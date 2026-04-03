@@ -1,0 +1,14 @@
+PySide6
+mlx
+numpy
+scikit-image
+opencv-python
+pyqtgraph
+vispy
+tifffile
+imagecodecs
+h5py
+qtpy
+scipy
+pyfftw
+matplotlib
