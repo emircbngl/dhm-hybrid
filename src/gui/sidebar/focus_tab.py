@@ -324,9 +324,10 @@ class FocusTab(QWidget):
         self.roi_tracker_group.setCheckable(True)
         self.roi_tracker_group.setChecked(False)
         self.roi_tracker_group.setToolTip(
-            "Automatically detect objects in the image, select one,\n"
-            "then run autofocus using that object's ROI.\n"
-            "Much faster and more accurate for specific objects."
+            "Detect objects from PHASE data (cells, microspheres, etc.),\n"
+            "select one, then autofocus uses that ROI as a mask.\n"
+            "Phase-based detection is more reliable for transparent objects.\n"
+            "The ROI bounds are passed to autofocus algorithms for focused evaluation."
         )
         rtg = QGridLayout(self.roi_tracker_group)
         rtg.setSpacing(5)
@@ -334,10 +335,11 @@ class FocusTab(QWidget):
 
         # ── Action buttons row ──
         btn_row = QHBoxLayout()
-        self.detect_objects_btn = QPushButton("Detect Objects")
+        self.detect_objects_btn = QPushButton("Detect Objects (Phase)")
         self.detect_objects_btn.setToolTip(
-            "Automatically find cells/particles in the reconstructed image.\n"
-            "Detected objects will be highlighted — click one to select it."
+            "Detect cells/microspheres from unwrapped phase data.\n"
+            "Results shown on Amplitude panel as autofocus mask regions.\n"
+            "Click on a detected object to select it as ROI for autofocus."
         )
         self.roi_clear_btn = QPushButton("Clear ROI")
         self.roi_clear_btn.setToolTip("Clear the current ROI selection and overlays")
@@ -382,7 +384,7 @@ class FocusTab(QWidget):
         # ── Manual ROI ──
         manual_row = QHBoxLayout()
         self.roi_select_btn = QPushButton("Manual ROI Select")
-        self.roi_select_btn.setToolTip("Click on the image to manually place ROI center")
+        self.roi_select_btn.setToolTip("Click on the Amplitude panel to manually place ROI as autofocus mask")
         self.roi_select_btn.setCheckable(True)
         manual_row.addWidget(self.roi_select_btn)
 

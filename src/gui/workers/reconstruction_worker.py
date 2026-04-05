@@ -118,6 +118,9 @@ class ReconstructionWorker(QThread):
         recon_complex = np.asarray(propagate(fc, recon_params, job['method'], fft=fft))
         print("ReconWorker: Propagate finished")
 
+        # Store raw (pre-reference) complex field for QPI use
+        recon_complex_raw = recon_complex.copy()
+
         # Reference hologram subtraction (complex division)
         ref_complex = job.get('reference_complex')
         if ref_complex is not None:
@@ -158,6 +161,7 @@ class ReconstructionWorker(QThread):
         return {
             'frame_num': job['frame_num'],
             'recon_complex': recon_complex,
+            'recon_complex_raw': recon_complex_raw,
             'spectrum_mag': spec,
             'phase_unwrapped': phase_unwrapped
         }

@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
         self._line_profile_plot = None
         self._line_profile_curve = None
         self._line_profile_stats = None
+        self._lp_ch = None  # crosshair measurement state
 
         self._frame_counter = 0
         self._adaptive_state = None
@@ -679,12 +680,14 @@ class MainWindow(QMainWindow):
                 }
                 self._recording_worker.push_frame(fdict)
                 
-        # Update ROI tracker if live tracking is enabled
+        # Update ROI tracker on amplitude (autofocus mask tracking)
         if self._recon_complex is not None:
             self._update_roi_tracking(np.abs(self._recon_complex))
 
         self.sidebar_tabs.recon_tab.recon_btn.setEnabled(True)
-        self.sidebar_tabs.qpi_tab.compute_btn.setEnabled(self._phase_unwrapped is not None)
+        has_phase = self._phase_unwrapped is not None
+        self.sidebar_tabs.qpi_tab.compute_btn.setEnabled(has_phase)
+        self.sidebar_tabs.focus_tab.detect_objects_btn.setEnabled(has_phase)
         self.status_bar.show_message("Reconstruction complete")
 
     def _display_recon_images(self) -> None:
@@ -880,21 +883,23 @@ class MainWindow(QMainWindow):
 
         try:
             # Populate stats panels
-            if result.phase_stats:
+            if result.phase_stats is not None:
                 qtab.set_phase_stats(result.phase_stats)
-            if result.cell_morph:
+            if result.cell_morph is not None:
                 qtab.set_cell_stats(result.cell_morph)
-            if result.roughness:
+            if result.roughness is not None:
                 qtab.set_roughness_stats(result.roughness)
 
             # Show QPI maps in a separate popup window
             self._show_qpi_window(result, qtab)
 
             msg = "QPI complete"
-            if result.total_dry_mass_pg:
+            if result.total_dry_mass_pg is not None and result.total_dry_mass_pg > 0:
                 msg += f" — Dry mass: {result.total_dry_mass_pg:.1f} pg"
-            if result.roughness:
+            if result.roughness is not None:
                 msg += f" | Ra: {result.roughness.Ra*1e9:.2f} nm"
+            if result.phase_stats is not None:
+                msg += f" | OPD range: {result.phase_stats.range_nm:.1f} nm"
             self.status_bar.show_message(msg)
         except Exception as e:
             import traceback
@@ -917,12 +922,18 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
         from PySide6.QtCore import QRectF
 
+        # Sanitize data: replace NaN/Inf with 0
+        data = np.array(data, dtype=np.float64, copy=True)
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
         container = QWidget()
         vbox = QVBoxLayout(container)
         vbox.setContentsMargins(2, 2, 2, 2)
         vbox.setSpacing(2)
 
-        lbl = QLabel(f"<b>{title}</b>")
+        # Title with min/max/mean stats
+        dmin, dmax, dmean = float(np.min(data)), float(np.max(data)), float(np.mean(data))
+        lbl = QLabel(f"<b>{title}</b>  min={dmin:.2g}  max={dmax:.2g}  mean={dmean:.2g}")
         lbl.setStyleSheet("color: #ddd; font-size: 11px; padding: 2px;")
         vbox.addWidget(lbl)
 
@@ -948,9 +959,15 @@ class MainWindow(QMainWindow):
 
         plot.addItem(img)
 
+        # Colorbar: handle constant data (min == max)
+        cb_min, cb_max = dmin, dmax
+        if abs(cb_max - cb_min) < 1e-15:
+            cb_min -= 1.0
+            cb_max += 1.0
+
         cbar = pg.ColorBarItem(
             colorMap=cmap,
-            values=(float(np.nanmin(data)), float(np.nanmax(data))),
+            values=(cb_min, cb_max),
             interactive=False,
             width=12,
         )
@@ -959,10 +976,24 @@ class MainWindow(QMainWindow):
         vbox.addWidget(gw)
         return container
 
+    def _cleanup_qpi_dialog(self):
+        """Safely close the QPI results dialog."""
+        if self._qpi_dialog is not None:
+            try:
+                from shiboken6 import isValid
+                if isValid(self._qpi_dialog):
+                    self._qpi_dialog.close()
+            except Exception:
+                pass
+            self._qpi_dialog = None
+
     def _show_qpi_window(self, result, qtab) -> None:
         """Open a window showing QPI map results in a proper grid layout."""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QSplitter, QGridLayout, QWidget
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QGridLayout, QWidget
         import pyqtgraph as pg
+
+        # Close previous dialog safely
+        self._cleanup_qpi_dialog()
 
         dlg = QDialog(self)
         dlg.setWindowTitle("QPI Results")
@@ -973,42 +1004,57 @@ class MainWindow(QMainWindow):
         # Pixel size for axis scaling
         px_um = self._get_effective_pixel_um()
 
+        def _has_data(arr):
+            return arr is not None and isinstance(arr, np.ndarray) and arr.size > 0
+
         # Collect active map panels
         map_panels = []
-        if qtab.show_opd_cb.isChecked() and result.opd_nm is not None and result.opd_nm.size > 0:
+        if qtab.show_opd_cb.isChecked() and _has_data(result.opd_nm):
             map_panels.append(self._make_qpi_map_widget(result.opd_nm, "OPD (nm)", "viridis", px_um))
-        if qtab.show_height_cb.isChecked() and result.height_nm is not None:
+        if qtab.show_height_cb.isChecked() and _has_data(result.height_nm):
             map_panels.append(self._make_qpi_map_widget(result.height_nm, "Height (nm)", "viridis", px_um))
-        if qtab.show_drymass_cb.isChecked() and result.dry_mass_density_pg_um2 is not None:
+        if qtab.show_drymass_cb.isChecked() and _has_data(result.dry_mass_density_pg_um2):
             map_panels.append(self._make_qpi_map_widget(result.dry_mass_density_pg_um2, "Dry mass (pg/µm²)", "inferno", px_um))
-        if qtab.show_ri_cb.isChecked() and result.ri_map is not None:
+        if qtab.show_ri_cb.isChecked() and _has_data(result.ri_map):
             map_panels.append(self._make_qpi_map_widget(result.ri_map, "Refractive Index", "plasma", px_um))
+
+        # Cell mask overlay on OPD
+        if _has_data(result.cell_mask) and _has_data(result.opd_nm):
+            map_panels.append(self._make_qpi_map_widget(
+                result.opd_nm * (result.cell_mask > 0).astype(float),
+                "Cell Segmentation (OPD × mask)", "viridis", px_um))
 
         # Collect plot panels
         plot_panels = []
-        if qtab.show_psd_cb.isChecked() and result.psd_freq is not None and result.psd_values is not None:
+        if qtab.show_psd_cb.isChecked() and _has_data(result.psd_freq) and _has_data(result.psd_values):
             w = pg.PlotWidget(title="Power Spectral Density")
             w.setLabel("bottom", "Spatial frequency", units="1/m")
             w.setLabel("left", "PSD", units="m³")
             w.setLogMode(x=True, y=True)
             w.showGrid(x=True, y=True, alpha=0.3)
-            w.plot(result.psd_freq, result.psd_values, pen=pg.mkPen("c", width=2))
+            # Filter out zero/negative values for log scale
+            valid = (result.psd_freq > 0) & (result.psd_values > 0)
+            if np.any(valid):
+                w.plot(result.psd_freq[valid], result.psd_values[valid], pen=pg.mkPen("c", width=2))
             plot_panels.append(w)
 
-        if qtab.show_histogram_cb.isChecked() and result.opd_nm is not None and result.opd_nm.size > 0:
+        if qtab.show_histogram_cb.isChecked() and _has_data(result.opd_nm):
             w = pg.PlotWidget(title="Phase Histogram")
             w.setLabel("bottom", "OPD (nm)")
             w.setLabel("left", "Count")
             w.showGrid(x=True, y=True, alpha=0.3)
             vals = result.opd_nm.ravel()
-            y, x = np.histogram(vals, bins=256)
-            w.plot(x, y, stepMode="center", fillLevel=0, fillOutline=True,
-                   pen=pg.mkPen("c", width=1.5), brush=(0, 180, 220, 80))
+            vals = vals[np.isfinite(vals)]
+            if len(vals) > 0:
+                y, x = np.histogram(vals, bins=256)
+                w.plot(x, y, stepMode="center", fillLevel=0, fillOutline=True,
+                       pen=pg.mkPen("c", width=1.5), brush=(0, 180, 220, 80))
             plot_panels.append(w)
 
         all_panels = map_panels + plot_panels
         if not all_panels:
-            dlg.close()
+            self.status_bar.show_message("QPI: no display panels selected or no data available")
+            dlg.deleteLater()
             return
 
         # Arrange in 2-column grid
@@ -1140,8 +1186,6 @@ class MainWindow(QMainWindow):
         """Re-show QPI window when display checkboxes change."""
         if self._qpi_last_result is None:
             return
-        if self._qpi_dialog is not None:
-            self._qpi_dialog.close()
         self._cleanup_3d_window()
         self._show_qpi_window(self._qpi_last_result, self.sidebar_tabs.qpi_tab)
 
@@ -1430,7 +1474,7 @@ class MainWindow(QMainWindow):
         self._roi_select_mode = False
         self._object_select_mode = False
 
-        # Clear detected object overlays
+        # Clear detected object overlays from amplitude panel
         vb = self.panel_amp.get_view()
         for item in self._detected_overlays:
             try:
@@ -1440,7 +1484,7 @@ class MainWindow(QMainWindow):
         self._detected_overlays.clear()
         self._detected_objects.clear()
 
-        # Clear ROI rectangle overlay
+        # Clear ROI rectangle overlay from amplitude panel
         if self._roi_rect_item is not None:
             try:
                 vb.removeItem(self._roi_rect_item)
@@ -1461,13 +1505,12 @@ class MainWindow(QMainWindow):
         ftab.roi_status_label.setStyleSheet("color: gray; font-style: italic;")
 
     def _on_detect_objects(self) -> None:
-        """Run automatic object detection on the current amplitude image."""
-        if self._recon_complex is None:
-            self.status_bar.show_message("No reconstruction available — load an image first")
+        """Run automatic object detection on the phase image (unwrapped phase)."""
+        if self._phase_unwrapped is None:
+            self.status_bar.show_message("No phase data — run reconstruction first")
             return
 
         ftab = self.sidebar_tabs.focus_tab
-        amp = np.abs(self._recon_complex)
 
         from core.phase_tracker import detect_objects
         from PySide6.QtWidgets import QApplication
@@ -1477,7 +1520,7 @@ class MainWindow(QMainWindow):
         ftab.detect_objects_btn.setEnabled(False)
         original_text = ftab.detect_objects_btn.text()
         ftab.detect_objects_btn.setText("Detecting...")
-        self.status_bar.show_message("Running object detection...")
+        self.status_bar.show_message("Running phase-based object detection...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
 
@@ -1486,8 +1529,11 @@ class MainWindow(QMainWindow):
         min_area = ftab.detect_min_area.value()
 
         try:
+            # Use unwrapped phase for detection — phase signatures reveal
+            # cells, microspheres, and other phase objects more reliably
             objects = detect_objects(
-                amp, min_area=min_area, method=method, sensitivity=sensitivity,
+                self._phase_unwrapped, min_area=min_area,
+                method=method, sensitivity=sensitivity,
             )
         finally:
             QApplication.restoreOverrideCursor()
@@ -1517,26 +1563,27 @@ class MainWindow(QMainWindow):
             ftab.roi_status_label.setText("No objects detected — adjust sensitivity")
             ftab.roi_status_label.setStyleSheet("color: orange;")
             ftab.roi_clear_btn.setEnabled(False)
-            self.status_bar.show_message("No objects detected")
+            self.status_bar.show_message("No objects detected in phase image")
             return
 
+        # Detection from phase, overlay on amplitude (autofocus mask)
         self._draw_detected_overlays()
 
         ftab.roi_status_label.setText(
-            f"{len(objects)} objects — click one to select"
+            f"{len(objects)} objects — click one on amplitude to select"
         )
         ftab.roi_status_label.setStyleSheet("color: #00bfff; font-weight: bold;")
         ftab.roi_clear_btn.setEnabled(True)
         self.status_bar.show_message(
-            f"Detected {len(objects)} objects. Click on one to select."
+            f"Detected {len(objects)} phase objects. Click on Amplitude panel to select as autofocus mask."
         )
 
-        # Enter object selection mode (single connection)
+        # Enter object selection mode — click on amplitude panel
         self._object_select_mode = True
         self.panel_amp.get_view().scene().sigMouseClicked.connect(self._on_object_click)
 
     def _draw_detected_overlays(self) -> None:
-        """Draw numbered bounding boxes for all detected objects on amp panel."""
+        """Draw numbered bounding boxes for detected objects on amplitude panel (autofocus mask)."""
         vb = self.panel_amp.get_view()
         colors = ['#00ff00', '#ff6600', '#ff00ff', '#ffff00',
                   '#00ffff', '#ff3333', '#66ff66', '#ff66ff']
@@ -1564,7 +1611,7 @@ class MainWindow(QMainWindow):
             self._detected_overlays.append(label)
 
     def _on_object_click(self, event) -> None:
-        """Handle click on amp panel to select the nearest detected object."""
+        """Handle click on amplitude panel to select the nearest detected object."""
         if not self._object_select_mode or not self._detected_objects:
             return
 
@@ -1592,6 +1639,7 @@ class MainWindow(QMainWindow):
         ftab.roi_size_spin.setValue(roi_size)
         self._phase_tracker.roi_size = roi_size
 
+        # ROI selected from phase detection, applied on amplitude for autofocus masking
         amp = np.abs(self._recon_complex)
         ok = self._phase_tracker.select_roi(amp, best_obj.cx, best_obj.cy)
 
@@ -1616,14 +1664,14 @@ class MainWindow(QMainWindow):
             ftab.roi_status_label.setStyleSheet("color: green; font-weight: bold;")
             ftab.roi_clear_btn.setEnabled(True)
             self.status_bar.show_message(
-                f"Object #{best_obj.label} selected — ready for autofocus"
+                f"Phase object #{best_obj.label} selected — ROI mask ready for autofocus"
             )
         else:
             ftab.roi_status_label.setText("Selection failed")
             ftab.roi_status_label.setStyleSheet("color: red;")
 
     def _on_roi_select_toggled(self, checked: bool) -> None:
-        """Enter/exit manual ROI selection mode."""
+        """Enter/exit manual ROI selection mode on the amplitude panel."""
         # Always disconnect first to prevent stacking
         self._disconnect_roi_signals()
         self._roi_select_mode = checked
@@ -1638,7 +1686,7 @@ class MainWindow(QMainWindow):
                     pass
             self._detected_overlays.clear()
 
-            self.status_bar.show_message("Click on the Amplitude image to place ROI center")
+            self.status_bar.show_message("Click on the Amplitude image to place ROI (autofocus mask)")
             self.panel_amp.get_view().scene().sigMouseClicked.connect(self._on_roi_click)
 
     def _on_roi_click(self, event) -> None:
@@ -1666,16 +1714,16 @@ class MainWindow(QMainWindow):
             )
             ftab.roi_status_label.setStyleSheet("color: green; font-weight: bold;")
             ftab.roi_clear_btn.setEnabled(True)
-            self.status_bar.show_message(f"ROI selected at ({int(cx)}, {int(cy)})")
+            self.status_bar.show_message(f"Phase ROI selected at ({int(cx)}, {int(cy)}) — autofocus mask active")
         else:
-            ftab.roi_status_label.setText("Selection failed — click inside image")
+            ftab.roi_status_label.setText("Selection failed — click inside phase image")
             ftab.roi_status_label.setStyleSheet("color: red;")
 
         # Uncheck the button (triggers toggled→disconnect)
         ftab.roi_select_btn.setChecked(False)
 
     def _draw_roi_overlay(self) -> None:
-        """Draw/update a lightweight ROI rectangle on the amplitude panel."""
+        """Draw/update a lightweight ROI rectangle on the amplitude panel (autofocus mask)."""
         if not self._phase_tracker.active:
             return
 
@@ -1701,7 +1749,7 @@ class MainWindow(QMainWindow):
         self._roi_rect_item = rect
 
     def _update_roi_tracking(self, amp_image: np.ndarray) -> None:
-        """Update ROI tracker with a new amplitude image (called after reconstruction)."""
+        """Update ROI tracker with amplitude data (called after reconstruction)."""
         ftab = self.sidebar_tabs.focus_tab
         if not ftab.roi_tracker_group.isChecked():
             return
@@ -2126,9 +2174,11 @@ class MainWindow(QMainWindow):
 
     # ─── Line Profile Tool ───
     def _on_line_profile_toggled(self, enabled: bool) -> None:
-        """Toggle a draggable line segment on the amplitude panel with live profile plot."""
+        """Toggle a draggable line segment on the phase panel with live profile plot."""
         if enabled:
-            panel = self.panel_amp
+            # Use the phase panel for phase-based depth measurement
+            phase_panel = self.panel_phase
+            panel = phase_panel.image_panel
             img_item = panel.view.getImageItem()
             if img_item is None or img_item.image is None:
                 self.status_bar.show_message("Load an image first")
@@ -2148,24 +2198,70 @@ class MainWindow(QMainWindow):
             self._line_profile_roi = roi
             self._line_profile_panel = panel
 
-            # Create profile plot dialog
-            from PySide6.QtWidgets import QDialog, QVBoxLayout
+            # Create profile plot dialog with crosshair measurement
+            from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
             dlg = QDialog(self)
-            dlg.setWindowTitle("Line Profile")
-            dlg.resize(520, 280)
+            dlg.setWindowTitle("Phase Line Profile — Crosshair Measurement")
+            dlg.resize(620, 340)
             dlg_layout = QVBoxLayout(dlg)
             dlg_layout.setContentsMargins(4, 4, 4, 4)
 
             pw = pg.PlotWidget()
-            pw.setLabel("bottom", "Distance (µm)")
-            pw.setLabel("left", "Value")
+            pw.setLabel("bottom", "Lateral Distance (µm)")
+            pw.setLabel("left", "Depth (µm)")
             pw.showGrid(x=True, y=True, alpha=0.3)
+            # Disable default right-click context menu so right-click works for Sel 2
+            pw.plotItem.vb.setMenuEnabled(False)
             curve = pw.plot(pen=pg.mkPen("c", width=2))
             stats_text = pg.TextItem("", anchor=(0, 0), color="w")
             stats_text.setPos(0, 0)
             pw.addItem(stats_text, ignoreBounds=True)
 
+            # --- Crosshair elements on the plot ---
+            ch_vline1 = pg.InfiniteLine(angle=90, movable=False,
+                                        pen=pg.mkPen("#00ff00", width=1, style=2))
+            ch_hline1 = pg.InfiniteLine(angle=0, movable=False,
+                                        pen=pg.mkPen("#00ff00", width=1, style=2))
+            ch_vline2 = pg.InfiniteLine(angle=90, movable=False,
+                                        pen=pg.mkPen("#ff4444", width=1, style=2))
+            ch_hline2 = pg.InfiniteLine(angle=0, movable=False,
+                                        pen=pg.mkPen("#ff4444", width=1, style=2))
+            for line in (ch_vline1, ch_hline1, ch_vline2, ch_hline2):
+                line.setVisible(False)
+                pw.addItem(line, ignoreBounds=True)
+
+            # Marker dots for selections
+            sel1_dot = pg.ScatterPlotItem(size=10, pen=pg.mkPen(None),
+                                          brush=pg.mkBrush("#00ff00"))
+            sel2_dot = pg.ScatterPlotItem(size=10, pen=pg.mkPen(None),
+                                          brush=pg.mkBrush("#ff4444"))
+            pw.addItem(sel1_dot, ignoreBounds=True)
+            pw.addItem(sel2_dot, ignoreBounds=True)
+
+            # Delta label on the plot
+            delta_text = pg.TextItem("", anchor=(0.5, 0), color="#ffff00")
+            pw.addItem(delta_text, ignoreBounds=True)
+
             dlg_layout.addWidget(pw)
+
+            # --- Bottom bar: info labels + reset button ---
+            bottom_bar = QHBoxLayout()
+            sel1_label = QLabel("Sel 1 (Left Click): —")
+            sel1_label.setStyleSheet("color: #00ff00; font-weight: bold;")
+            sel2_label = QLabel("Sel 2 (Right Click): —")
+            sel2_label.setStyleSheet("color: #ff4444; font-weight: bold;")
+            delta_label = QLabel("Δ: —")
+            delta_label.setStyleSheet("color: #ffff00; font-weight: bold;")
+            reset_btn = QPushButton("Reset")
+            reset_btn.setFixedWidth(60)
+
+            bottom_bar.addWidget(sel1_label)
+            bottom_bar.addWidget(sel2_label)
+            bottom_bar.addWidget(delta_label)
+            bottom_bar.addStretch()
+            bottom_bar.addWidget(reset_btn)
+            dlg_layout.addLayout(bottom_bar)
+
             dlg.show()
 
             self._line_profile_dlg = dlg
@@ -2173,12 +2269,28 @@ class MainWindow(QMainWindow):
             self._line_profile_curve = curve
             self._line_profile_stats = stats_text
 
+            # Crosshair state
+            self._lp_ch = {
+                "vline1": ch_vline1, "hline1": ch_hline1,
+                "vline2": ch_vline2, "hline2": ch_hline2,
+                "dot1": sel1_dot, "dot2": sel2_dot,
+                "delta_text": delta_text,
+                "sel1_label": sel1_label, "sel2_label": sel2_label,
+                "delta_label": delta_label,
+                "sel1": None,  # (x, y) tuple
+                "sel2": None,
+            }
+
+            # Connect mouse clicks on the plot
+            pw.scene().sigMouseClicked.connect(self._on_line_profile_plot_clicked)
+            reset_btn.clicked.connect(self._reset_line_profile_crosshair)
+
             # Connect live update
             roi.sigRegionChanged.connect(self._update_line_profile)
             # Show initial profile
             self._update_line_profile()
 
-            self.status_bar.show_message("Line Profile active — drag endpoints to measure")
+            self.status_bar.show_message("Phase Line Profile — Left click: Sel1, Right click: Sel2")
         else:
             self._clear_line_profile()
             self.status_bar.show_message("Line Profile removed")
@@ -2192,8 +2304,30 @@ class MainWindow(QMainWindow):
             px_um = px_um / (mag if mag > 0 else 1.0)
         return px_um
 
+    def _phase_to_height_um(self, phase_rad: np.ndarray) -> np.ndarray:
+        """Convert unwrapped phase (radians) to height in µm using current optical params."""
+        rtab = self.sidebar_tabs.recon_tab
+        wavelength_m = float(rtab.wavelength_nm.value()) * 1e-9
+
+        from core.qpi import phase_to_opd, opd_to_height
+        opd_m = phase_to_opd(phase_rad, wavelength_m)
+
+        # Use QPI tab params if available, otherwise reflection mode
+        try:
+            qtab = self.sidebar_tabs.qpi_tab
+            n_sample = float(qtab.n_sample.value())
+            n_medium = float(qtab.n_medium.value())
+            if abs(n_sample - n_medium) > 1e-6:
+                height_m = opd_to_height(opd_m, n_sample, n_medium)
+            else:
+                height_m = opd_m / 2.0  # reflection mode fallback
+        except Exception:
+            height_m = opd_m / 2.0  # reflection mode fallback
+
+        return height_m * 1e6  # metres → µm
+
     def _update_line_profile(self) -> None:
-        """Recalculate and redraw the line profile from the current ROI position."""
+        """Recalculate and redraw the line profile from phase data, converted to depth (µm)."""
         roi = self._line_profile_roi
         panel = self._line_profile_panel
         if roi is None or panel is None:
@@ -2220,29 +2354,98 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
-        # Convert pixel distances to micrometers
+        # Convert pixel distances to µm (lateral)
         px_um = self._get_effective_pixel_um()
         distances_um = distances * px_um
 
+        # Convert phase values to depth in µm
+        height_um = self._phase_to_height_um(values)
+
         if self._line_profile_curve is not None:
-            self._line_profile_curve.setData(distances_um, values)
+            self._line_profile_curve.setData(distances_um, height_um)
 
         # Update stats text
-        if self._line_profile_stats is not None and len(values) > 0:
-            vmin, vmax, vmean = float(np.min(values)), float(np.max(values)), float(np.mean(values))
+        if self._line_profile_stats is not None and len(height_um) > 0:
+            vmin = float(np.min(height_um))
+            vmax = float(np.max(height_um))
+            vmean = float(np.mean(height_um))
             length_um = float(distances_um[-1]) if len(distances_um) > 0 else 0
             self._line_profile_stats.setText(
-                f"L={length_um:.1f}µm  min={vmin:.3g}  max={vmax:.3g}  mean={vmean:.3g}"
+                f"L={length_um:.1f}µm  min={vmin:.3f}µm  max={vmax:.3f}µm  mean={vmean:.3f}µm"
             )
             # Position stats at top-left of plot
             vr = self._line_profile_plot.viewRange()
             self._line_profile_stats.setPos(vr[0][0], vr[1][1])
+
+    def _on_line_profile_plot_clicked(self, event) -> None:
+        """Handle mouse clicks on the line profile plot for crosshair selection."""
+        ch = getattr(self, "_lp_ch", None)
+        if ch is None or self._line_profile_plot is None:
+            return
+
+        pw = self._line_profile_plot
+        vb = pw.plotItem.vb
+        scene_pos = event.scenePos()
+        mouse_point = vb.mapSceneToView(scene_pos)
+        x, y = float(mouse_point.x()), float(mouse_point.y())
+
+        from PySide6.QtCore import Qt
+        button = event.button()
+
+        if button == Qt.MouseButton.LeftButton:
+            # Selection 1 (green)
+            ch["sel1"] = (x, y)
+            ch["vline1"].setPos(x); ch["hline1"].setPos(y)
+            ch["vline1"].setVisible(True); ch["hline1"].setVisible(True)
+            ch["dot1"].setData([x], [y])
+            ch["sel1_label"].setText(f"Sel 1: ({x:.2f}, {y:.3f}) µm")
+
+        elif button == Qt.MouseButton.RightButton:
+            # Selection 2 (red)
+            ch["sel2"] = (x, y)
+            ch["vline2"].setPos(x); ch["hline2"].setPos(y)
+            ch["vline2"].setVisible(True); ch["hline2"].setVisible(True)
+            ch["dot2"].setData([x], [y])
+            ch["sel2_label"].setText(f"Sel 2: ({x:.2f}, {y:.3f}) µm")
+
+        # Update delta if both selections exist
+        if ch["sel1"] is not None and ch["sel2"] is not None:
+            dx = abs(ch["sel2"][0] - ch["sel1"][0])
+            dy = abs(ch["sel2"][1] - ch["sel1"][1])
+            ch["delta_label"].setText(f"Δ: ({dx:.2f}, {dy:.3f}) µm")
+            # Position delta text between the two points on the plot
+            mx = (ch["sel1"][0] + ch["sel2"][0]) / 2
+            my = max(ch["sel1"][1], ch["sel2"][1])
+            ch["delta_text"].setText(f"Δx={dx:.2f} µm\nΔy={dy:.3f} µm")
+            ch["delta_text"].setPos(mx, my)
+
+    def _reset_line_profile_crosshair(self) -> None:
+        """Reset crosshair selections on the line profile plot."""
+        ch = getattr(self, "_lp_ch", None)
+        if ch is None:
+            return
+        ch["sel1"] = None
+        ch["sel2"] = None
+        for key in ("vline1", "hline1", "vline2", "hline2"):
+            ch[key].setVisible(False)
+        ch["dot1"].setData([], [])
+        ch["dot2"].setData([], [])
+        ch["delta_text"].setText("")
+        ch["sel1_label"].setText("Sel 1 (Left Click): —")
+        ch["sel2_label"].setText("Sel 2 (Right Click): —")
+        ch["delta_label"].setText("Δ: —")
 
     def _clear_line_profile(self) -> None:
         """Remove line profile ROI and close plot window."""
         if self._line_profile_roi is not None and self._line_profile_panel is not None:
             try:
                 self._line_profile_panel.get_view().removeItem(self._line_profile_roi)
+            except Exception:
+                pass
+        if self._line_profile_plot is not None:
+            try:
+                self._line_profile_plot.scene().sigMouseClicked.disconnect(
+                    self._on_line_profile_plot_clicked)
             except Exception:
                 pass
         if self._line_profile_dlg is not None:
@@ -2253,6 +2456,7 @@ class MainWindow(QMainWindow):
         self._line_profile_plot = None
         self._line_profile_curve = None
         self._line_profile_stats = None
+        self._lp_ch = None
 
     def _on_export_view(self) -> None:
         """Export the current image grid as a PNG."""
