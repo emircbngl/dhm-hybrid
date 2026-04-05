@@ -2174,11 +2174,16 @@ class MainWindow(QMainWindow):
 
     # ─── Line Profile Tool ───
     def _on_line_profile_toggled(self, enabled: bool) -> None:
-        """Toggle a draggable line segment on the phase panel with live profile plot."""
+        """Toggle a draggable line segment with live phase-depth profile plot."""
         if enabled:
-            # Use the phase panel for phase-based depth measurement
-            phase_panel = self.panel_phase
-            panel = phase_panel.image_panel
+            # Check that we have phase data for depth measurement
+            if self._phase_unwrapped is None:
+                self.status_bar.show_message("Run reconstruction first — need phase data")
+                self.toolbar.action_line_profile.setChecked(False)
+                return
+
+            # Place ROI on amplitude panel (always has data, easier to see)
+            panel = self.panel_amp
             img_item = panel.view.getImageItem()
             if img_item is None or img_item.image is None:
                 self.status_bar.show_message("Load an image first")
@@ -2333,8 +2338,9 @@ class MainWindow(QMainWindow):
         if roi is None or panel is None:
             return
 
-        img_item = panel.view.getImageItem()
-        if img_item is None or img_item.image is None:
+        # Use stored unwrapped phase data directly
+        phase_data = self._phase_unwrapped
+        if phase_data is None:
             return
 
         # Get ROI handle positions in image coordinates
@@ -2350,7 +2356,7 @@ class MainWindow(QMainWindow):
 
         from core.qpi import extract_line_profile
         try:
-            distances, values = extract_line_profile(img_item.image, start, end)
+            distances, values = extract_line_profile(phase_data, start, end)
         except Exception:
             return
 
