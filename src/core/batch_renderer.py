@@ -10,7 +10,7 @@ from core.phase_unwrap import unwrap_phase_advanced
 from core.ingestion import load_any
 from core.reconstruction import propagate, ReconstructionParams, ReconstructionMethod
 from core.offaxis import OffAxisParams, extract_complex_field_offaxis_debug
-from core.autofocus import FocusMetric, _calc_metric
+from core.autofocus import FocusMetric, _calc_metric, _is_phase_metric, _is_minimize
 
 def _save_normalized(path: Path, arr: np.ndarray, is_phase: bool = False):
     if is_phase:
@@ -272,7 +272,7 @@ class BatchRenderer(QThread):
         except ValueError:
             metric = FocusMetric.LAPLACIAN_VARIANCE
 
-        best_score = -1.0
+        best_score = float('inf') if _is_minimize(metric) else -float('inf')
         best_complex = None
         best_z = 0.0
 
@@ -345,17 +345,19 @@ class BatchRenderer(QThread):
                     wavelength_m=wl, pixel_size_m=px, z_m=z_m, n=n_medium
                 )
                 complex_field = _apply_ref(propagate(fc, recon_params, method, force_python=True))
-                amp = np.abs(complex_field)
 
                 try:
-                    score = _calc_metric(amp, metric)
+                    data = complex_field if _is_phase_metric(metric) else np.abs(complex_field)
+                    score = _calc_metric(data, metric)
                 except Exception:
-                    score = float(np.var(amp))
+                    score = float(np.var(np.abs(complex_field)))
 
                 if writer:
                     writer.writerow([job.in_file.name, prof, f"{z_val:.4f}", f"{score:.2f}"])
 
-                if score > best_score:
+                minimize = _is_minimize(metric)
+                better = (score < best_score) if minimize else (score > best_score)
+                if better:
                     best_score = score
                     best_complex = complex_field.copy()
                     best_z = z_val

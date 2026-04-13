@@ -58,6 +58,7 @@ def _make_fast_evaluator(
     method: ReconstructionMethod,
     metric: 'FocusMetric',
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ):
     """
     Build a fast evaluate(z) closure.
@@ -68,6 +69,10 @@ def _make_fast_evaluator(
 
     If roi_bounds is provided (ROIBounds-like with x0,y0,x1,y1), the metric
     is computed only within that region — much faster and focuses on the object.
+
+    If ref_field is provided and the metric is phase-based, both sample and
+    reference are propagated to each z and divided, giving a reference-
+    subtracted complex field for accurate phase measurement.
     """
     fft = get_best_fft_backend()
     recon = CachedReconstructor(field.shape, method, fft)
@@ -77,6 +82,17 @@ def _make_fast_evaluator(
     field_spectrum = fft.fft2(inp)
     if field_spectrum.dtype != np.complex64:
         field_spectrum = field_spectrum.astype(np.complex64)
+
+    # Pre-compute reference spectrum if provided
+    use_ref = ref_field is not None and _is_phase_metric(metric)
+    ref_spectrum = None
+    if use_ref:
+        ref_inp = ref_field.astype(np.complex64, copy=False)
+        ref_spectrum = fft.fft2(ref_inp)
+        if ref_spectrum.dtype != np.complex64:
+            ref_spectrum = ref_spectrum.astype(np.complex64)
+
+    phase_metric = _is_phase_metric(metric)
 
     # Pre-compute clamped ROI bounds
     ny, nx = field.shape
@@ -95,7 +111,19 @@ def _make_fast_evaluator(
             z_m=z, n=base_params.n,
         )
         result = recon.reconstruct_from_spectrum(field_spectrum, params)
-        return _calc_metric(np.abs(result[ry0:ry1, rx0:rx1]), metric)
+
+        if use_ref and ref_spectrum is not None:
+            ref_result = recon.reconstruct_from_spectrum(ref_spectrum, params)
+            ref_abs = np.abs(ref_result)
+            safe = np.where(ref_abs > 1e-10, ref_result,
+                            np.ones_like(ref_result))
+            result = result / safe
+
+        roi = result[ry0:ry1, rx0:rx1]
+        if phase_metric:
+            return _calc_metric(roi, metric)
+        else:
+            return _calc_metric(np.abs(roi), metric)
 
     return evaluate
 
@@ -131,13 +159,35 @@ class FocusMetric(str, Enum):
     VOLLATH_F5 = "vollath_f5"
     NORMALIZED_VARIANCE = "normalized_variance"
     SPECTRAL_ENERGY = "spectral_energy"
+    # Phase-based metrics — require complex field (not just amplitude)
+    PHASE_VARIANCE = "phase_variance"
+    AMPLITUDE_FLATNESS = "amplitude_flatness"
+
+
+def _is_phase_metric(metric: FocusMetric) -> bool:
+    """True if the metric requires the complex field (not just amplitude)."""
+    return metric == FocusMetric.PHASE_VARIANCE
 
 @dataclass(frozen=True)
 class AutoFocusResult:
     best_z_m: float
     scores: Dict[float, float]
 
-def _calc_metric(amp: np.ndarray, metric: FocusMetric) -> float:
+def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
+    """Compute focus metric.  *data* is amplitude (real) for classic metrics,
+    or complex field for phase-based metrics."""
+    # Phase-based metrics — operate on the complex field directly
+    if metric == FocusMetric.PHASE_VARIANCE:
+        phase = np.angle(data).astype(np.float64)
+        return float(np.var(phase))
+
+    if metric == FocusMetric.AMPLITUDE_FLATNESS:
+        amp = np.abs(data).astype(np.float64)
+        return float(np.var(amp))
+
+    # Classic amplitude-based metrics — ensure real array
+    amp = np.abs(data).astype(np.float64) if np.iscomplexobj(data) else data
+
     if metric == FocusMetric.TOTAL_VARIATION:
         dy = amp[1:, :] - amp[:-1, :]
         dx = amp[:, 1:] - amp[:, :-1]
@@ -205,7 +255,7 @@ def _calc_metric(amp: np.ndarray, metric: FocusMetric) -> float:
 
 def _is_minimize(metric: FocusMetric) -> bool:
     """Returns True if the given metric should be minimized (e.g. entropy)."""
-    return metric == FocusMetric.ENTROPY
+    return metric in (FocusMetric.ENTROPY, FocusMetric.AMPLITUDE_FLATNESS)
 
 def autofocus_zscan(
     field: np.ndarray,
@@ -216,11 +266,13 @@ def autofocus_zscan(
     on_progress: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> AutoFocusResult:
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     scores = {}
     best_z = z_values_m[0]
-    best_score = -float('inf') if metric != FocusMetric.ENTROPY else float('inf')
+    minimize = _is_minimize(metric)
+    best_score = float('inf') if minimize else -float('inf')
     total = len(z_values_m)
     
     for i, z in enumerate(z_values_m):
@@ -231,7 +283,7 @@ def autofocus_zscan(
         score = _eval(z)
         scores[z] = score
         
-        if metric == FocusMetric.ENTROPY:
+        if minimize:
             if score < best_score:
                 best_score = score
                 best_z = z
@@ -262,12 +314,13 @@ def golden_section_search(
     eval_offset: int = 0,
     est_total: int = 0,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> GoldenSearchResult:
     """O(log N) search for the best focus plane using Golden Section."""
     phi = (1.0 + np.sqrt(5.0)) / 2.0
     resphi = 2.0 - phi
     
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     state = {"evaluations": 0}
     
     def evaluate(z: float) -> float:
@@ -278,7 +331,7 @@ def golden_section_search(
             on_progress(eval_offset + state["evaluations"], est_total)
         return _eval(z)
         
-    maximize = metric != FocusMetric.ENTROPY
+    maximize = not _is_minimize(metric)
     
     a = float(z_min_m)
     b = float(z_max_m)
@@ -325,6 +378,7 @@ def coarse_to_fine_search(
     cancel_check: Optional[Callable[[], bool]] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> GoldenSearchResult:
     """Hybrid approach: N-step sweep followed by Golden Section Search."""
     import math
@@ -333,7 +387,7 @@ def coarse_to_fine_search(
     golden_iters = max(1, int(math.log(margin_est / max(fine_tolerance_m, 1e-15)) / math.log(phi))) + 3
     est_total = coarse_steps + golden_iters
 
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     state = {"evaluations": 0}
     
     def evaluate(z: float) -> float:
@@ -344,7 +398,7 @@ def coarse_to_fine_search(
             on_progress(state["evaluations"], est_total)
         return _eval(z)
         
-    maximize = metric != FocusMetric.ENTROPY
+    maximize = not _is_minimize(metric)
 
     # Phase 1: Coarse Scan
     step = (z_max_m - z_min_m) / max(1, coarse_steps - 1)
@@ -377,6 +431,7 @@ def coarse_to_fine_search(
         on_progress=on_progress,
         eval_offset=state["evaluations"],
         est_total=est_total,
+        ref_field=ref_field,
     )
     
     return GoldenSearchResult(
@@ -414,6 +469,7 @@ def robust_coarse_to_fine_search(
     on_progress: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> RobustSearchResult:
     """
     Robust Multi-Scale Autofocus — works even with noisy / multimodal metrics.
@@ -425,7 +481,7 @@ def robust_coarse_to_fine_search(
       4. Fine scan around the peak neighbourhood (refine_factor × denser)
       5. Smooth + peak again for sub-step precision
     """
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     evaluations = 0
     minimize = _is_minimize(metric)
 
@@ -506,6 +562,7 @@ def adaptive_gradient_search(
     cancel_check: Optional[Callable[[], bool]] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> AdaptiveStepResult:
     """
     Gradient-Based Adaptive Step autofocus.
@@ -516,7 +573,7 @@ def adaptive_gradient_search(
     Phase 2 (refinement, remaining budget): Iteratively narrows a window
       around the best z found so far, achieving sub-step resolution.
     """
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     full_range = z_max_m - z_min_m
     if step_init is None:
         # Gradient algo needs large initial steps to traverse range quickly;
@@ -633,6 +690,7 @@ def adaptive_ratio_search(
     cancel_check: Optional[Callable[[], bool]] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> AdaptiveStepResult:
     """
     Ratio-Based Adaptive Step autofocus.
@@ -643,7 +701,7 @@ def adaptive_ratio_search(
     Phase 2 (refinement, remaining budget): Iteratively narrows a window
       around the best z found so far.
     """
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     full_range = z_max_m - z_min_m
     if step_init is None:
         # Ratio algo: moderate step — not as aggressive as Gradient,
@@ -753,6 +811,7 @@ def adaptive_bracketing_search(
     cancel_check: Optional[Callable[[], bool]] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> AdaptiveStepResult:
     """
     Bracketing + Refinement autofocus with noise-robust peak detection.
@@ -767,7 +826,7 @@ def adaptive_bracketing_search(
              Runs at least *n_refine_levels*; auto-extends if *max_evaluations*
              budget allows more levels.
     """
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     full_range = z_max_m - z_min_m
     if step_init is None:
         # Allocate ~50% of budget to coarse sweep for reliable peak detection
@@ -935,8 +994,8 @@ def auto_select_metric(
 
     z_values = np.linspace(z_min_m, z_max_m, n_steps)
 
-    # Pre-compute all reconstructions once
-    amplitudes: List[np.ndarray] = []
+    # Pre-compute all reconstructions once (store complex for phase metrics)
+    complex_fields: List[np.ndarray] = []
     for z in z_values:
         if cancel_check and cancel_check():
             raise AutofocusCancelled()
@@ -947,14 +1006,17 @@ def auto_select_metric(
             n=base_params.n,
         )
         result = recon.reconstruct_from_spectrum(field_spectrum, params)
-        amplitudes.append(np.abs(result))
+        complex_fields.append(result)
 
     # Exclude entropy — unreliable for holographic samples (false peaks)
     candidates = [fm for fm in FocusMetric if fm != FocusMetric.ENTROPY]
 
     scores: Dict[FocusMetric, float] = {}
     for fm in candidates:
-        values = np.array([_calc_metric(a, fm) for a in amplitudes])
+        if _is_phase_metric(fm):
+            values = np.array([_calc_metric(c, fm) for c in complex_fields])
+        else:
+            values = np.array([_calc_metric(np.abs(c), fm) for c in complex_fields])
         vmin, vmax = values.min(), values.max()
         if vmax - vmin < 1e-15:
             scores[fm] = -999.0
@@ -1009,7 +1071,7 @@ def scan_metric_landscape(
     fft = get_best_fft_backend()
     z_values = np.linspace(z_min_m, z_max_m, n_steps)
 
-    amplitudes: List[np.ndarray] = []
+    complex_fields: List[np.ndarray] = []
     for z in z_values:
         params = ReconstructionParams(
             wavelength_m=base_params.wavelength_m,
@@ -1018,7 +1080,7 @@ def scan_metric_landscape(
             n=base_params.n,
         )
         recon = propagate(field, params, method, fft=fft, force_python=True)
-        amplitudes.append(np.abs(recon))
+        complex_fields.append(recon)
 
     raw_scores: Dict[FocusMetric, np.ndarray] = {}
     smoothed_scores: Dict[FocusMetric, np.ndarray] = {}
@@ -1026,7 +1088,10 @@ def scan_metric_landscape(
     n_peaks_map: Dict[FocusMetric, int] = {}
 
     for fm in metrics:
-        vals = np.array([_calc_metric(a, fm) for a in amplitudes])
+        if _is_phase_metric(fm):
+            vals = np.array([_calc_metric(c, fm) for c in complex_fields])
+        else:
+            vals = np.array([_calc_metric(np.abs(c), fm) for c in complex_fields])
         vmin, vmax = vals.min(), vals.max()
         if vmax - vmin < 1e-15:
             vals_norm = np.zeros_like(vals)
@@ -1224,6 +1289,7 @@ def adaptive_distance_search(
     cancel_check: Optional[Callable[[], bool]] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
     roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> AdaptiveDistanceResult:
     """
     Adaptive Distance autofocus — automatically discovers the z-range with signal.
@@ -1251,7 +1317,7 @@ def adaptive_distance_search(
     max_evaluations : total evaluation budget
     cancel_check, on_progress : callbacks
     """
-    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds)
+    _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     maximize = not _is_minimize(metric)
     evaluations = 0
     z_hist: List[float] = []

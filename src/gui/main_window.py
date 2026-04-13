@@ -1,3 +1,4 @@
+import logging
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -8,6 +9,8 @@ from PySide6.QtCore import Qt, QSettings
 import pyqtgraph as pg
 import numpy as np
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 from .toolbar import MainToolbar
 from .status_bar import MainStatusBar
@@ -116,11 +119,13 @@ class MainWindow(QMainWindow):
         self._loaded_metadata = None
 
         self._recon_complex = None
+        self._recon_complex_raw = None   # pre-reference-subtraction field
         self._phase_unwrapped = None
         self._spectrum_mag = None
 
         # Reference hologram for phase correction
         self._reference_complex = None   # reconstructed complex field of reference
+        self._reference_fc = None        # pre-propagation extracted field (for autofocus)
         self._reference_source = None    # str: filename or "captured"
 
         # QPI state
@@ -661,6 +666,7 @@ class MainWindow(QMainWindow):
 
     def _on_recon_completed(self, result: dict) -> None:
         self._recon_complex = result.get('recon_complex')
+        self._recon_complex_raw = result.get('recon_complex_raw')
         self._spectrum_mag = result.get('spectrum_mag')
         self._phase_unwrapped = result.get('phase_unwrapped')
         
@@ -768,6 +774,7 @@ class MainWindow(QMainWindow):
             )
             ref_complex = propagate(fc, recon_params, method, force_python=True)
 
+            self._reference_fc = np.asarray(fc)  # pre-propagation (for autofocus phase metrics)
             self._reference_complex = np.asarray(ref_complex)
             self._reference_source = source_name
 
@@ -815,6 +822,7 @@ class MainWindow(QMainWindow):
     def _clear_reference(self):
         """Remove the loaded reference hologram."""
         self._reference_complex = None
+        self._reference_fc = None
         self._reference_source = None
 
         ptab = self.sidebar_tabs.process_tab
@@ -847,6 +855,7 @@ class MainWindow(QMainWindow):
         job = {
             "phase_unwrapped": self._phase_unwrapped.copy(),
             "recon_complex": self._recon_complex,
+            "recon_complex_raw": self._recon_complex_raw,
             "reference_complex": getattr(self, "_reference_complex", None),
             "wavelength_m": wl,
             "pixel_size_m": px,
@@ -860,6 +869,7 @@ class MainWindow(QMainWindow):
             "bg_correction": qtab.bg_correction_cb.isChecked(),
             "bg_poly_order": qtab.bg_poly_order.value(),
             "ref_subtract": qtab.ref_subtract_cb.isChecked(),
+            "unwrap_bg_already_removed": self.sidebar_tabs.process_tab.unwrap_post_bg.isChecked(),
         }
 
         # Disable button while computing
@@ -898,6 +908,8 @@ class MainWindow(QMainWindow):
                 msg += f" — Dry mass: {result.total_dry_mass_pg:.1f} pg"
             if result.roughness is not None:
                 msg += f" | Ra: {result.roughness.Ra*1e9:.2f} nm"
+            if result.step_height_m is not None:
+                msg += f" | Step: {result.step_height_m*1e9:.1f} nm"
             if result.phase_stats is not None:
                 msg += f" | OPD range: {result.phase_stats.range_nm:.1f} nm"
             self.status_bar.show_message(msg)
@@ -1094,7 +1106,7 @@ class MainWindow(QMainWindow):
             import pyqtgraph as pg
             import pyqtgraph.opengl as gl
         except ImportError:
-            print("WARNING: PyOpenGL not installed — 3D surface skipped")
+            log.warning("PyOpenGL not installed — 3D surface skipped")
             return
 
         from PySide6.QtCore import QTimer
@@ -1381,6 +1393,9 @@ class MainWindow(QMainWindow):
             if ftab.roi_tracker_group.isChecked() and self._phase_tracker.active:
                 roi_bounds = self._phase_tracker.get_roi_bounds()
 
+            # Pass pre-propagation reference field for phase-based focus metrics
+            ref_fc = getattr(self, '_reference_fc', None)
+
             worker = AutofocusWorker(self)
             worker.configure(
                 field=fc, base_params=params, method=method, metric=metric,
@@ -1398,6 +1413,7 @@ class MainWindow(QMainWindow):
                 ad_expand_factor=ftab.ad_expand_factor.value(),
                 ad_signal_threshold=ftab.ad_signal_threshold.value(),
                 roi_bounds=roi_bounds,
+                ref_field=ref_fc,
             )
 
             worker.progress.connect(self._af_overlay.set_status)
@@ -1531,8 +1547,9 @@ class MainWindow(QMainWindow):
         try:
             # Use unwrapped phase for detection — phase signatures reveal
             # cells, microspheres, and other phase objects more reliably
+            phase_img = self._phase_unwrapped
             objects = detect_objects(
-                self._phase_unwrapped, min_area=min_area,
+                phase_img, min_area=min_area,
                 method=method, sensitivity=sensitivity,
             )
         finally:
@@ -1556,6 +1573,11 @@ class MainWindow(QMainWindow):
                 pass
             self._roi_rect_item = None
         self._phase_tracker.reset()
+
+        # Limit to top 50 objects by area to prevent UI freeze
+        MAX_DISPLAY = 50
+        if len(objects) > MAX_DISPLAY:
+            objects = sorted(objects, key=lambda o: o.area, reverse=True)[:MAX_DISPLAY]
 
         self._detected_objects = objects
 
@@ -2307,6 +2329,19 @@ class MainWindow(QMainWindow):
         if not rtab.pixel_is_effective_cb.isChecked():
             mag = float(rtab.magnification.value())
             px_um = px_um / (mag if mag > 0 else 1.0)
+        else:
+            # Warn if pixel_is_effective is checked but the pixel size seems
+            # too large for the configured magnification (likely a config error).
+            mag = float(rtab.magnification.value())
+            if mag > 1.0 and px_um > 1.0:
+                expected = px_um / mag
+                log.warning(
+                    "'Pixel is already effective' is checked but "
+                    "pixel=%.2fµm with %.0fx magnification seems "
+                    "too large. Expected effective pixel ≈ %.3fµm. "
+                    "Uncheck the flag if this is a camera pixel size.",
+                    px_um, mag, expected
+                )
         return px_um
 
     def _phase_to_height_um(self, phase_rad: np.ndarray) -> np.ndarray:

@@ -76,7 +76,11 @@ class FocusTab(QWidget):
 
         # Metric
         self.metric_combo = QComboBox()
-        self.metric_combo.setToolTip("Focus quality metric")
+        self.metric_combo.setToolTip("Focus quality metric.\n"
+            "Phase Variance (recommended for DHM phase objects): maximizes phase contrast.\n"
+            "Amplitude Flatness: minimizes amplitude variance (phase objects have flat amplitude at focus).")
+        self.metric_combo.addItem("Phase Variance ★", FocusMetric.PHASE_VARIANCE.value)
+        self.metric_combo.addItem("Amplitude Flatness", FocusMetric.AMPLITUDE_FLATNESS.value)
         self.metric_combo.addItem("Tenengrad", FocusMetric.TENENGRAD.value)
         self.metric_combo.addItem("Gradient", FocusMetric.GRADIENT.value)
         self.metric_combo.addItem("Brenner", FocusMetric.BRENNER.value)
@@ -525,6 +529,8 @@ class FocusTab(QWidget):
     def set_state(self, state: dict):
         if "metric" in state:
             idx = self.metric_combo.findText(state["metric"])
+            if idx < 0:
+                idx = self.metric_combo.findData(state["metric"])
             if idx >= 0: self.metric_combo.setCurrentIndex(idx)
         if "algorithm" in state:
             idx = self.algo_combo.findText(state["algorithm"])

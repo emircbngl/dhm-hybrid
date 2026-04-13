@@ -79,6 +79,7 @@ class AutofocusWorker(QThread):
         ad_expand_factor: float = 2.0,
         ad_signal_threshold: float = 0.3,
         roi_bounds=None,
+        ref_field: np.ndarray | None = None,
     ):
         self._job = dict(
             field=field,
@@ -101,6 +102,7 @@ class AutofocusWorker(QThread):
             ad_expand_factor=ad_expand_factor,
             ad_signal_threshold=ad_signal_threshold,
             roi_bounds=roi_bounds,
+            ref_field=ref_field,
         )
 
     def run(self):
@@ -122,6 +124,11 @@ class AutofocusWorker(QThread):
             # Auto-downsample ×2 for faster autofocus (~4× speedup)
             ds_factor = 2
             fc, params = downsample_complex_field(fc_orig, params_orig, factor=ds_factor)
+
+            # Downsample reference field if provided (for phase metrics)
+            ref_fc = job.get("ref_field")
+            if ref_fc is not None:
+                ref_fc, _ = downsample_complex_field(ref_fc, params_orig, factor=ds_factor)
 
             # Scale ROI bounds for downsampled field
             rb = job["roi_bounds"]
@@ -162,7 +169,7 @@ class AutofocusWorker(QThread):
                     signal_threshold=job["ad_signal_threshold"],
                     max_evaluations=ad_budget,
                     cancel_check=cc, on_progress=prog,
-                    roi_bounds=rb,
+                    roi_bounds=rb, ref_field=ref_fc,
                 )
                 # Narrow the search range to detected active zone
                 zmin, zmax = ad_res.detected_range_m
@@ -183,7 +190,7 @@ class AutofocusWorker(QThread):
                     z_min_m=zmin, z_max_m=zmax,
                     n_coarse=steps, refine_factor=8, smooth_sigma=1.5,
                     on_progress=prog, cancel_check=cc,
-                    roi_bounds=rb,
+                    roi_bounds=rb, ref_field=ref_fc,
                 )
                 best_z = res.best_z_m
                 z_m_arr = res.coarse_z if res.coarse_z is not None else np.array([best_z])
@@ -196,7 +203,7 @@ class AutofocusWorker(QThread):
                     z_min_m=zmin, z_max_m=zmax,
                     coarse_steps=steps, fine_tolerance_m=1e-6,
                     cancel_check=cc, on_progress=prog,
-                    roi_bounds=rb,
+                    roi_bounds=rb, ref_field=ref_fc,
                 )
                 best_z = res.best_z_m
                 z_m_arr = np.array([best_z])
@@ -210,7 +217,7 @@ class AutofocusWorker(QThread):
                     step_init=step_init, grow_factor=grow, shrink_factor=shrink,
                     max_evaluations=steps,
                     cancel_check=cc, on_progress=prog,
-                    roi_bounds=rb,
+                    roi_bounds=rb, ref_field=ref_fc,
                 )
                 best_z = res.best_z_m
                 z_m_arr = res.z_history
@@ -224,7 +231,7 @@ class AutofocusWorker(QThread):
                     step_init=step_init, grow_factor=grow, shrink_factor=shrink,
                     max_evaluations=steps,
                     cancel_check=cc, on_progress=prog,
-                    roi_bounds=rb,
+                    roi_bounds=rb, ref_field=ref_fc,
                 )
                 best_z = res.best_z_m
                 z_m_arr = res.z_history
@@ -241,7 +248,7 @@ class AutofocusWorker(QThread):
                     smooth_sigma=1.0,
                     max_evaluations=steps,
                     cancel_check=cc, on_progress=prog,
-                    roi_bounds=rb,
+                    roi_bounds=rb, ref_field=ref_fc,
                 )
                 best_z = res.best_z_m
                 z_m_arr = res.z_history
@@ -254,7 +261,7 @@ class AutofocusWorker(QThread):
                     field=fc, base_params=params, z_values_m=z_arr,
                     method=method, metric=metric,
                     on_progress=prog, cancel_check=cc,
-                    roi_bounds=rb,
+                    roi_bounds=rb, ref_field=ref_fc,
                 )
                 best_z = res.best_z_m
                 z_m_arr = np.array(list(res.scores.keys()))

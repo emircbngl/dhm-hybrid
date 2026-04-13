@@ -1,9 +1,12 @@
+import logging
 import numpy as np
 import time
 from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker
 from core.reconstruction import propagate, ReconstructionParams, ReconstructionMethod
 from core.offaxis import OffAxisParams, extract_complex_field_offaxis_debug
 from core.phase_unwrap import unwrap_phase_advanced, UnwrapConfig
+
+log = logging.getLogger(__name__)
 
 class ReconstructionWorker(QThread):
     """
@@ -41,7 +44,6 @@ class ReconstructionWorker(QThread):
 
     def run(self):
         self.running = True
-        print("ReconWorker thread running")
         while self.running:
             job = None
             with QMutexLocker(self._mutex):
@@ -53,15 +55,11 @@ class ReconstructionWorker(QThread):
                 time.sleep(0.005)
                 continue
 
-            print("ReconWorker found job, starting _process")
             try:
                 result = self._process(job)
-                print("ReconWorker finished _process, emitting completed")
                 self.recon_completed.emit(result)
             except Exception as e:
-                import traceback
-                print("EXCEPTION IN RECON WORKER:")
-                traceback.print_exc()
+                log.exception("Reconstruction failed")
                 self.error_occurred.emit(str(e))
 
     def _process(self, job: dict) -> dict:
@@ -96,7 +94,6 @@ class ReconstructionWorker(QThread):
             )
 
         # 2. Propagation
-        print("ReconWorker: Starting Propagation")
         recon_params = ReconstructionParams(
             wavelength_m=job['wavelength'],
             pixel_size_m=job['pixel_size'],
@@ -114,9 +111,7 @@ class ReconstructionWorker(QThread):
             except Exception:
                 pass
                 
-        print("ReconWorker: Calling propagate")
         recon_complex = np.asarray(propagate(fc, recon_params, job['method'], fft=fft))
-        print("ReconWorker: Propagate finished")
 
         # Store raw (pre-reference) complex field for QPI use
         recon_complex_raw = recon_complex.copy()
@@ -124,7 +119,6 @@ class ReconstructionWorker(QThread):
         # Reference hologram subtraction (complex division)
         ref_complex = job.get('reference_complex')
         if ref_complex is not None:
-            print("ReconWorker: Applying reference subtraction")
             ref_abs = np.abs(ref_complex)
             safe_ref = np.where(ref_abs > 1e-10, ref_complex,
                                 np.ones_like(ref_complex))
@@ -133,7 +127,7 @@ class ReconstructionWorker(QThread):
         # Validate reconstruction output
         if not np.all(np.isfinite(recon_complex)):
             n_bad = int(np.sum(~np.isfinite(recon_complex)))
-            print(f"WARNING: Reconstruction contains {n_bad} non-finite values — sanitizing")
+            log.warning("Reconstruction contains %d non-finite values — sanitizing", n_bad)
             recon_complex = np.nan_to_num(recon_complex, nan=0.0, posinf=0.0, neginf=0.0)
 
         phase_unwrapped = None
@@ -149,13 +143,13 @@ class ReconstructionWorker(QThread):
                 # Validate unwrapped phase
                 if not np.all(np.isfinite(phase_unwrapped)):
                     n_bad = int(np.sum(~np.isfinite(phase_unwrapped)))
-                    print(f"WARNING: Phase unwrapping produced {n_bad} non-finite values — falling back to wrapped phase")
+                    log.warning("Phase unwrapping produced %d non-finite values — falling back to wrapped phase", n_bad)
                     phase_unwrapped = wrapped.copy()
             else:
-                print("WARNING: Wrapped phase contains non-finite values — skipping unwrap")
+                log.warning("Wrapped phase contains non-finite values — skipping unwrap")
                 phase_unwrapped = np.nan_to_num(wrapped, nan=0.0, posinf=0.0, neginf=0.0)
         except Exception as e:
-            print(f"WARNING: Phase unwrapping failed ({e}) — using wrapped phase")
+            log.warning("Phase unwrapping failed (%s) — using wrapped phase", e)
             phase_unwrapped = np.angle(recon_complex)
 
         return {

@@ -284,9 +284,10 @@ def detect_objects(
         return _detect_log_blobs(img, h, w, min_area, max_area, sensitivity, margin, image)
 
     if method == "otsu":
-        # Global Otsu threshold
+        # Global Otsu threshold — detect both bright and dark outliers
         threshold = _otsu_threshold(img) * sensitivity
-        binary = img > threshold
+        med = np.median(img)
+        binary = (img > (med + (threshold - med))) | (img < (med - (threshold - med)))
     else:
         # Adaptive local threshold (default)
         block_size = max(31, min(h, w) // 8) | 1  # ensure odd
@@ -298,9 +299,11 @@ def detect_objects(
                 0.0,
             )
         )
-        # Pixels significantly above local background
+        # Pixels significantly deviating from local background (both bright AND dark)
+        # Phase objects can appear as positive or negative phase shifts
         offset = 0.5 * sensitivity
-        binary = img > (local_mean + offset * np.maximum(local_std, 0.02))
+        deviation = np.abs(img - local_mean)
+        binary = deviation > (offset * np.maximum(local_std, 0.02))
 
     # Clean up with morphological operations
     struct = ndimage.generate_binary_structure(2, 1)
@@ -451,7 +454,7 @@ def make_roi_evaluator(
     only within the specified ROI — much faster than full-frame
     and focuses the autofocus on the region of interest.
     """
-    from .autofocus import FocusMetric, _calc_metric
+    from .autofocus import FocusMetric, _calc_metric, _is_phase_metric
 
     fft = get_best_fft_backend()
     recon = CachedReconstructor(field.shape, method, fft)
@@ -464,6 +467,7 @@ def make_roi_evaluator(
     # Map string metric name to FocusMetric enum
     metric_map = {fm.value: fm for fm in FocusMetric}
     fm = metric_map.get(metric_name, FocusMetric.TENENGRAD)
+    phase_metric = _is_phase_metric(fm)
 
     # Pre-compute clamped ROI bounds
     ny, nx = field.shape
@@ -476,8 +480,10 @@ def make_roi_evaluator(
             z_m=z, n=base_params.n,
         )
         result = recon.reconstruct_from_spectrum(field_spectrum, params)
-        amp_roi = np.abs(result[rb.y0:rb.y1, rb.x0:rb.x1])
-        return _calc_metric(amp_roi, fm)
+        roi = result[rb.y0:rb.y1, rb.x0:rb.x1]
+        if phase_metric:
+            return _calc_metric(roi, fm)
+        return _calc_metric(np.abs(roi), fm)
 
     return evaluate
 
@@ -499,13 +505,18 @@ def roi_autofocus_sweep(
 
     Returns (best_z_m, z_array, score_array).
     """
+    from .autofocus import FocusMetric, _is_minimize
+    metric_map = {fm.value: fm for fm in FocusMetric}
+    fm = metric_map.get(metric_name, FocusMetric.TENENGRAD)
+    minimize = _is_minimize(fm)
+
     evaluate = make_roi_evaluator(field, base_params, method, metric_name, roi_bounds)
 
     z_values = np.linspace(z_min_m, z_max_m, n_steps)
     scores = np.empty(n_steps, dtype=np.float64)
 
     best_z = z_values[0]
-    best_score = -float('inf')
+    best_score = float('inf') if minimize else -float('inf')
 
     for i, z in enumerate(z_values):
         if cancel_check and cancel_check():
@@ -515,7 +526,7 @@ def roi_autofocus_sweep(
             on_progress(i, n_steps)
         score = evaluate(z)
         scores[i] = score
-        if score > best_score:
+        if (minimize and score < best_score) or (not minimize and score > best_score):
             best_score = score
             best_z = z
 
@@ -539,15 +550,23 @@ def roi_autofocus_coarse_fine(
     Two-stage ROI autofocus: coarse sweep → fine sweep around best.
     Returns (best_z_m, z_array, score_array).
     """
+    from .autofocus import FocusMetric, _is_minimize
+    metric_map = {fm.value: fm for fm in FocusMetric}
+    fm = metric_map.get(metric_name, FocusMetric.TENENGRAD)
+    minimize = _is_minimize(fm)
+
     evaluate = make_roi_evaluator(field, base_params, method, metric_name, roi_bounds)
     total = coarse_steps + fine_steps
     evals = 0
+
+    def is_better(new, old):
+        return new < old if minimize else new > old
 
     # Phase 1: Coarse
     z_coarse = np.linspace(z_min_m, z_max_m, coarse_steps)
     s_coarse = np.empty(coarse_steps, dtype=np.float64)
     best_z = z_coarse[0]
-    best_score = -float('inf')
+    best_score = float('inf') if minimize else -float('inf')
 
     for i, z in enumerate(z_coarse):
         if cancel_check and cancel_check():
@@ -558,7 +577,7 @@ def roi_autofocus_coarse_fine(
             on_progress(evals, total)
         score = evaluate(z)
         s_coarse[i] = score
-        if score > best_score:
+        if is_better(score, best_score):
             best_score = score
             best_z = z
 
@@ -579,7 +598,7 @@ def roi_autofocus_coarse_fine(
             on_progress(evals, total)
         score = evaluate(z)
         s_fine[i] = score
-        if score > best_score:
+        if is_better(score, best_score):
             best_score = score
             best_z = z
 

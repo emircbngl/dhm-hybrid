@@ -200,6 +200,50 @@ def compute_roughness(
     return RoughnessResult(Ra=ra, Rq=rq, Rz=rz, Rsk=rsk, Rku=rku)
 
 
+def compute_step_height(
+    height_m: np.ndarray,
+    n_bins: int = 512,
+) -> Optional[float]:
+    """
+    Estimate step height from a height map using histogram peak detection.
+
+    For calibration gratings and step-height standards, the height histogram
+    is bimodal (two dominant levels). The step height is the distance between
+    the two tallest histogram peaks.
+
+    This is far more robust than simple peak-to-valley (Rz), which is
+    dominated by noise outliers.
+
+    Returns: step height in metres, or None if two peaks cannot be detected.
+    """
+    from scipy.signal import find_peaks
+
+    h = height_m.ravel()
+    # Use central 80% to avoid edge artifacts
+    ny, nx = height_m.shape
+    margin_y = ny // 10
+    margin_x = nx // 10
+    if margin_y > 0 and margin_x > 0:
+        h = height_m[margin_y:-margin_y, margin_x:-margin_x].ravel()
+
+    counts, edges = np.histogram(h, bins=n_bins)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+
+    # Smooth histogram to suppress noise
+    kernel_size = max(5, n_bins // 50)
+    smooth = np.convolve(counts.astype(float), np.ones(kernel_size) / kernel_size, mode='same')
+
+    peaks_idx, _ = find_peaks(smooth, height=np.max(smooth) * 0.05,
+                              distance=max(n_bins // 20, 5))
+
+    if len(peaks_idx) >= 2:
+        # Take top-2 peaks by height
+        sorted_peaks = sorted(peaks_idx, key=lambda i: smooth[i], reverse=True)[:2]
+        peak_values = sorted([centers[i] for i in sorted_peaks])
+        return float(peak_values[1] - peak_values[0])
+    return None
+
+
 def level_plane(height_m: np.ndarray) -> np.ndarray:
     """
     Remove best-fit plane from height map (tilt correction).
@@ -861,6 +905,9 @@ class QPIResult:
     cell_morph: Optional[CellMorphology] = None
     total_dry_mass_pg: Optional[float] = None
 
+    # Step height (microstructure mode)
+    step_height_m: Optional[float] = None
+
     # Segmentation
     cell_mask: Optional[np.ndarray] = None
 
@@ -931,6 +978,7 @@ def compute_qpi(
         h_for_roughness = h_m if h_m is not None else opd_m
         h_leveled = level_plane(h_for_roughness)
         result.roughness = compute_roughness(h_leveled)
+        result.step_height_m = compute_step_height(h_leveled)
         if compute_psd:
             # Pass already-leveled data to avoid redundant level_plane call
             result.psd_freq, result.psd_values = compute_psd_2d(

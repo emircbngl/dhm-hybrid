@@ -1,5 +1,8 @@
+import logging
 import numpy as np
 from PySide6.QtCore import QThread, Signal
+
+log = logging.getLogger(__name__)
 
 
 class QPIWorker(QThread):
@@ -50,12 +53,15 @@ class QPIWorker(QThread):
             # Validate input
             if not np.all(np.isfinite(phase_input)):
                 n_bad = int(np.sum(~np.isfinite(phase_input)))
-                print(f"QPI: sanitizing {n_bad} non-finite values in phase input")
+                log.warning("QPI: sanitizing %d non-finite values in phase input", n_bad)
                 phase_input = np.nan_to_num(phase_input, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Reference wave subtraction (if enabled)
             if job.get("ref_subtract") and job.get("reference_complex") is not None:
-                recon = job.get("recon_complex")
+                # Use raw (pre-reference) complex field to avoid double subtraction.
+                # The reconstruction worker already applies ref subtraction to
+                # recon_complex; using it again would divide by reference twice.
+                recon = job.get("recon_complex_raw") or job.get("recon_complex")
                 if recon is not None:
                     try:
                         corrected = subtract_reference_wave(recon, job["reference_complex"])
@@ -67,15 +73,18 @@ class QPIWorker(QThread):
                             pixel_size_m=job["pixel_size_m"],
                         )
                     except Exception as e:
-                        print(f"WARNING: Reference subtraction failed: {e}")
+                        log.warning("Reference subtraction failed: %s", e)
 
-            # Background phase correction (once, after ref subtraction)
-            if job.get("bg_correction"):
+            # Background phase correction (once, after ref subtraction).
+            # Skip if the unwrap pipeline already applied polynomial bg removal
+            # to avoid destructive double correction.
+            unwrap_already_removed_bg = job.get("unwrap_bg_already_removed", False)
+            if job.get("bg_correction") and not unwrap_already_removed_bg:
                 try:
                     order = job.get("bg_poly_order", 2)
                     phase_input = correct_background_phase(phase_input, order=order)
                 except Exception as e:
-                    print(f"WARNING: Background correction failed: {e}")
+                    log.warning("Background correction failed: %s", e)
 
             result = compute_qpi(
                 phase_unwrapped=phase_input,
