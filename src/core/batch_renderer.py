@@ -10,7 +10,7 @@ from core.phase_unwrap import unwrap_phase_advanced
 from core.ingestion import load_any
 from core.reconstruction import propagate, ReconstructionParams, ReconstructionMethod
 from core.offaxis import OffAxisParams, extract_complex_field_offaxis_debug
-from core.autofocus import FocusMetric, _calc_metric, _is_phase_metric, _is_minimize
+from core.autofocus import FocusMetric, _calc_metric, _is_minimize
 
 def _save_normalized(path: Path, arr: np.ndarray, is_phase: bool = False):
     if is_phase:
@@ -347,10 +347,9 @@ class BatchRenderer(QThread):
                 complex_field = _apply_ref(propagate(fc, recon_params, method, force_python=True))
 
                 try:
-                    data = complex_field if _is_phase_metric(metric) else np.abs(complex_field)
-                    score = _calc_metric(data, metric)
+                    score = _calc_metric(complex_field, metric)
                 except Exception:
-                    score = float(np.var(np.abs(complex_field)))
+                    score = float(np.var(np.angle(complex_field)))
 
                 if writer:
                     writer.writerow([job.in_file.name, prof, f"{z_val:.4f}", f"{score:.2f}"])

@@ -76,11 +76,11 @@ class FocusTab(QWidget):
 
         # Metric
         self.metric_combo = QComboBox()
-        self.metric_combo.setToolTip("Focus quality metric.\n"
-            "Phase Variance (recommended for DHM phase objects): maximizes phase contrast.\n"
-            "Amplitude Flatness: minimizes amplitude variance (phase objects have flat amplitude at focus).")
+        self.metric_combo.setToolTip(
+            "Focus quality metric — all operate on phase (wrap-safe).\n"
+            "Phase Variance (recommended for DHM phase objects): maximizes phase contrast."
+        )
         self.metric_combo.addItem("Phase Variance ★", FocusMetric.PHASE_VARIANCE.value)
-        self.metric_combo.addItem("Amplitude Flatness", FocusMetric.AMPLITUDE_FLATNESS.value)
         self.metric_combo.addItem("Tenengrad", FocusMetric.TENENGRAD.value)
         self.metric_combo.addItem("Gradient", FocusMetric.GRADIENT.value)
         self.metric_combo.addItem("Brenner", FocusMetric.BRENNER.value)

@@ -121,17 +121,28 @@ class AutofocusWorker(QThread):
             zmax = job["z_max_m"]
             steps = job["steps"]
 
-            # Auto-downsample ×2 for faster autofocus (~4× speedup)
+            # Smart downsampling: skip 2× if ROI is small (preserves small features)
+            rb = job["roi_bounds"]
             ds_factor = 2
-            fc, params = downsample_complex_field(fc_orig, params_orig, factor=ds_factor)
+            if rb is not None:
+                roi_w = abs(rb.x1 - rb.x0)
+                roi_h = abs(rb.y1 - rb.y0)
+                if max(roi_w, roi_h) < 128:
+                    ds_factor = 1  # small ROI → keep full resolution
+
+            if ds_factor > 1:
+                fc, params = downsample_complex_field(fc_orig, params_orig, factor=ds_factor)
+            else:
+                fc, params = fc_orig, params_orig
 
             # Downsample reference field if provided (for phase metrics)
             ref_fc = job.get("ref_field")
-            if ref_fc is not None:
+            if ref_fc is not None and ds_factor > 1:
                 ref_fc, _ = downsample_complex_field(ref_fc, params_orig, factor=ds_factor)
+            elif ref_fc is None:
+                pass  # no ref field
 
             # Scale ROI bounds for downsampled field
-            rb = job["roi_bounds"]
             if rb is not None and ds_factor > 1:
                 from core.phase_tracker import ROIBounds
                 rb = ROIBounds(
@@ -160,7 +171,14 @@ class AutofocusWorker(QThread):
             ad_f_hist = np.array([])
             if job["use_adaptive_distance"]:
                 self.progress.emit("Adaptive Distance: discovering signal range...")
-                ad_budget = max(30, int(steps * 0.5))
+                # Budget must cover log2(max_range/init_range) expansion iterations
+                # at 15 pts per iter, plus margin. With init=0.5mm, max=50mm the
+                # expansion needs ~7 doublings; 30 evals (old default) stalled at ±1mm.
+                import math
+                expand_depth = max(1, math.ceil(math.log2(
+                    job["ad_max_range_m"] / max(job["ad_initial_range_m"], 1e-15)
+                )))
+                ad_budget = max(60, expand_depth * 15 + 15, int(steps * 0.5))
                 ad_res = adaptive_distance_search(
                     field=fc, base_params=params, method=method, metric=metric,
                     initial_range_m=job["ad_initial_range_m"],
@@ -175,13 +193,19 @@ class AutofocusWorker(QThread):
                 zmin, zmax = ad_res.detected_range_m
                 ad_z_hist = ad_res.z_history
                 ad_f_hist = ad_res.score_history
-                steps = max(steps - ad_res.evaluations, 10)
+                # Keep a healthy refinement budget — don't subtract AdDist cost,
+                # user's `steps` is meant for refinement density, not a global cap.
+                steps = max(steps, 20)
                 self.progress.emit(
                     f"Range found: {zmin*1e3:.3f} \u2013 {zmax*1e3:.3f} mm \u2192 refining with {algo}..."
                 )
-                # Recalculate step_init for adaptive algorithms within new range
-                if step_init is None or job["use_adaptive_distance"]:
-                    step_init = (zmax - zmin) / 20.0
+                # After AdDist narrows the range, let the refinement algorithm pick
+                # its own default step_init — passing (range/20) forced tiny steps
+                # that couldn't traverse a wide detected range in the forward scan.
+                if step_init is not None and not job["use_adaptive_distance"]:
+                    pass  # keep user-supplied step_init
+                else:
+                    step_init = None  # let algorithm choose (full_range/10 for AdGrad)
 
             if algo == FocusTab.ALGO_ROBUST:
                 self.progress.emit("Running Robust Coarse-to-Fine...")

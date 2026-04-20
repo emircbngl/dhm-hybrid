@@ -454,7 +454,7 @@ def make_roi_evaluator(
     only within the specified ROI — much faster than full-frame
     and focuses the autofocus on the region of interest.
     """
-    from .autofocus import FocusMetric, _calc_metric, _is_phase_metric
+    from .autofocus import FocusMetric, _calc_metric
 
     fft = get_best_fft_backend()
     recon = CachedReconstructor(field.shape, method, fft)
@@ -467,7 +467,6 @@ def make_roi_evaluator(
     # Map string metric name to FocusMetric enum
     metric_map = {fm.value: fm for fm in FocusMetric}
     fm = metric_map.get(metric_name, FocusMetric.TENENGRAD)
-    phase_metric = _is_phase_metric(fm)
 
     # Pre-compute clamped ROI bounds
     ny, nx = field.shape
@@ -481,9 +480,7 @@ def make_roi_evaluator(
         )
         result = recon.reconstruct_from_spectrum(field_spectrum, params)
         roi = result[rb.y0:rb.y1, rb.x0:rb.x1]
-        if phase_metric:
-            return _calc_metric(roi, fm)
-        return _calc_metric(np.abs(roi), fm)
+        return _calc_metric(roi, fm)
 
     return evaluate
 

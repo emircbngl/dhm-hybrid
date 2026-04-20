@@ -155,6 +155,7 @@ class MainWindow(QMainWindow):
         self._line_profile_curve = None
         self._line_profile_stats = None
         self._lp_ch = None  # crosshair measurement state
+        self._lp_panel_combo = None  # panel selector combo in line profile dialog
 
         self._frame_counter = 0
         self._adaptive_state = None
@@ -228,6 +229,10 @@ class MainWindow(QMainWindow):
             self._on_camera_disconnect()
         except Exception:
             pass
+        # Clean up QPI, 3D, and line profile windows
+        self._cleanup_qpi_dialog()
+        self._cleanup_3d_window()
+        self._clear_line_profile()
         super().closeEvent(event)
 
     def _save_layout(self):
@@ -269,6 +274,11 @@ class MainWindow(QMainWindow):
             lambda: self.image_grid.toggle_maximize(self.panel_spectrum)
         )
         
+        # Reconstruct
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(
+            self._trigger_reconstruction
+        )
+
         # Restore grid
         QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(
             self.image_grid.restore_grid
@@ -302,6 +312,7 @@ class MainWindow(QMainWindow):
         """Wires up UI interactions to their handlers."""
         self.toolbar.file_load_requested.connect(self._load_file_path)
         self.toolbar.batch_show_requested.connect(self._show_batch_dock)
+        self.toolbar.reconstruct_requested.connect(self._trigger_reconstruction)
         self.toolbar.mode_combo.currentTextChanged.connect(self._on_mode_changed)
         
         # Profile bindings
@@ -551,6 +562,19 @@ class MainWindow(QMainWindow):
         self._spectrum_mag = None
 
         self._clear_export_crop_roi()
+
+        # Clean up stale analysis state from previous file
+        self._clear_line_profile()
+        if hasattr(self, 'toolbar') and self.toolbar.action_line_profile.isChecked():
+            self.toolbar.action_line_profile.blockSignals(True)
+            self.toolbar.action_line_profile.setChecked(False)
+            self.toolbar.action_line_profile.blockSignals(False)
+        self._cleanup_qpi_dialog()
+        self._cleanup_3d_window()
+        self._qpi_last_result = None
+        self.sidebar_tabs.qpi_tab.clear_stats()
+        self.sidebar_tabs.qpi_tab.compute_btn.setEnabled(False)
+
         self._update_info()
 
         # Update input image view
@@ -560,6 +584,7 @@ class MainWindow(QMainWindow):
         
         # Enable processing buttons now that we have data
         self.sidebar_tabs.recon_tab.recon_btn.setEnabled(True)
+        self.toolbar.action_reconstruct.setEnabled(True)
         self.sidebar_tabs.focus_tab.autofocus_btn.setEnabled(True)
         self.sidebar_tabs.focus_tab.benchmark_btn.setEnabled(True)
         self.sidebar_tabs.focus_tab.diagnostic_btn.setEnabled(True)
@@ -650,6 +675,7 @@ class MainWindow(QMainWindow):
             return
 
         self.sidebar_tabs.recon_tab.recon_btn.setEnabled(False)
+        self.toolbar.action_reconstruct.setEnabled(False)
         job = self._build_recon_job()
 
         # Warn about negative z (back-propagation / evanescent waves)
@@ -691,10 +717,23 @@ class MainWindow(QMainWindow):
             self._update_roi_tracking(np.abs(self._recon_complex))
 
         self.sidebar_tabs.recon_tab.recon_btn.setEnabled(True)
+        self.toolbar.action_reconstruct.setEnabled(True)
         has_phase = self._phase_unwrapped is not None
         self.sidebar_tabs.qpi_tab.compute_btn.setEnabled(has_phase)
         self.sidebar_tabs.focus_tab.detect_objects_btn.setEnabled(has_phase)
         self.status_bar.show_message("Reconstruction complete")
+
+        # Auto-refresh open QPI windows using the new reconstruction data.
+        # Without this, the QPI dialog and 3D surface keep stale results from
+        # the previous z until the user manually clicks "Compute QPI" again.
+        if has_phase and self._qpi_dialog is not None:
+            from shiboken6 import isValid
+            if isValid(self._qpi_dialog):
+                self._compute_qpi()
+
+        # Live line profile on phase: update when new phase data arrives.
+        if self._line_profile_roi is not None and self._phase_unwrapped is not None:
+            self._update_line_profile()
 
     def _display_recon_images(self) -> None:
         """Display amplitude & phase with optional contrast enhancement."""
@@ -892,6 +931,9 @@ class MainWindow(QMainWindow):
         qtab.compute_btn.setText("Compute QPI")
 
         try:
+            # Clear stale stats from previous computation before populating
+            qtab.clear_stats()
+
             # Populate stats panels
             if result.phase_stats is not None:
                 qtab.set_phase_stats(result.phase_stats)
@@ -957,6 +999,17 @@ class MainWindow(QMainWindow):
 
         img = pg.ImageItem(image=data)
         cmap = pg.colormap.get(cmap_name, source="matplotlib")
+        if cmap is None:
+            cmap = pg.colormap.get(cmap_name, source=None)
+        if cmap is None:
+            try:
+                from matplotlib.cm import get_cmap as _get_cmap
+                mpl_cm = _get_cmap(cmap_name)
+                positions = np.linspace(0, 1, 256)
+                colors = (mpl_cm(positions) * 255).astype(np.uint8)
+                cmap = pg.ColorMap(pos=positions, color=colors)
+            except Exception:
+                cmap = pg.colormap.get("CET-L1")  # built-in fallback
         img.setLookupTable(cmap.getLookupTable(nPts=256))
 
         # Scale axes to micrometers if pixel size is known
@@ -990,14 +1043,23 @@ class MainWindow(QMainWindow):
 
     def _cleanup_qpi_dialog(self):
         """Safely close the QPI results dialog."""
-        if self._qpi_dialog is not None:
+        dlg = self._qpi_dialog
+        self._qpi_dialog = None  # Clear first to prevent re-entrant issues
+        if dlg is not None:
             try:
                 from shiboken6 import isValid
-                if isValid(self._qpi_dialog):
-                    self._qpi_dialog.close()
+                if isValid(dlg):
+                    # Disconnect the destroyed→_cleanup_3d_window handler before
+                    # closing. WA_DeleteOnClose schedules an async delete; without
+                    # this disconnect, the stale fire would kill the *next* 3D
+                    # window created just after the dialog is replaced.
+                    try:
+                        dlg.destroyed.disconnect(self._cleanup_3d_window)
+                    except (TypeError, RuntimeError):
+                        pass
+                    dlg.close()
             except Exception:
                 pass
-            self._qpi_dialog = None
 
     def _show_qpi_window(self, result, qtab) -> None:
         """Open a window showing QPI map results in a proper grid layout."""
@@ -1078,12 +1140,26 @@ class MainWindow(QMainWindow):
             grid.addWidget(panel, i // 2, i % 2)
         main_layout.addWidget(grid_widget)
 
+        # Bottom bar with 3D button
+        from PySide6.QtWidgets import QHBoxLayout, QPushButton
+        bottom_bar = QHBoxLayout()
+        bottom_bar.addStretch()
+        btn_3d = QPushButton("Show 3D Surface")
+        btn_3d.setToolTip("Open interactive 3D surface view of height/OPD data")
+        has_surface = (_has_data(result.height_nm) or _has_data(result.opd_nm))
+        btn_3d.setEnabled(has_surface)
+        btn_3d.clicked.connect(lambda: self._show_3d_surface(result))
+        bottom_bar.addWidget(btn_3d)
+        main_layout.addLayout(bottom_bar)
+
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda: setattr(self, '_qpi_dialog', None))
+        dlg.destroyed.connect(self._cleanup_3d_window)
         dlg.show()
         self._qpi_dialog = dlg
         self._qpi_last_result = result
 
-        # 3D surface as separate window
+        # 3D surface as separate window (auto-open if checkbox is checked)
         if qtab.show_3d_cb.isChecked():
             self._show_3d_surface(result)
 
@@ -1098,55 +1174,50 @@ class MainWindow(QMainWindow):
             self._qpi_3d_window = None
 
     def _show_3d_surface(self, result) -> None:
-        """Open a standalone 3D surface window with progressive refinement."""
+        """Open (or refresh) the 3D surface window with progressive refinement.
+
+        Reuses the existing GLViewWidget when possible. Creating a fresh
+        GLViewWidget while the previous one is still being deleted by Qt caused
+        the new window to render pitch-black (OpenGL context torn down mid-init).
+        """
         surface_data = result.height_nm if result.height_nm is not None else result.opd_nm
         if surface_data is None or surface_data.size == 0:
             return
         try:
             import pyqtgraph as pg
             import pyqtgraph.opengl as gl
-        except ImportError:
-            log.warning("PyOpenGL not installed — 3D surface skipped")
+        except ImportError as e:
+            msg = f"3D Surface unavailable — PyOpenGL not installed ({e}). Run: pip install PyOpenGL PyOpenGL-accelerate"
+            log.warning(msg)
+            self.status_bar.show_message(msg)
             return
 
         from PySide6.QtCore import QTimer
         from shiboken6 import isValid
 
-        # Close previous 3D window before creating a new one
-        self._cleanup_3d_window()
-
         px_um = self._get_effective_pixel_um()
-
-        w = gl.GLViewWidget()
-        w.setWindowTitle("QPI — 3D Surface")
-        w.resize(700, 550)
-
         full_data = surface_data.copy()
         cmap = pg.colormap.get("viridis", source="matplotlib")
+        if cmap is None:
+            cmap = pg.colormap.get("viridis", source=None)
+        if cmap is None:
+            cmap = pg.colormap.get("CET-L1")
 
-        # Physical extent of the full image in µm
         full_w_um = full_data.shape[1] * px_um
         full_h_um = full_data.shape[0] * px_um
         xy_extent = max(full_w_um, full_h_um)
 
         def _build_surface(data, max_dim):
-            """Build a GLSurfacePlotItem at given resolution, scaled to µm."""
             if data.shape[0] > max_dim or data.shape[1] > max_dim:
-                # Uniform step to preserve aspect ratio (no distortion)
                 step = max(1, max(data.shape[0], data.shape[1]) // max_dim)
                 data = data[::step, ::step]
-
             ny, nx = data.shape
-            # Uniform pixel spacing in µm (same for both axes)
-            eff_px = px_um * (full_data.shape[1] / nx)  # how many original pixels per grid point
-
+            eff_px = px_um * (full_data.shape[1] / nx)
             z_range = float(np.ptp(data))
             z_scale = 1.0 if z_range == 0 else xy_extent / (z_range * 3)
-
             d_min, d_max = float(np.nanmin(data)), float(np.nanmax(data))
             norm = (data - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(data)
             colors = cmap.map(norm.ravel(), mode="float").reshape(ny, nx, 4)
-
             surface = gl.GLSurfacePlotItem(
                 z=data.astype(np.float64),
                 colors=colors,
@@ -1155,43 +1226,56 @@ class MainWindow(QMainWindow):
             surface.translate(-nx * eff_px / 2, -ny * eff_px / 2, 0)
             return surface
 
-        # Step 1: Show low-res immediately (64×64)
-        current_surface = _build_surface(full_data, max_dim=64)
-        w.addItem(current_surface)
+        def _fresh_grid():
+            g = gl.GLGridItem()
+            g.setSize(full_w_um, full_h_um)
+            g.setSpacing(max(1, full_w_um / 10), max(1, full_h_um / 10))
+            return g
 
-        grid = gl.GLGridItem()
-        grid.setSize(full_w_um, full_h_um)
-        grid.setSpacing(max(1, full_w_um / 10), max(1, full_h_um / 10))
+        w = self._qpi_3d_window
+        first_time = w is None or not isValid(w)
+        if first_time:
+            w = gl.GLViewWidget()
+            w.setWindowTitle("QPI — 3D Surface")
+            w.resize(700, 550)
+            self._qpi_3d_window = w
+        else:
+            # Reuse the existing widget — remove old items before adding new ones
+            for item in list(w.items):
+                try:
+                    w.removeItem(item)
+                except Exception:
+                    pass
+
+        current_surface = _build_surface(full_data, max_dim=64)
+        grid = _fresh_grid()
+        w.addItem(current_surface)
         w.addItem(grid)
 
-        w.setCameraPosition(distance=xy_extent * 1.5, elevation=30, azimuth=45)
+        if first_time:
+            w.setCameraPosition(distance=xy_extent * 1.5, elevation=30, azimuth=45)
         w.show()
-        self._qpi_3d_window = w
+        w.raise_()
+        w.activateWindow()
 
-        # State for progressive refinement
         state = {"current": current_surface, "grid": grid}
 
         def _refine(max_dim):
             if self._qpi_3d_window is not w or not isValid(w):
-                return  # window was replaced or destroyed
+                return
             try:
                 w.removeItem(state["current"])
                 w.removeItem(state["grid"])
             except Exception:
                 return
             new_surface = _build_surface(full_data, max_dim=max_dim)
+            new_grid = _fresh_grid()
             w.addItem(new_surface)
-            new_grid = gl.GLGridItem()
-            new_grid.setSize(full_w_um, full_h_um)
-            new_grid.setSpacing(max(1, full_w_um / 10), max(1, full_h_um / 10))
             w.addItem(new_grid)
             state["current"] = new_surface
             state["grid"] = new_grid
 
-        # Step 2: Medium-res after 150ms (128×128)
         QTimer.singleShot(150, lambda: _refine(128))
-
-        # Step 3: Full-res after 500ms (256×256)
         QTimer.singleShot(500, lambda: _refine(256))
 
     def _on_qpi_display_changed(self):
@@ -1203,6 +1287,13 @@ class MainWindow(QMainWindow):
 
     # ─── Camera Live Mode Hooks ───
     def _on_mode_changed(self, mode: str):
+        # Clean up analysis state on mode switch
+        self._clear_line_profile()
+        if hasattr(self, 'toolbar') and self.toolbar.action_line_profile.isChecked():
+            self.toolbar.action_line_profile.blockSignals(True)
+            self.toolbar.action_line_profile.setChecked(False)
+            self.toolbar.action_line_profile.blockSignals(False)
+
         tabs = self.sidebar_tabs.tabs
         cam_tab = self.sidebar_tabs.camera_tab
         rec_tab = self.sidebar_tabs.record_tab
@@ -2204,9 +2295,19 @@ class MainWindow(QMainWindow):
                 self.toolbar.action_line_profile.setChecked(False)
                 return
 
-            # Place ROI on amplitude panel (always has data, easier to see)
-            panel = self.panel_amp
-            img_item = panel.view.getImageItem()
+            # Default to phase panel — that's where the measurement lives.
+            # Fall back to amplitude only if phase panel isn't showing an image
+            # yet (e.g. Wrapped mode with no wrapped data set).
+            phase_img = self.panel_phase.image_panel.view.getImageItem()
+            if phase_img is not None and phase_img.image is not None:
+                panel = self.panel_phase
+                img_item = phase_img
+                initial_combo_index = 1  # "Phase"
+            else:
+                panel = self.panel_amp
+                img_item = panel.view.getImageItem()
+                initial_combo_index = 0  # "Amplitude"
+
             if img_item is None or img_item.image is None:
                 self.status_bar.show_message("Load an image first")
                 self.toolbar.action_line_profile.setChecked(False)
@@ -2226,12 +2327,25 @@ class MainWindow(QMainWindow):
             self._line_profile_panel = panel
 
             # Create profile plot dialog with crosshair measurement
-            from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
+            from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox
             dlg = QDialog(self)
             dlg.setWindowTitle("Phase Line Profile — Crosshair Measurement")
-            dlg.resize(620, 340)
+            dlg.resize(620, 380)
             dlg_layout = QVBoxLayout(dlg)
             dlg_layout.setContentsMargins(4, 4, 4, 4)
+
+            # Panel selector
+            panel_bar = QHBoxLayout()
+            panel_bar.addWidget(QLabel("ROI Panel:"))
+            panel_combo = QComboBox()
+            panel_combo.addItem("Amplitude", "amp")
+            panel_combo.addItem("Phase", "phase")
+            panel_combo.setCurrentIndex(initial_combo_index)
+            panel_combo.currentIndexChanged.connect(self._on_line_profile_panel_changed)
+            panel_bar.addWidget(panel_combo)
+            panel_bar.addStretch()
+            dlg_layout.addLayout(panel_bar)
+            self._lp_panel_combo = panel_combo
 
             pw = pg.PlotWidget()
             pw.setLabel("bottom", "Lateral Distance (µm)")
@@ -2476,6 +2590,25 @@ class MainWindow(QMainWindow):
         ch["sel2_label"].setText("Sel 2 (Right Click): —")
         ch["delta_label"].setText("Δ: —")
 
+    def _on_line_profile_panel_changed(self, index: int) -> None:
+        """Move line profile ROI between amplitude and phase panels."""
+        roi = self._line_profile_roi
+        old_panel = self._line_profile_panel
+        if roi is None or old_panel is None:
+            return
+
+        new_panel = self.panel_amp if index == 0 else self.panel_phase
+        if new_panel is old_panel:
+            return
+
+        try:
+            old_panel.get_view().removeItem(roi)
+        except Exception:
+            pass
+        new_panel.get_view().addItem(roi)
+        self._line_profile_panel = new_panel
+        self._update_line_profile()
+
     def _clear_line_profile(self) -> None:
         """Remove line profile ROI and close plot window."""
         if self._line_profile_roi is not None and self._line_profile_panel is not None:
@@ -2498,6 +2631,7 @@ class MainWindow(QMainWindow):
         self._line_profile_curve = None
         self._line_profile_stats = None
         self._lp_ch = None
+        self._lp_panel_combo = None
 
     def _on_export_view(self) -> None:
         """Export the current image grid as a PNG."""

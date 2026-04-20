@@ -63,9 +63,13 @@ class ReconstructionWorker(QThread):
                 self.error_occurred.emit(str(e))
 
     def _process(self, job: dict) -> dict:
+        t_total = time.perf_counter()
         img = job['image']
+        log.info("[RECON] Start — image %s, z=%.4f mm, method=%s",
+                 img.shape, job['z']*1e3, job['method'])
         
         # Preprocessing
+        t0 = time.perf_counter()
         if job.get('subtract_mean', False):
             img = img - float(np.mean(img))
         if job.get('hann_window', False):
@@ -75,14 +79,17 @@ class ReconstructionWorker(QThread):
             
         if np.max(np.abs(img)) > 0:
             img = img / float(np.max(np.abs(img)))
+        log.info("[RECON]  preprocess: %.3fs", time.perf_counter() - t0)
 
         # 1. Offaxis extraction (with soft-edge spectral mask)
+        t0 = time.perf_counter()
         offaxis_params = OffAxisParams(
             radius=job.get('mask_radius', 80),
             apodization=job.get('mask_apodization', 'tukey'),
             rolloff=job.get('mask_rolloff', 0.25),
         )
         fc, center, spec, mask = extract_complex_field_offaxis_debug(img, offaxis_params)
+        log.info("[RECON]  offaxis:    %.3fs", time.perf_counter() - t0)
         
         # 1.5. Frequency domain filtering (if enabled)
         if job.get('filter_enable', False):
@@ -94,6 +101,7 @@ class ReconstructionWorker(QThread):
             )
 
         # 2. Propagation
+        t0 = time.perf_counter()
         recon_params = ReconstructionParams(
             wavelength_m=job['wavelength'],
             pixel_size_m=job['pixel_size'],
@@ -108,12 +116,14 @@ class ReconstructionWorker(QThread):
             from core.fft_backend import get_best_fft_backend, FFTBackendName
             try:
                 fft = get_best_fft_backend(prefer=FFTBackendName(fft_name))
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("FFT backend '%s' unavailable, using default: %s", fft_name, e)
                 
         recon_complex = np.asarray(propagate(fc, recon_params, job['method'], fft=fft))
+        log.info("[RECON]  propagate:  %.3fs", time.perf_counter() - t0)
 
         # Store raw (pre-reference) complex field for QPI use
+        t0 = time.perf_counter()
         recon_complex_raw = recon_complex.copy()
 
         # Reference hologram subtraction (complex division)
@@ -124,6 +134,8 @@ class ReconstructionWorker(QThread):
                                 np.ones_like(ref_complex))
             recon_complex = recon_complex / safe_ref
 
+        log.info("[RECON]  ref_sub:    %.3fs", time.perf_counter() - t0)
+
         # Validate reconstruction output
         if not np.all(np.isfinite(recon_complex)):
             n_bad = int(np.sum(~np.isfinite(recon_complex)))
@@ -131,10 +143,12 @@ class ReconstructionWorker(QThread):
             recon_complex = np.nan_to_num(recon_complex, nan=0.0, posinf=0.0, neginf=0.0)
 
         phase_unwrapped = None
+        t0 = time.perf_counter()
         try:
             wrapped = np.angle(recon_complex)
             if np.all(np.isfinite(wrapped)):
                 unwrap_cfg = job.get('unwrap_config', None)
+                log.info("[RECON]  unwrap method: %s", unwrap_cfg.method if unwrap_cfg else 'default')
                 phase_unwrapped = unwrap_phase_advanced(
                     wrapped, config=unwrap_cfg, complex_field=recon_complex,
                     wavelength_m=job.get('wavelength'),
@@ -151,6 +165,8 @@ class ReconstructionWorker(QThread):
         except Exception as e:
             log.warning("Phase unwrapping failed (%s) — using wrapped phase", e)
             phase_unwrapped = np.angle(recon_complex)
+        log.info("[RECON]  unwrap:     %.3fs", time.perf_counter() - t0)
+        log.info("[RECON]  TOTAL:      %.3fs", time.perf_counter() - t_total)
 
         return {
             'frame_num': job['frame_num'],

@@ -12,3 +12,5 @@ qtpy
 scipy
 pyfftw
 matplotlib
+PyOpenGL
+PyOpenGL-accelerate

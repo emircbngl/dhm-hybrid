@@ -34,7 +34,7 @@ MASK_RADIUS = 80
 METHOD = ReconstructionMethod.ASM
 Z_MIN_M = 0.0
 Z_MAX_M = 120e-3  # 0–120 mm
-IMAGE_PATH = ROOT / "ilk_imgbackCCD_24.10mm.png"
+IMAGE_PATH = ROOT / "labtest" / "ilk_imgbackCCD_24.10mm.png"
 
 
 def load_and_preprocess():

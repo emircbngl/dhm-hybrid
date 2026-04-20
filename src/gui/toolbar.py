@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
     QHBoxLayout,
     QDoubleSpinBox,
+    QSizePolicy,
 )
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtCore import Signal, Qt
@@ -32,6 +33,7 @@ class MainToolbar(QToolBar):
     crosshair_toggled = Signal(bool)
     line_profile_toggled = Signal(bool)
     export_view_requested = Signal()
+    reconstruct_requested = Signal()
 
     def __init__(self, parent: QWidget = None):
         super().__init__("Main Toolbar", parent)
@@ -127,6 +129,18 @@ class MainToolbar(QToolBar):
         tools_btn.setMenu(self._tools_menu)
         tools_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.addWidget(tools_btn)
+
+        # Spacer pushes Reconstruct to the far right
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.addWidget(spacer)
+
+        # Reconstruct (always visible, works from any tab)
+        self.action_reconstruct = QAction("⬢ Reconstruct", self)
+        self.action_reconstruct.setToolTip("Run reconstruction with current parameters (Ctrl+R)")
+        self.action_reconstruct.setEnabled(False)
+        self.action_reconstruct.triggered.connect(self.reconstruct_requested.emit)
+        self.addAction(self.action_reconstruct)
 
     def _on_scalebar_length_changed(self, val: float) -> None:
         """Re-trigger scalebar if it's currently active."""
