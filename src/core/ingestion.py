@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -7,6 +8,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 
 from .metadata_reader import read_embedded_metadata
+
+logger = logging.getLogger(__name__)
 
 
 class UnsupportedFormatError(RuntimeError):
@@ -107,10 +110,10 @@ def load_tiff(path: Union[str, Path]) -> LoadedData:
                     if key in tags:
                         try:
                             meta[key] = tags[key].value
-                        except Exception:
-                            pass
-    except Exception:
-        pass
+                        except Exception as exc:
+                            logger.debug("TIFF tag %s parse failed: %s", key, exc)  # inner
+    except Exception as exc:
+        logger.debug("TIFF metadata read failed for %s: %s", p, exc)  # outer
 
     acq = read_embedded_metadata(p, extra=meta)
     if acq.wavelength_m is not None:

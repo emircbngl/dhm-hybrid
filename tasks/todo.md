@@ -1,175 +1,127 @@
-# Plan — 2026-04-17
+# Plan — 2026-04-21 — Faz 1.1 (v1.0.1-ux)
 
 ## Context
-User requested:
-1. Fix: "Surface" 3D window not opening
-2. Feature: All autofocus algorithms should operate on PHASE (not amplitude) from now on
-3. Optimization: Split large files if it helps the program run / be maintained better
-4. Question: What do `n_sample` / `n_medium` in QPI actually do?
+Faz 1 (v1.0.0, 2026-04-20) teknik review'ı geçti ama lab pilotunda **hem teknik hem görsel** UX problemiyle geri döndü (Anna / Lindqvist lab). Dil karışımı, sessiz recon/QPI, transient hata, parameter amnezisi, klavye yokluğu, cancel yokluğu — altı şikâyet. Analiz: bunların yarısı yüzey (copy, tema, klavye) ama diğer yarısı **worker-level mimari eksiklik** (progress signal yok, error shape lossy, interruption check yok, command registry yok, settings schema typed değil).
+
+Hedef: Faz 2'ye (AI segmentasyon, licensing, PDF) geçmeden v1.0.1-ux patch'iyle dön. Rams/Ma/Ive penceresinden: *"Dış sessizlik, iç rijitliğe borçlu."*
+
+## Strateji: iki tier
+- **Tier 0 — invisible plumbing (~8 gün):** Faz 1.1'in %70'i. Lab açsa hiçbir görsel fark görmez. Ama üstüne güvenilir Tier 1 çakılır.
+- **Tier 1 — visible design (~4 gün):** Tier 0'ı *tüketir*. Command palette, toast, sessiz progress line, persistence, dil reduction.
 
 ---
 
-## 1. Surface window bug ✅
+## Tier 0 — plumbing ✅ SHIPPED (2026-04-21)
 
-- [x] `pip install PyOpenGL PyOpenGL-accelerate` into `venv/`
-- [x] Surface the warning to the status bar when import fails
-- [x] Manual smoke planned for end of session
+### T0.1 · `src/core/progress.py` — progress protocol ✅
+- [x] `ProgressEvent(operation_id, operation_kind, phase, phase_index, phase_count, pct, elapsed_s, eta_s, message, done, cancelled)` frozen dataclass
+- [x] `Operation` context manager — elapsed tracking, ETA hesaplama, phase transitions
+- [x] Pure Python; Qt bağlantısı worker katmanında
+- [x] `tests/test_progress.py` (9 test)
 
-**Root cause**: `PyOpenGL` was listed in `requirements.txt` but not installed in the Hybrid `venv/`. The original code swallowed the ImportError silently. Fix: install + surface future failures to the status bar so they can't be silent again (`src/gui/main_window.py:1156-1255`).
+### T0.2 · `src/core/errors.py` — structured error bus ✅
+- [x] `Severity` enum (INFO / WARN / ERROR / FATAL)
+- [x] `ErrorEvent(severity, title, cause, action, context, trace, timestamp, event_id)` frozen dataclass
+- [x] `ErrorCenter` singleton: `subscribe(fn, min_severity=)`, `emit(event)`, bounded session history
+- [x] Built-in sinks: `logger_sink` + `audit_sink`
+- [x] `tests/test_errors.py` (14 test)
 
-## 2. Autofocus → phase ✅
+### T0.3 · `src/core/settings_schema.py` + `src/gui/settings_store.py` ✅
+- [x] `SCHEMA_VERSION = 2`
+- [x] `ReconDefaults`, `AutofocusDefaults`, `QPIDefaults`, `IODefaults`, `AppSettings` dataclass'ları
+- [x] `gui/settings_store.py` — `QSettings` IniFormat + UserScope; load/save; v1 → v2 migrator
+- [x] `validate()` tipli uyarılarla; invalid on-disk state → defaults fallback
+- [x] `tests/test_settings_schema.py` (13 test)
 
-- [x] Added `_phase_of` and `_wrap_diff` helpers
-- [x] Rewrote `_calc_metric` so all 11 metrics run on phase (wrap-safe for neighbour-differences; sin/cos decomposition for Tenengrad/Laplacian; circular statistics for Vollath/Normalized variance; HF energy of `exp(iφ)` for spectral energy)
-- [x] Removed `AMPLITUDE_FLATNESS` entirely (user: "sana bırakıyorum" — chose removal to keep the "all-phase" philosophy coherent)
-- [x] Removed `_is_phase_metric()` and simplified `_make_fast_evaluator` to always receive complex
-- [x] `_is_minimize` returns `True` only for `ENTROPY` — every other phase metric peaks at focus
-- [x] Propagated changes to `src/core/phase_tracker.py`, `src/core/batch_renderer.py`, `src/gui/sidebar/focus_tab.py`, `test_af_visual.py`, `tools/tool_autofocus.py`, `tools/tool_full_pipeline.py`, `tools/README.md`
-- [x] Verified on real hologram: bench_af.py reference sweep converged at z≈44.37mm (120 steps) / z≈42.71mm (60 steps); all search algorithms (Linear, Golden, Robust C2F, Bracketing) cluster at 44-45mm
-- [x] Re-tested after package split: same convergence behavior
+### T0.4 · `reconstruction_worker.py` refactor ✅
+- [x] `_process` → 7 faz (preprocess, offaxis, freqfilter, propagate, refsub, finitecheck, unwrap)
+- [x] Her faz sınırında `_check_cancel()` → `OperationCancelled`
+- [x] `progress = Signal(object)` — `ProgressEvent` emit
+- [x] `error_event = Signal(object)` — structured; legacy `error_occurred = Signal(str)` yan yana korunur
+- [x] `_emit_error(exc, job)` faz bağlamı + Rams-#4 action hint
+- [x] `tests/test_reconstruction_worker.py` (7 test)
 
-**Direction sanity check**: Earlier in the session I briefly flipped several phase gradient metrics to MINIMIZE based on a synthetic-test intuition (Fresnel rings getting louder at defocus). On real data this was wrong — sharp cell edges + high contrast at focus dominate, so gradient-family metrics MAXIMIZE. Reverted. Only ENTROPY minimizes.
+### T0.5 · `qpi_worker.py` + `autofocus_worker.py` ✅
+- [x] QPI: 4 faz (validate, refsub, bgcorrect, compute) + `error_event`/`progress` signals
+- [x] AF: minimal surgery — `error_event = Signal(object)` eklendi, mevcut cooperative cancellation korundu
+- [x] Her üç worker'da da `requestInterruption()` semantiği
+- [x] `tests/test_qpi_worker.py` (10 test) + `tests/test_autofocus_worker.py` (6 test)
 
-## 3. File splitting ✅ partial
+### T0.6 · `src/gui/commands.py` — command registry ✅
+- [x] `Command(id, title, category, callback, shortcut, hint, when, visible_in_palette)` frozen dataclass
+- [x] `CommandRegistry` — thread-safe, ordered, search + by_category + invoke + when-predicate
+- [x] `gui/commands_install.py` — 9 main-window commands kayıt + QShortcut üreteci
+- [x] `main_window._setup_shortcuts` + `_init_menus` registry'den besleniyor
+- [x] `tests/test_commands.py` (23 test)
 
-### 3a. `src/core/autofocus.py` (1545 lines) → package ✅
-Split into `src/core/autofocus/`:
-- `metrics.py` — `FocusMetric` enum, phase helpers, `_calc_metric`, `_is_minimize`, `_get_hf_mask`
-- `evaluator.py` — `AutofocusCancelled`, `AutoFocusResult`, `_make_fast_evaluator`, `downsample_complex_field`
-- `search_classic.py` — `autofocus_zscan`, Golden Section, Coarse-to-Fine, Robust C2F
-- `search_adaptive.py` — Adaptive Gradient/Ratio/Bracketing/Distance + `AdaptiveFocusState`
-- `analysis.py` — `auto_select_metric`, `scan_metric_landscape`, `autofocus_benchmark`
-- `__init__.py` — re-exports the full public + internal surface so every `from core.autofocus import …` still works
-
-Benefit: functions are grouped by concern (11 metrics in 170 lines of metrics.py vs scattered across 1500 lines), and editing one search algorithm no longer forces reading the whole file. Import-level API preserved — no call-site changes needed anywhere in the codebase.
-
-### 3b. `src/gui/main_window.py` (2653 lines) — NOT SPLIT (deliberate)
-Started a plan to split into mixins (recon / qpi / camera / autofocus / tools) but backed off for these reasons:
-- MainWindow is a single Qt class with tight signal/slot coupling — every method assumes a fully constructed `self` with dozens of widgets/state fields. Mixins work, but IDE navigation and type checking degrade because `self.foo` is defined in another file.
-- The autofocus split already captures the primary maintenance win (the file Claude most frequently needed to read at depth).
-- Runtime doesn't change — this is purely about reading cost, and the GUI file is less frequently opened than `autofocus.py` during work on this project.
-
-**Recommendation**: leave `main_window.py` monolithic unless it becomes painful. If the user still wants it split, the cleanest next step is to extract standalone concerns first (line-profile dialog, 3D surface viewer) into `src/gui/views/` as free-function helpers that take a parent widget.
-
-## 4. QPI refractive index ✅ (answer, not code)
-
-Both `n_sample` (default 1.38) and `n_medium` (default 1.337) are load-bearing, not cosmetic:
-- `n_sample - n_medium = Δn` gates whether height can be computed at all (`src/core/qpi.py:614-617`)
-- `opd_to_height(opd, n_sample, n_medium)` (`src/core/qpi.py:55-73`) feeds `result.height_nm`
-- `compute_cell_morphology` (`src/core/qpi.py:274-388`) uses Δn for per-pixel cell height → volume (fL)
-- Roughness (Ra/Rq/Rz) and 2D PSD downstream consume `height_nm`
-- `opd_to_refractive_index` inverse helper is only used when `known_thickness_m` is supplied
-- UI exposes both spinboxes in `qpi_update/qpi_tab.py:88-115`
-
-Changing either value directly alters the reported thickness, volume, roughness, and PSD. Answer confirmed by tracing through the code — nothing is vestigial.
+### T0 Verification ✅
+- [x] `pytest tests/` — 107 test yeşil (1.23s)
+- [x] Esc cancels: reconstruction + QPI + AF — cancellation testleri mevcut
+- [x] ErrorEvent phase context: z_mm/wavelength_nm/pixel_um/n_sample/n_medium test assert'leri
+- [x] v1 → v2 migration: `test_v1_to_v2_migration_stamps_version` yeşil, mevcut `window/geometry` korunuyor
+- [ ] Manuel GUI smoke (Esc kesiyor, toast gösterisi) — Tier 1 UI landingi sonrası kullanıcı oturumunda
 
 ---
 
-## Review
+## Tier 1 — visible design
 
-**What shipped**:
-- Surface window opens (PyOpenGL installed; future silent failures now surface a status-bar warning)
-- Every autofocus metric now runs on wrap-safe phase instead of amplitude
-- AMPLITUDE_FLATNESS is gone everywhere (core, GUI, tests, tools)
-- `src/core/autofocus.py` → clean 5-file package with preserved public API; bench reproduces ~same focus z as before the split
-- QPI refractive-index question answered with file references
+### T1.1 · `src/gui/widgets/command_palette.py` ✅
+- [x] `⌘K` açar; fuzzy search; Enter çalıştırır
+- [x] `CommandRegistry`'yi tüketir; dinamik `when` değerlendirmesi (greys out disabled komutlar)
+- [x] `tests/test_command_palette.py` (5 test, offscreen Qt)
 
-**What didn't ship** (and why):
-- main_window.py split: backed off after starting the plan. Trade-off isn't in favor given how mixins interact with Qt signal/slot and IDE support.
+### T1.2 · `src/gui/widgets/toast.py` + `src/gui/widgets/error_drawer.py` ✅
+- [x] Toast: sağ üst overlay, dismiss'e kadar kalır, max 3 stack
+- [x] Başlık + cause + action + "Show log ›" chevron
+- [x] Drawer: `QDockWidget`, session error history, timestamped, traceback collapsible
+- [x] Her ikisi de `ErrorCenter` subscriber'ı; severity floor = WARN
+- [x] `tests/test_toast_and_drawer.py` (8 test)
 
-**Test status**:
-- `bench_af.py --ref-only` converges at plausible focus (≈44mm on lab hologram at 120 steps)
-- All public symbols in `from core.autofocus import …` still resolve after the package split
-- End-to-end GUI smoke test not run in this session — recommend the user launch the app and exercise the Surface window + autofocus before declaring the changes stable.
+### T1.3 · `src/gui/widgets/progress_line.py` ✅
+- [x] Status bar'da 1px çizgi; `ProgressEvent`'i tüketir
+- [x] <500ms gizli, 500ms–5s line-only, >5s line + caption + Esc ipucu
+- [x] `cancel_requested` signal → `_cancel_active_worker` (QPI → AF → recon)
+- [x] `tests/test_progress_line.py` (8 test)
 
-**Follow-ups for next session**:
-- Manual GUI smoke test (app launch → load hologram → reconstruct → autofocus → QPI → 3D surface)
-- If the user still wants main_window.py split, go the helper-module route, not mixins
+### T1.4 · Parameter persistence wiring ✅
+- [x] `src/gui/persistence.py` — `apply_settings` / `collect_settings` tabs ↔ `AppSettings`
+- [x] `_load_persisted_settings()` `__init__` sonunda; sidebar widgets'a inject
+- [x] `_persist_current_settings()` recon/AF/QPI başarılı sonrasında
+- [x] `_update_io_history()` altı `QFileDialog` site'ında: load hologram (toolbar), reference hologram, video output dir, snapshot, export view, export panel, report save
+- [x] `last_folder` toolbar default_dir'e; `last_report_folder` rapor dialog default'una
+- [x] `tests/test_persistence_wiring.py` (9 test) + manuel smoke: fresh QSettings → save → reload round-trip OK, MainWindow boot + apply OK
+
+### T1.5 · Dil reduction + CI guard ✅
+- [x] 12 Türkçe string çevrildi: AF fallback mesajı, amp+phase panel menüleri, export dialog, report dialog, 4 status mesajı
+- [x] Verbosity azaltıldı: "Line Profile başlat" → "Line profile"; "3D Yüzey göster" → "3D surface"; "Görüntüyü dışa aktar…" → "Export image…"
+- [x] `scripts/check_language.py` — standalone Python scanner; pre-commit olmadan da manuel çalıştırılabilir
+- [x] `.pre-commit-config.yaml` — `local` hook; Türkçe karakter görürse commit'i bloklar
+- [x] Smoke: clean pass (exit 0), dirty detect (exit 1, satır numarası + uyarı)
+- [x] `src/gui` grep sonrası sıfır Türkçe karakter (string + comment)
+
+### T1.6 · Esc = cancel everywhere ✅
+- [x] `_setup_shortcuts`'ta `QShortcut(Qt.Key.Key_Escape, self)` → `_cancel_active_worker`
+- [x] WindowShortcut context — modal dialog'lar ve error drawer kendi Esc'lerini korur
+- [x] Walker status bar'a "QPI/Autofocus/Reconstruction: cancel requested" feedback yazar (4s)
+- [x] Hiç worker çalışmıyorsa Esc sessiz — kullanıcıyı rahatsız etmez
+- [x] Progress line'ın "Press Esc to cancel" caption'ı zaten T1.3'te şiplenmişti; Esc artık o vaadi yerine getiriyor
+- [x] `tests/test_cancel_walker.py` (6 test): priority order, stopped-skip, stop-vs-cancel, exception swallowing, Esc wiring smoke
+- [x] Autofocus'un kendi cancel button'u korundu (mouse'u tercih edenler için) — Rams #4 "understandable"
+
+### T1.7 · Context-sensitive sidebar (stretch)
+- [ ] Recon/Focus/QPI tab'leri → mod switch (aynı sütun farklı içerik)
+- [ ] `CommandRegistry.enabled_when`'e bağlı göster/gizle
+- [ ] Stretch çünkü büyük görsel refactor; T1.1–T1.6 bittikten sonra yapılırsa yapılsın
 
 ---
-
-# Follow-up session — 2026-04-17
-
-## Context
-User reported after previous session:
-1. "Surface hesaplamasında bir sorun var gibi" — surface calculation looks wrong
-2. "Autofocus aramasında hatalı sonuç buluyor" — autofocus finds wrong z
-
-Working hypothesis: fix autofocus and surface follows (bad z → bad QPI phase → bad surface).
-
-## Fixes landed
-
-- [x] **PHASE_VARIANCE wrap bug** — `src/core/autofocus/metrics.py`
-  `np.var(wrapped_phase)` replaced with circular variance `1 − |mean(exp(iφ))|`.
-  Pre-fix landscape peak: z=70mm. Post-fix: z=39mm (lab focus ≈ 45mm).
-
-- [x] **AdDist peak significance check** — `src/core/autofocus/search_adaptive.py`
-  Interior peak now requires (range/|median|) > 3% AND (peak − worst_edge) > 30% of range. Prevents early termination on flat noise plateaus. Bilateral expansion only fires when the peak is truly interior but insignificant.
-
-- [x] **AdGrad `prev_deriv` initialization** — same file
-  Changed `prev_deriv = 0.0` → `prev_deriv: Optional[float] = None`. Skip step adjustment on the first iteration so the walker doesn't shrink immediately on `abs_d > 0 * 1.5`.
-
-- [x] **AdGrad coverage safety net** — same file
-  After Phase 1, if the walker covered < 75% of [z_min, z_max], run a short uniform sweep (up to 12 evals) to catch the global peak. Phase 2 local refinement then operates on the corrected best_z.
-
-- [x] **Worker AdDist budget** — `src/gui/workers/autofocus_worker.py`
-  Replaced `max(30, steps*0.5)` with `max(60, ceil(log2(max/init))*15 + 15, steps*0.5)`. For the default ±0.5→±50mm expansion this scales to 120 evals, enough for the full log₂ expansion depth.
-
-- [x] **Worker `step_init` pass-through** — same file
-  When adaptive distance is on, the worker now passes `step_init=None` so AdGrad uses its natural `full_range/10` default. Previously `(zmax-zmin)/20` produced steps so tiny the walker couldn't traverse the detected range in its forward budget.
 
 ## Verification
 
-Real lab hologram (`labtest/ilk_imgbackCCD_24.10mm.png`), true focus ≈ 44mm:
+- [ ] `pytest tests/` — hepsi yeşil
+- [ ] `bench_af.py --ref-only` — hâlâ ≈42–45mm
+- [ ] Smoke scenario: uygulamayı aç → parametrelerin hatırlandığını gör → Cmd+K → "recon" → Enter → sessiz progress çizgisi → Esc → cancel olduğunu gör → yanlış param gir → toast kart → "Show log ›" → drawer
+- [ ] Dil guard: CI'da Türkçe string commit'i red etsin
+- [ ] Audit log'da Tier 0 yeni events: `operation_started`, `operation_completed`, `error_event`
 
-| Scenario | Metrics tested | Pass |
-|---|---|---|
-| A. AdDist → AdGrad (wide range, user's 50x profile) | PHASE_VARIANCE, LAPLACIAN_VARIANCE, TENENGRAD, GRADIENT, BRENNER, NORMALIZED_VARIANCE, TOTAL_VARIATION, SPECTRAL_ENERGY | 8/8 within ±6mm |
-| B. Narrow refinement [42,46]mm | 4 gradient metrics | 3/4 (phase_variance's true peak is 39mm — correctly clamps to edge z=42, not a regression) |
-| C. Precise refinement [43.5,44.5]mm | 4 gradient metrics | 4/4 within ±1mm |
-
-## Not addressed this session
-- Stale profile metric silent fallback (`src/gui/sidebar/focus_tab.py set_state` swallows removed metrics like "Amplitude Flatness"). User profile at `~/.dhm-reconstruction/profiles/setup/50x.json` still has this stale value.
-- Surface bug not independently verified — assumed downstream of autofocus. Needs a manual GUI smoke test to confirm.
-- AdDist `signal_threshold` tuning — 0.3 produces detected ranges that are wider than strictly necessary (e.g. [0.64, 50]mm when peak is at 44). The coverage safety net in AdGrad compensates, but a tighter threshold would also fix it.
-
-## Manual verification remaining
-- Launch app with user's 50x profile → autofocus on lab hologram → confirm z converges near 44mm
-- Reconstruct at autofocused z → view 3D Surface → confirm it looks right
-
----
-
-# Follow-up session — 2026-04-17 (QPI/3D/Line profile)
-
-## Context
-User reported three fresh bugs:
-1. "QPI surface ikinciye tekrar oluşturulmuyor" — 3D surface fails to open on second attempt
-2. "QPI pencereleri açıldığında, yeniden reconstruct alındığında güncellensin" — open QPI windows should auto-update on new reconstruction
-3. "-phase penceresi üzerinden line graph tool ile çizgi grafiği oluşturamıyorum" — line profile tool can't draw on phase panel
-
-After first pass, user reported follow-up: "surface penceresi açılıyo ikinciye açılmasına tamam da kapkara görüntü yok" — window opens but renders black.
-
-## Fixes landed
-
-- [x] **QPI dialog replacement no longer kills the fresh 3D window** — `src/gui/main_window.py:1044-1062`
-  `_cleanup_qpi_dialog` now disconnects `dlg.destroyed → _cleanup_3d_window` before closing. Root cause: `WA_DeleteOnClose` schedules async deletion, and the stale signal fired *after* the new 3D window was created, killing it.
-
-- [x] **QPI auto-refresh on new reconstruction** — `src/gui/main_window.py:726-732`
-  `_on_recon_completed` now calls `_compute_qpi()` when a QPI dialog is already open, so height/OPD/mass maps reflect the current z.
-
-- [x] **Live line profile refresh** — `src/gui/main_window.py:734-736`
-  When phase data arrives during a live line-profile session, re-sample along the ROI without requiring the user to reopen the dialog.
-
-- [x] **Line profile defaults to phase panel** — `src/gui/main_window.py` `_on_line_profile_toggled`
-  ROI is now placed on the phase image when one exists (combo index 1 = "Phase"); falls back to amplitude. Previously always attached to amplitude → phase-panel click did nothing.
-
-- [x] **Black 3D surface on second open** — `src/gui/main_window.py:1176-1279`
-  Refactored `_show_3d_surface` to *reuse* the existing `GLViewWidget` when `isValid(w)`. `removeItem()` each old surface/grid, add fresh ones, keep the user's camera rotation (only set camera on first open). Root cause: destroying a `GLViewWidget` via `deleteLater` and creating a new one mid-tick left the new widget's OpenGL context un-initialized → pitch-black render.
-
-## Not addressed
-- Stale profile metric silent fallback (`set_state` still swallows removed "Amplitude Flatness" in `~/.dhm-reconstruction/profiles/setup/50x.json`). Low impact — any other valid metric choice overrides it.
-
-## Manual verification needed
-- Compute QPI → open 3D surface → close dialog → recompute → 3D surface opens and renders properly on second try
-- Reconstruct at z1 → open QPI → reconstruct at z2 → confirm QPI maps refresh automatically
-- Toggle line profile → ROI lands on phase panel → drag endpoints → profile updates live
+## Review
+(oturum sonunda doldurulacak)

@@ -151,10 +151,13 @@ class MainToolbar(QToolBar):
 
     def _on_load_clicked(self) -> None:
         """Open a file dialog and emit the selected path."""
+        # ``default_dir`` is set by the main window from persisted I/O history,
+        # so the dialog reopens where the user left off. Empty string → $HOME.
+        start_dir = getattr(self, "default_dir", "") or ""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Hologram",
-            "",
+            start_dir,
             "Images (*.png *.tif *.tiff *.jpg *.jpeg *.bmp *.h5 *.nd2 *.czi);;All Files (*)",
         )
         if file_path:

@@ -18,6 +18,7 @@ from .metrics import (
     _is_minimize,
     _phase_of,
     _wrap_diff,
+    has_sufficient_contrast,
 )
 from .evaluator import (
     AutoFocusResult,
@@ -60,6 +61,7 @@ __all__ = [
     "_is_minimize",
     "_phase_of",
     "_wrap_diff",
+    "has_sufficient_contrast",
     # evaluator
     "AutoFocusResult",
     "AutofocusCancelled",

@@ -23,11 +23,14 @@ Display outputs:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field as dc_field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -190,9 +193,9 @@ def compute_roughness(
     rq = float(np.sqrt(np.mean(h ** 2)))
     rz = float(np.max(h) - np.min(h))
 
-    if rq > 1e-20:
-        rsk = float(np.mean(h ** 3) / rq ** 3)
-        rku = float(np.mean(h ** 4) / rq ** 4)
+    if rq > 1e-10:
+        rsk = float(np.mean(h ** 3) / (rq ** 3 + 1e-30))
+        rku = float(np.mean(h ** 4) / (rq ** 4 + 1e-30))
     else:
         rsk = 0.0
         rku = 3.0  # Gaussian
@@ -819,8 +822,11 @@ def reconstruct_z_stack(
                     phase_raw, complex_field=result,
                     wavelength_m=wavelength_m, pixel_size_m=pixel_size_m,
                 ).astype(np.float32)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Phase unwrap failed for z-slice %d; using wrapped phase. Reason: %s",
+                    i, exc,
+                )
         if correct_background:
             phase_raw = correct_background_phase(phase_raw, order=1)
 

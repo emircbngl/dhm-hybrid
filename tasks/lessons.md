@@ -88,3 +88,41 @@ dlg.close()
 **Rule**: Prefer *reusing* a `GLViewWidget` (or any QOpenGLWidget) across refreshes. Check `shiboken6.isValid(w)` to tell whether the Python handle still points at a live C++ object; if yes, call `w.removeItem(item)` for each item in `w.items` and re-add fresh items. Only create a new widget if the old one is truly dead (user closed via X with WA_DeleteOnClose, mode switch cleaned it up, etc.). Camera position should only be set on *first* open so the user's rotation survives refresh.
 
 **Tangential rule**: For widgets meant to be long-lived (progressive refinement, live refresh), don't set `WA_DeleteOnClose`. Let `hide()` + reshow handle the open/close cycle; reserve deletion for mode changes and file switches.
+
+---
+
+## 2026-04-20 — `git add -A` pulled in 56k lines of worktree backups
+
+**Mistake**: Asked to save a snapshot, ran `git add -A` after only seeing the first 30 lines of `git status --short` (piped through `head -30`). That sample hid untracked directories — including `.claude/worktrees/v1.0_apr03_base/` (a full copy of an old version) and macOS `.DS_Store` files. Committed 561 files / +56k lines instead of the ~10 real changes.
+
+**Root cause**: Truncated status output + blind wildcard stage. Never enumerated what `-A` would actually add.
+
+**Rule**: Before any `git add -A` or `git add .` on a dirty repo:
+1. Run `git status --short` *unfiltered* (or pipe to `| wc -l` first to gauge size).
+2. Scan untracked section for unexpected top-level directories (`.claude/`, `worktrees/`, `node_modules/`, anything macOS/IDE-specific).
+3. Ensure `.gitignore` covers local-only state *before* staging, not after.
+4. Prefer `git add <explicit paths>` when the modified set is small and known.
+
+**Recovery pattern used (non-destructive)**: `git tag -d <tag>` → `git reset --mixed HEAD~1` → fix `.gitignore` → re-stage → re-commit → re-tag. No force-push, no `reset --hard`, working tree preserved.
+
+---
+
+## 2026-04-21 — `QShortcut` moved to `QtGui` in PySide6 6.x; unit tests don't catch it
+
+**Mistake**: `main_window._setup_shortcuts` and `gui/commands_install.install_shortcuts` both imported `QShortcut` from `PySide6.QtWidgets`. All 137 pytest cases passed — they exercised the command *registry* but not the QShortcut *binding* path, because no test instantiated a full `MainWindow`. Manual smoke (`MainWindow()` under offscreen Qt) immediately raised `ImportError: cannot import name 'QShortcut' from PySide6.QtWidgets`.
+
+**Root cause**: PySide6 6.0 moved `QShortcut` from `QtWidgets` to `QtGui`. Widget-level tests that only touch individual widgets never trigger the failing import; only a full main-window boot does.
+
+**Rule**: For any task that touches `main_window.py`, include a headless-Qt smoke that actually runs `MainWindow()` to construction completion. A 5-line smoke (`QApplication([]); MainWindow()`) catches whole classes of "import-at-first-use" regressions that unit tests miss. Add the smoke to the verification checklist, not just the unit tests.
+
+**Qt version note**: for PySide6 6.x use `from PySide6.QtGui import QShortcut, QKeySequence, QAction`. Pinning the import at the Qt-moved site (not at module top-level) limits the blast radius.
+
+---
+
+## 2026-04-21 — `np.bool_` ≠ `bool` in `is` checks
+
+**Mistake**: `has_sufficient_contrast()` in `src/core/autofocus/metrics.py` returned `circ_var >= min_circular_std`, which is a `numpy.bool_` (not Python `bool`). Two pytest cases used `assert has_sufficient_contrast(...) is False` / `is True` — identity check against Python singletons — and failed because `np.False_ is False` → `False`.
+
+**Root cause**: The function's type hint said `-> bool` but the body leaked a numpy scalar. Test authors trusted the annotation and used identity comparison (which is idiomatic and correct for Python booleans).
+
+**Rule**: When a function's return annotation is `bool`, make it a real Python `bool` at the boundary: `return bool(expr)`. Don't let numpy scalars escape typed APIs — they look equal but fail `is` checks and pickle oddly. Same rule applies to `int` / `float` annotations returning `np.int64` / `np.float64`.

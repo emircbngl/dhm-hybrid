@@ -1,9 +1,18 @@
-"""Background worker for autofocus — prevents UI freezing."""
+"""Background worker for autofocus — prevents UI freezing.
+
+v1.0.1: emits :class:`core.errors.ErrorEvent` on failure alongside the legacy
+``error`` string signal, so the UI can bind to one structured error protocol
+across reconstruction / autofocus / QPI workers. The algorithm already has
+cooperative cancellation and progress reporting, so no deeper refactor is
+needed here.
+"""
+import logging
 import time
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from core.reconstruction import ReconstructionParams, ReconstructionMethod
+from core.errors import ErrorEvent, Severity
+from core.reconstruction import ReconstructionParams, ReconstructionMethod, propagate
 from core.autofocus import (
     FocusMetric,
     AutofocusCancelled,
@@ -16,8 +25,11 @@ from core.autofocus import (
     adaptive_bracketing_search,
     adaptive_distance_search,
     downsample_complex_field,
+    has_sufficient_contrast,
 )
 from gui.sidebar.focus_tab import FocusTab
+
+_LOG = logging.getLogger(__name__)
 
 
 class AutofocusWorker(QThread):
@@ -27,7 +39,11 @@ class AutofocusWorker(QThread):
     finished = Signal(float, object, object, str, float, int)
     # Emits metric enum value string when auto-select picks one
     metric_selected = Signal(str)
+    # Emits (from_metric, to_metric) when ENTROPY is auto-fallen back due to low contrast
+    metric_auto_fallback = Signal(str, str)
     error = Signal(str)
+    # Structured error (ErrorEvent) — new in v1.0.1. Emitted alongside `error`.
+    error_event = Signal(object)
     cancelled = Signal()
     progress = Signal(str)
     # Emits (percent 0-100, elapsed_s, eta_s)  — eta_s = -1 if unknown
@@ -108,7 +124,12 @@ class AutofocusWorker(QThread):
     def run(self):
         job = self._job
         if job is None:
-            self.error.emit("No autofocus job configured")
+            self._emit_error(
+                ValueError("No autofocus job configured"),
+                job=None,
+                title="Autofocus failed",
+                action="Configure z-range and metric, then retry.",
+            )
             return
 
         try:
@@ -158,6 +179,50 @@ class AutofocusWorker(QThread):
                 metric = auto_select_metric(fc, params, method, zmin, zmax, n_steps=min(steps, 30), cancel_check=self._is_cancelled)
                 self.metric_selected.emit(metric.value)
                 self.progress.emit(f"Selected metric: {metric.value}")
+
+            # ENTROPY low-contrast pre-flight check — reconstruct at mid-z and
+            # verify phase has enough structure. If not, fall back to PHASE_VARIANCE.
+            # ENTROPY collapses into a single-bin histogram on flat/saturated holograms
+            # and the search converges to a random z.
+            if metric == FocusMetric.ENTROPY:
+                z_mid = 0.5 * (zmin + zmax)
+                mid_params = ReconstructionParams(
+                    wavelength_m=params.wavelength_m,
+                    pixel_size_m=params.pixel_size_m,
+                    z_m=z_mid,
+                    n=params.n,
+                )
+                field_mid = propagate(fc, mid_params, method)
+                if not has_sufficient_contrast(field_mid):
+                    # Re-compute circular variance locally for the log message
+                    phase_mid = np.angle(field_mid) if np.iscomplexobj(field_mid) else field_mid
+                    mu_x = float(np.mean(np.cos(phase_mid)))
+                    mu_y = float(np.mean(np.sin(phase_mid)))
+                    measured_circ_var = float(1.0 - np.sqrt(mu_x * mu_x + mu_y * mu_y))
+                    logging.getLogger(__name__).warning(
+                        "ENTROPY low-contrast fallback → PHASE_VARIANCE "
+                        "(measured circular variance = %.4f, threshold = 0.15)",
+                        measured_circ_var,
+                    )
+                    self.metric_auto_fallback.emit(
+                        FocusMetric.ENTROPY.value, FocusMetric.PHASE_VARIANCE.value
+                    )
+                    try:
+                        from core.audit import get_audit_log
+                        get_audit_log().record(
+                            action="autofocus_metric_fallback",
+                            params={
+                                "from": "entropy",
+                                "to": "phase_variance",
+                                "reason": "low_contrast",
+                                "measured_circ_var": measured_circ_var,
+                            },
+                        )
+                    except Exception:
+                        logging.getLogger(__name__).warning(
+                            "audit record failed", exc_info=True
+                        )
+                    metric = FocusMetric.PHASE_VARIANCE
 
             self._t0 = time.time()
             step_init = job["step_init"]
@@ -309,10 +374,61 @@ class AutofocusWorker(QThread):
 
         except AutofocusCancelled:
             self.cancelled.emit()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            if not self._is_cancelled():
-                self.error.emit(str(e))
-            else:
+        except Exception as e:  # noqa: BLE001
+            if self._is_cancelled():
+                # User hit Cancel mid-flight; treat as cooperative cancellation
+                # rather than a surprise error.
                 self.cancelled.emit()
+                return
+            self._emit_error(e, job=job)
+
+    # ---- helpers -----------------------------------------------------------
+
+    def _emit_error(self, exc: BaseException, *,
+                    job: dict | None,
+                    title: str = "Autofocus failed",
+                    action: str = "") -> None:
+        """Log, build an :class:`ErrorEvent`, and fan it out on both signals.
+
+        The structured event carries the z-range / algo / metric context so
+        the UI can render a useful one-line copy without re-parsing the
+        exception string. The legacy ``error(str)`` signal is retained for
+        v1.0.0 call-sites that still listen for it.
+        """
+        _LOG.exception("[AF] worker failed")
+        context: dict = {}
+        if job is not None:
+            metric_val = job.get("metric")
+            algo_val = job.get("algo", "")
+            context = {
+                "z_min_mm": float(job.get("z_min_m", 0.0)) * 1e3,
+                "z_max_mm": float(job.get("z_max_m", 0.0)) * 1e3,
+                "steps": int(job.get("steps", 0)),
+                "metric": getattr(metric_val, "value", str(metric_val or "")),
+                "algo": str(algo_val),
+            }
+        event = ErrorEvent.from_exception(
+            exc,
+            title=title,
+            action=action or _suggest_action(exc, job or {}),
+            context=context,
+            severity=Severity.ERROR,
+        )
+        self.error_event.emit(event)
+        self.error.emit(f"{type(exc).__name__}: {exc}")
+
+
+def _suggest_action(exc: BaseException, job: dict) -> str:
+    """One-sentence, user-correctable hint — Rams #4 (understandable)."""
+    msg = str(exc).lower()
+    if isinstance(exc, MemoryError) or "memory" in msg:
+        return "Reduce step count or narrow the z-range and retry."
+    zmin = float(job.get("z_min_m", 0.0) or 0.0)
+    zmax = float(job.get("z_max_m", 0.0) or 0.0)
+    if zmax <= zmin:
+        return "Set z-max greater than z-min in the Focus panel."
+    if "wavelength" in msg:
+        return "Set a positive wavelength in the Reconstruction panel."
+    if "metric" in msg:
+        return "Pick a different focus metric or enable Auto-select."
+    return ""

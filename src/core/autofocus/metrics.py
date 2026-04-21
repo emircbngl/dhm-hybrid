@@ -49,6 +49,20 @@ def _phase_of(data: np.ndarray) -> np.ndarray:
     return data.astype(np.float64, copy=False)
 
 
+def has_sufficient_contrast(data: np.ndarray, min_circular_std: float = 0.15) -> bool:
+    """True if the phase has enough wrapped-phase structure for ENTROPY to be reliable.
+
+    Uses circular standard deviation (sqrt of circular variance) as the contrast proxy.
+    Below 0.15 rad the histogram collapses near a single bin and ENTROPY becomes noise-dominated.
+    """
+    phase = _phase_of(data)
+    mu_x = float(np.mean(np.cos(phase)))
+    mu_y = float(np.mean(np.sin(phase)))
+    R = np.sqrt(mu_x * mu_x + mu_y * mu_y)
+    circ_var = 1.0 - R
+    return bool(circ_var >= min_circular_std)
+
+
 def _wrap_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Wrap-safe phase difference in [-π, π]. Equivalent to angle(exp(i·(a-b)))."""
     d = a - b
@@ -73,17 +87,20 @@ def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
         # whereas naïve variance peaks at defocus artifacts.
         mu_x = float(np.mean(np.cos(phase)))
         mu_y = float(np.mean(np.sin(phase)))
-        return float(1.0 - np.sqrt(mu_x * mu_x + mu_y * mu_y))
+        result = float(1.0 - np.sqrt(mu_x * mu_x + mu_y * mu_y))
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.TOTAL_VARIATION:
         dy = _wrap_diff(phase[1:, :], phase[:-1, :])
         dx = _wrap_diff(phase[:, 1:], phase[:, :-1])
-        return float(np.sum(np.abs(dy)) + np.sum(np.abs(dx)))
+        result = float(np.sum(np.abs(dy)) + np.sum(np.abs(dx)))
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.GRADIENT:
         dy = _wrap_diff(phase[1:, :], phase[:-1, :])
         dx = _wrap_diff(phase[:, 1:], phase[:, :-1])
-        return float(np.sum(dy * dy) + np.sum(dx * dx))
+        result = float(np.sum(dy * dy) + np.sum(dx * dx))
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.TENENGRAD:
         # Apply Sobel to sin(φ) and cos(φ) separately — wrap-invariant gradient magnitude.
@@ -93,7 +110,8 @@ def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
         sy = ndimage.sobel(s, axis=0, mode='reflect')
         cx = ndimage.sobel(c, axis=1, mode='reflect')
         cy = ndimage.sobel(c, axis=0, mode='reflect')
-        return float(np.sum(sx * sx + sy * sy + cx * cx + cy * cy))
+        result = float(np.sum(sx * sx + sy * sy + cx * cx + cy * cy))
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.LAPLACIAN_VARIANCE:
         # Laplacian on sin/cos — wrap-invariant second-order phase structure.
@@ -101,18 +119,23 @@ def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
         lap_s = ndimage.laplace(s)
         lap_c = ndimage.laplace(c)
         mag = lap_s * lap_s + lap_c * lap_c
-        return float(np.var(mag))
+        result = float(np.var(mag))
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.BRENNER:
         dy = _wrap_diff(phase[2:, :], phase[:-2, :])
         dx = _wrap_diff(phase[:, 2:], phase[:, :-2])
-        return float(np.sum(dy * dy) + np.sum(dx * dx))
+        result = float(np.sum(dy * dy) + np.sum(dx * dx))
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.ENTROPY:
         hist, _ = np.histogram(phase, bins=256, range=(-np.pi, np.pi), density=False)
         hist = hist[hist > 0].astype(np.float64)
+        if hist.size == 0:
+            return 0.0
         p = hist / hist.sum()
-        return -float(np.sum(p * np.log(p)))
+        result = -float(np.sum(p * np.log(p)))
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.VOLLATH_F4:
         # Circular Vollath F4: cos(Δφ) autocorrelation difference (shift 1 vs 2).
@@ -120,7 +143,8 @@ def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
         n = phase.shape[0] * phase.shape[1]
         g1 = float(np.sum(np.cos(_wrap_diff(phase[:, :-1], phase[:, 1:]))))
         g2 = float(np.sum(np.cos(_wrap_diff(phase[:, :-2], phase[:, 2:]))))
-        return (g1 - g2) / n
+        result = (g1 - g2) / n if n > 0 else 0.0
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.VOLLATH_F5:
         # Circular Vollath F5: cos-autocorrelation minus squared circular mean.
@@ -128,7 +152,8 @@ def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
         g1 = float(np.sum(np.cos(_wrap_diff(phase[:, :-1], phase[:, 1:]))))
         mu_x = float(np.mean(np.cos(phase)))
         mu_y = float(np.mean(np.sin(phase)))
-        return g1 / n - (mu_x * mu_x + mu_y * mu_y)
+        result = (g1 / n - (mu_x * mu_x + mu_y * mu_y)) if n > 0 else 0.0
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.NORMALIZED_VARIANCE:
         # Circular variance: 1 − |mean(exp(iφ))|. At focus, phase gains structure
@@ -137,7 +162,8 @@ def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
         mu_x = float(np.mean(np.cos(phase)))
         mu_y = float(np.mean(np.sin(phase)))
         R = np.sqrt(mu_x * mu_x + mu_y * mu_y)
-        return float(1.0 - R)
+        result = float(1.0 - R)
+        return result if np.isfinite(result) else 0.0
 
     if metric == FocusMetric.SPECTRAL_ENERGY:
         # HF energy of exp(iφ) — wrap-safe phase spectrum. Focused images have
@@ -146,7 +172,8 @@ def _calc_metric(data: np.ndarray, metric: FocusMetric) -> float:
         F_shift = np.fft.fftshift(F)
         mag = np.abs(F_shift)
         hf_mask = _get_hf_mask(phase.shape)
-        return float(np.sum(mag[hf_mask] ** 2))
+        result = float(np.sum(mag[hf_mask] ** 2))
+        return result if np.isfinite(result) else 0.0
 
     raise ValueError(f"Unknown metric: {metric}")
 

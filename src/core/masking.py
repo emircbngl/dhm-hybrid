@@ -85,6 +85,9 @@ def circular_mask(shape: Tuple[int, int], center_yx: Tuple[int, int], radius: in
         return mask.astype(np.float32)
 
     elif apodization == "tukey":
+        if rolloff < 0.01:
+            # rolloff too small for meaningful taper → fall back to hard mask
+            return (r <= radius).astype(np.float32)
         # Tukey (tapered cosine): flat top with cosine rolloff at edges
         # flat region: r <= R * (1 - rolloff)
         # taper region: R * (1 - rolloff) < r <= R

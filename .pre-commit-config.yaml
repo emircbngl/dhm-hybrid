@@ -1,0 +1,16 @@
+# Install once:  pip install pre-commit && pre-commit install
+# Run on demand: pre-commit run --all-files
+#
+# v1.0.1-ux keeps the GUI layer English-only so the Lindqvist-lab pilot
+# isn't staring at mixed-language dialogs again. The guard below rejects
+# Turkish characters in src/gui/; other parts of the repo (tasks/, lessons,
+# core comments) stay free to be bilingual.
+repos:
+  - repo: local
+    hooks:
+      - id: no-turkish-in-gui
+        name: Reject Turkish characters in src/gui/
+        entry: python3 scripts/check_language.py
+        language: system
+        pass_filenames: true
+        files: ^src/gui/.*\.py$

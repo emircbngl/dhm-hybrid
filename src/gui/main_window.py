@@ -1,11 +1,15 @@
 import logging
+from datetime import datetime
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
     QDockWidget,
     QSizePolicy,
+    QMenu,
+    QFileDialog,
 )
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt, QSettings, QPoint
 import pyqtgraph as pg
 import numpy as np
 from pathlib import Path
@@ -25,6 +29,11 @@ from .workers.acquisition_worker import AcquisitionWorker
 from .widgets.autofocus_overlay import AutofocusOverlay
 
 from core.profile_manager import ProfileManager
+
+try:
+    from core.audit import get_audit_log
+except Exception:  # pragma: no cover — audit module may not be present yet
+    get_audit_log = None  # type: ignore[assignment]
 
 
 def _nice_scalebar_length(pixel_um: float) -> float:
@@ -134,6 +143,11 @@ class MainWindow(QMainWindow):
         self._qpi_dialog = None
         self._qpi_3d_window = None
 
+        # Last-known operation state (surfaced in reports / audit log)
+        self._last_recon_params: dict | None = None
+        self._last_af_result: dict | None = None
+        self._last_qpi_result = None  # alias kept for backward clarity
+
         self._batch_paths = []
         self._batch_out_root = None
         self._batch_running = False
@@ -180,6 +194,7 @@ class MainWindow(QMainWindow):
         self._recording_worker.frame_written.connect(
             lambda count: self.status_bar.show_message(f"Recording frame {count}")
         )
+        self._recording_worker.error_occurred.connect(self._on_recording_worker_error)
 
         self._recon_worker = ReconstructionWorker()
         self._recon_worker.recon_completed.connect(self._on_recon_completed)
@@ -196,8 +211,12 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._setup_shortcuts()
         self._setup_dirty_tracking()
+        self._init_menus()
+        self._init_image_panel_context_menus()
+        self._install_error_ui()
+        self._load_persisted_settings()
         self.status_bar.show_message("Ready")
-        
+
         self._refresh_profiles("all")
         
         # Default mode is File — hide Camera tab
@@ -216,24 +235,97 @@ class MainWindow(QMainWindow):
             self._af_overlay._reposition()
 
     def closeEvent(self, event):
-        """Save settings when the window is closed."""
+        """Save settings and cleanly stop all worker threads before shutdown.
+
+        Every QThread-based worker must finish before the QMainWindow is
+        destroyed — otherwise Qt aborts with `QThread: Destroyed while thread
+        is still running`. We attempt graceful cancellation first (each worker
+        advertises some variant of stop/cancel), then fall through to the
+        Qt-builtin interrupt + quit, then wait with a bounded timeout. Workers
+        that have no cooperative stop path are still given a chance to drain
+        via `wait()`; if they still block, we log and move on rather than
+        calling `terminate()` (terminating mid-FFT can leave the FFTW plan
+        cache in an undefined state).
+        """
         self._save_layout()
-        # Stop autofocus worker first (must finish before QThread destructor)
+
+        # Stop autofocus worker first — its cancel() resolves fastest and the
+        # AF overlay widget expects a clean shutdown.
         if self._af_worker and self._af_worker.isRunning():
-            self._af_worker.cancel()
+            try:
+                self._af_worker.cancel()
+            except Exception:
+                log.warning("af_worker cancel() failed", exc_info=True)
             self._af_worker.wait(5000)
+
+        # Reconstruction worker has its own stop()
         if hasattr(self, '_recon_worker'):
-            self._recon_worker.stop()
+            try:
+                self._recon_worker.stop()
+            except Exception:
+                log.warning("recon_worker stop() failed", exc_info=True)
             self._recon_worker.wait(5000)
+
+        # Remaining workers — uniform best-effort cleanup.
+        for attr in ("_batch_worker", "_qpi_worker", "_acq_worker",
+                     "_recording_worker", "_adaptive_worker"):
+            worker = getattr(self, attr, None)
+            if worker is None:
+                continue
+            self._stop_worker_safely(worker, attr, timeout_ms=3000)
+
         try:
             self._on_camera_disconnect()
         except Exception:
-            pass
+            log.warning("camera disconnect on close failed", exc_info=True)
+
         # Clean up QPI, 3D, and line profile windows
         self._cleanup_qpi_dialog()
         self._cleanup_3d_window()
         self._clear_line_profile()
         super().closeEvent(event)
+
+    def _stop_worker_safely(self, worker, name: str, *, timeout_ms: int = 3000) -> None:
+        """Best-effort QThread shutdown: cooperative stop → interrupt → quit → wait.
+
+        Workers expose different stop APIs (stop/cancel/request_stop) or none
+        at all. We try each cooperative variant, then fall through to Qt's
+        built-in interruption + event-loop quit, then wait up to `timeout_ms`.
+        Never calls `terminate()` — forcible termination mid-compute can
+        corrupt shared caches (FFTW plans, CachedReconstructor state).
+        """
+        # 1. Cooperative stop methods the worker may advertise
+        for method_name in ("cancel", "stop", "request_stop"):
+            method = getattr(worker, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    break
+                except Exception:
+                    log.warning("%s.%s() raised during close", name, method_name, exc_info=True)
+        # 2. Qt-level: ask the thread to interrupt (worker must check
+        #    isInterruptionRequested() in its run loop; harmless if it doesn't)
+        try:
+            worker.requestInterruption()
+        except Exception:
+            pass
+        # 3. End the event loop if one is running
+        try:
+            worker.quit()
+        except Exception:
+            pass
+        # 4. Bounded wait. If it times out we log and proceed — do NOT
+        #    terminate() here.
+        try:
+            if worker.isRunning():
+                finished = worker.wait(timeout_ms)
+                if not finished:
+                    log.warning(
+                        "%s did not finish within %d ms on close; leaving it to Qt",
+                        name, timeout_ms,
+                    )
+        except Exception:
+            log.warning("wait() on %s failed", name, exc_info=True)
 
     def _save_layout(self):
         """Persists window geometry and image grid boundaries to QSettings."""
@@ -258,36 +350,248 @@ class MainWindow(QMainWindow):
                 self.image_grid.restore_state(grid_state)
 
     def _setup_shortcuts(self):
+        """Install every window-owned keyboard shortcut.
+
+        Sources its shortcut table from the :mod:`gui.commands` registry
+        via :mod:`gui.commands_install`. The registry is the single source
+        of truth for ids, titles, and key sequences; this method just
+        materializes the QShortcut side of it.
+        """
+        # QShortcut lives in QtGui (PySide6 ≥ 6.0); keep the import local
+        # so this module stays side-effect-free on import.
         from PySide6.QtGui import QKeySequence, QShortcut
-        
-        # Maximize panels
-        QShortcut(QKeySequence("Ctrl+1"), self).activated.connect(
-            lambda: self.image_grid.toggle_maximize(self.panel_input)
-        )
-        QShortcut(QKeySequence("Ctrl+2"), self).activated.connect(
-            lambda: self.image_grid.toggle_maximize(self.panel_amp)
-        )
-        QShortcut(QKeySequence("Ctrl+3"), self).activated.connect(
-            lambda: self.image_grid.toggle_maximize(self.panel_phase)
-        )
-        QShortcut(QKeySequence("Ctrl+4"), self).activated.connect(
-            lambda: self.image_grid.toggle_maximize(self.panel_spectrum)
-        )
-        
-        # Reconstruct
-        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(
-            self._trigger_reconstruction
+        from gui.commands_install import (
+            install_main_window_commands,
+            install_shortcuts,
         )
 
-        # Restore grid
-        QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(
-            self.image_grid.restore_grid
+        install_main_window_commands(self)
+        # Keep a reference so the shortcuts aren't GC'd — Qt parents them
+        # to ``self`` too, but holding an attribute makes debugging easier.
+        self._command_shortcuts = install_shortcuts(self)
+
+        # ⌘K / Ctrl+K opens the command palette. Kept outside the registry
+        # because the palette itself isn't a registered command — it's the
+        # *launcher* for them, and we don't want it to appear in its own
+        # list.
+        self._palette_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self._palette_shortcut.setObjectName("sc_open_command_palette")
+        self._palette_shortcut.activated.connect(self._open_command_palette)
+
+        # Esc = cancel the active worker. Kept at WindowShortcut context
+        # (the default) so modal dialogs and the error drawer keep their
+        # own Esc-to-close behaviour — only when the main window is the
+        # active focus target does Esc route through the cancel walker.
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_shortcut.setObjectName("sc_cancel_active_worker")
+        self._esc_shortcut.activated.connect(self._cancel_active_worker)
+
+    def _open_command_palette(self) -> None:
+        """Show the ⌘K palette, lazily creating it on first use."""
+        palette = getattr(self, "_command_palette", None)
+        if palette is None:
+            from gui.widgets.command_palette import CommandPalette
+            palette = CommandPalette(self)
+            self._command_palette = palette
+        palette.show()
+        palette.raise_()
+        palette.activateWindow()
+
+    def _install_error_ui(self) -> None:
+        """Wire the :class:`ToastHost`, :class:`ErrorDrawer`, and
+        :class:`ProgressLine` to the error/progress buses.
+
+        The toast host subscribes to the singleton ``ErrorCenter``
+        immediately; any worker that emits a structured
+        :class:`~core.errors.ErrorEvent` surfaces as a toast. The progress
+        line listens to the reconstruction and QPI workers' ``progress``
+        signals and stays silent until an operation crosses the
+        perceptual-noticeability threshold.
+        """
+        from gui.commands import Categories, Command, get_registry
+        from gui.widgets.error_drawer import ErrorDrawer
+        from gui.widgets.progress_line import ProgressLine
+        from gui.widgets.toast import ToastHost
+
+        # -- Toast + drawer --------------------------------------------------
+        self._toast_host = ToastHost(self)
+        self._error_drawer = ErrorDrawer(self)
+        self.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, self._error_drawer,
         )
-        
-        # Reset layout
-        QShortcut(QKeySequence("Ctrl+Shift+R"), self).activated.connect(
-            self._reset_layout_to_defaults
+        self._error_drawer.hide()  # only shown on demand
+
+        self._toast_host.show_drawer_requested.connect(
+            self._error_drawer.open_for_event
         )
+        self._toast_host.attach()
+
+        # -- Progress line ---------------------------------------------------
+        self._progress_line = ProgressLine(self)
+        # Mount as a permanent status-bar widget so it sits below the
+        # image grid without restructuring the central layout. It renders
+        # at height 0 while idle, so no chrome cost.
+        self.status_bar.addPermanentWidget(self._progress_line, 1)
+        self._progress_line.cancel_requested.connect(self._cancel_active_worker)
+
+        # Wire the reconstruction worker — it already exists at this point.
+        try:
+            self._recon_worker.progress.connect(self._progress_line.on_progress)
+        except AttributeError:
+            pass  # worker without new-protocol progress signal (compat)
+
+        # -- Error drawer discovery via ⌘K ----------------------------------
+        reg = get_registry()
+        if reg.get("help.show_error_log") is None:
+            reg.register(Command(
+                id="help.show_error_log",
+                title="Show error log",
+                category=Categories.HELP,
+                shortcut="",
+                hint="Open the session error drawer",
+                callback=lambda: self._error_drawer.toggle(),
+            ))
+
+    # ─── Parameter persistence (T1.4) ─────────────────────────────────────
+    def _load_persisted_settings(self) -> None:
+        """Populate sidebar widgets from disk on startup.
+
+        Runs once, just after UI construction. Invalid on-disk state is
+        rejected inside :mod:`gui.settings_store` and we receive defaults
+        instead — nothing crashes, the worst-case is that the widgets show
+        their factory values.
+        """
+        try:
+            from gui import settings_store
+            from gui.persistence import apply_settings
+        except Exception:
+            log.warning("persistence: import failed, using widget defaults",
+                        exc_info=True)
+            return
+        try:
+            self._app_settings = settings_store.load()
+            apply_settings(self.sidebar_tabs, self._app_settings)
+        except Exception:
+            log.warning("persistence: load+apply failed", exc_info=True)
+            # Hold a default in memory so save paths still have somewhere to
+            # merge I/O history into.
+            from core.settings_schema import AppSettings
+            self._app_settings = AppSettings.defaults()
+        self._sync_toolbar_default_dir()
+
+    def _sync_toolbar_default_dir(self) -> None:
+        """Push the latest ``last_folder`` onto the toolbar so the next Load
+        dialog opens there."""
+        try:
+            self.toolbar.default_dir = self._app_settings.io.last_folder or ""
+        except Exception:
+            log.debug("persistence: toolbar default_dir sync failed",
+                      exc_info=True)
+
+    def _persist_current_settings(self) -> None:
+        """Snapshot the sidebar and merge with the live I/O history, then save.
+
+        Called after a successful recon/AF/QPI run so the next launch
+        reopens in the same state the lab last used. Silently swallows
+        storage errors — the app continues; the next save has another
+        chance.
+        """
+        try:
+            from gui import settings_store
+            from gui.persistence import collect_settings
+        except Exception:  # pragma: no cover
+            log.debug("persistence: module import failed on save",
+                      exc_info=True)
+            return
+        try:
+            io = getattr(self._app_settings, "io", None) if getattr(
+                self, "_app_settings", None
+            ) is not None else None
+            snapshot = collect_settings(self.sidebar_tabs, io=io)
+            settings_store.save(snapshot)
+            self._app_settings = snapshot
+        except Exception:
+            log.warning("persistence: save failed", exc_info=True)
+
+    def _update_io_history(self, **updates) -> None:
+        """Merge one or more :class:`IODefaults` fields into the live snapshot
+        and write it to disk immediately.
+
+        Called whenever the user confirms a file-dialog path — threading
+        ``last_folder``/``last_hologram``/``last_report_folder`` back into
+        the schema so the next dialog opens where the user left off.
+        """
+        try:
+            from gui import settings_store
+            from core.settings_schema import AppSettings, IODefaults
+        except Exception:  # pragma: no cover
+            return
+        try:
+            current = getattr(self, "_app_settings", None) or AppSettings.defaults()
+            new_io = IODefaults(**{
+                **{
+                    "last_folder": current.io.last_folder,
+                    "last_preset": current.io.last_preset,
+                    "last_hologram": current.io.last_hologram,
+                    "last_report_folder": current.io.last_report_folder,
+                },
+                **updates,
+            })
+            self._app_settings = current.with_io(
+                last_folder=new_io.last_folder,
+                last_preset=new_io.last_preset,
+                last_hologram=new_io.last_hologram,
+                last_report_folder=new_io.last_report_folder,
+            )
+            settings_store.save(self._app_settings)
+            self._sync_toolbar_default_dir()
+        except Exception:
+            log.debug("persistence: io merge failed", exc_info=True)
+
+    def _last_folder_default(self) -> str:
+        """Return the last-used folder or empty string (Qt opens $HOME)."""
+        try:
+            return self._app_settings.io.last_folder or ""
+        except AttributeError:
+            return ""
+
+    def _cancel_active_worker(self) -> None:
+        """Best-effort cancel of whatever worker is live right now.
+
+        The progress line doesn't know which worker produced an event; we
+        walk the candidates in priority order (QPI → AF → recon) and call
+        each one's cancellation hook if the worker is running. Called from
+        two places: the progress line's Esc-hint click, and the global
+        :kbd:`Esc` shortcut installed in :meth:`_setup_shortcuts`.
+
+        Silent when no worker is running — Esc with nothing to cancel must
+        not flash the status bar or steal focus.
+        """
+        for attr, method, label in (
+            ("_qpi_worker", "cancel", "QPI"),
+            ("_af_worker", "cancel", "Autofocus"),
+            ("_recon_worker", "stop", "Reconstruction"),
+        ):
+            worker = getattr(self, attr, None)
+            if worker is None:
+                continue
+            try:
+                if hasattr(worker, "isRunning") and not worker.isRunning():
+                    continue
+                getattr(worker, method)()
+                # Acknowledge the cancel request so the user sees that Esc
+                # landed. The worker's own ``cancelled`` signal will still
+                # fire once it actually stops; this is just immediate UI
+                # feedback for the keystroke.
+                try:
+                    self.status_bar.show_message(
+                        f"{label}: cancel requested", timeout=4000
+                    )
+                except Exception:
+                    pass
+                break
+            except Exception:
+                continue
 
     def _reset_layout_to_defaults(self):
         """Resets the layout to factory defaults."""
@@ -589,6 +893,17 @@ class MainWindow(QMainWindow):
         self.sidebar_tabs.focus_tab.benchmark_btn.setEnabled(True)
         self.sidebar_tabs.focus_tab.diagnostic_btn.setEnabled(True)
 
+        # Remember the folder the hologram came from so the next "Load"
+        # and "Save As" dialogs open next to it.
+        try:
+            self._update_io_history(
+                last_folder=str(Path(path).parent),
+                last_hologram=str(path),
+            )
+        except Exception:
+            log.debug("persistence: io history update on load failed",
+                      exc_info=True)
+
         return True
 
     def _as_field_2d(self, arr) -> np.ndarray:
@@ -695,6 +1010,30 @@ class MainWindow(QMainWindow):
         self._recon_complex_raw = result.get('recon_complex_raw')
         self._spectrum_mag = result.get('spectrum_mag')
         self._phase_unwrapped = result.get('phase_unwrapped')
+
+        # Snapshot recon params (for report) + audit record
+        try:
+            self._last_recon_params = self._collect_recon_params_for_report()
+        except Exception:
+            self._last_recon_params = None
+
+        try:
+            phase_arr = self._phase_unwrapped if self._phase_unwrapped is not None else (
+                np.angle(self._recon_complex) if self._recon_complex is not None else None
+            )
+            result_summary = None
+            if phase_arr is not None:
+                result_summary = {
+                    "shape": list(phase_arr.shape),
+                    "duration_s": result.get("duration_s"),
+                }
+            self._audit(
+                action="reconstruct",
+                params=self._last_recon_params or {},
+                result_summary=result_summary,
+            )
+        except Exception:
+            log.warning("audit log failed for reconstruct", exc_info=True)
         
         if self._spectrum_mag is not None:
             spec_log = np.log1p(self._spectrum_mag)
@@ -722,6 +1061,9 @@ class MainWindow(QMainWindow):
         self.sidebar_tabs.qpi_tab.compute_btn.setEnabled(has_phase)
         self.sidebar_tabs.focus_tab.detect_objects_btn.setEnabled(has_phase)
         self.status_bar.show_message("Reconstruction complete")
+        # Persist the parameters that just produced a successful run —
+        # next launch opens on the same values.
+        self._persist_current_settings()
 
         # Auto-refresh open QPI windows using the new reconstruction data.
         # Without this, the QPI dialog and 3D surface keep stale results from
@@ -832,11 +1174,12 @@ class MainWindow(QMainWindow):
         from core.ingestion import load_any
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Reference Hologram", "",
+            self, "Load Reference Hologram", self._last_folder_default(),
             "Images (*.tiff *.tif *.png *.bmp *.jpg *.jpeg);;All (*)"
         )
         if not path:
             return
+        self._update_io_history(last_folder=str(Path(path).parent))
 
         try:
             loaded = load_any(path)
@@ -921,6 +1264,10 @@ class MainWindow(QMainWindow):
         worker.qpi_completed.connect(self._on_qpi_completed)
         worker.qpi_failed.connect(self._on_qpi_failed)
         worker.finished.connect(worker.deleteLater)
+        # Route structured progress through the silent 1px line (Tier 1).
+        progress_line = getattr(self, "_progress_line", None)
+        if progress_line is not None:
+            worker.progress.connect(progress_line.on_progress)
         self._qpi_worker = worker  # prevent GC
         worker.start()
 
@@ -929,6 +1276,36 @@ class MainWindow(QMainWindow):
         qtab = self.sidebar_tabs.qpi_tab
         qtab.compute_btn.setEnabled(True)
         qtab.compute_btn.setText("Compute QPI")
+
+        # Stash for reports; _qpi_last_result is also set inside _show_qpi_window.
+        self._last_qpi_result = result
+
+        # Audit QPI completion
+        try:
+            summary = {
+                "n_sample": float(qtab.n_sample.value()),
+                "n_medium": float(qtab.n_medium.value()),
+            }
+            for attr in ("total_dry_mass_pg", "step_height_m"):
+                val = getattr(result, attr, None)
+                if val is not None:
+                    try:
+                        summary[attr] = float(val)
+                    except Exception:
+                        pass
+            ph_stats = getattr(result, "phase_stats", None)
+            if ph_stats is not None and getattr(ph_stats, "range_nm", None) is not None:
+                try:
+                    summary["opd_range_nm"] = float(ph_stats.range_nm)
+                except Exception:
+                    pass
+            self._audit(
+                action="qpi",
+                params={"n_sample": summary["n_sample"], "n_medium": summary["n_medium"]},
+                result_summary=summary,
+            )
+        except Exception:
+            log.warning("audit log failed for qpi", exc_info=True)
 
         try:
             # Clear stale stats from previous computation before populating
@@ -955,6 +1332,8 @@ class MainWindow(QMainWindow):
             if result.phase_stats is not None:
                 msg += f" | OPD range: {result.phase_stats.range_nm:.1f} nm"
             self.status_bar.show_message(msg)
+            # Persist the refractive-index values the user just validated.
+            self._persist_current_settings()
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1510,6 +1889,7 @@ class MainWindow(QMainWindow):
             worker.progress.connect(self._af_overlay.set_status)
             worker.progress_pct.connect(self._af_overlay.update_progress)
             worker.metric_selected.connect(self._on_af_metric_selected)
+            worker.metric_auto_fallback.connect(self._on_af_metric_auto_fallback)
             worker.finished.connect(self._on_af_worker_finished)
             worker.error.connect(self._on_af_worker_error)
             worker.cancelled.connect(self._on_af_worker_cancelled)
@@ -1536,6 +1916,25 @@ class MainWindow(QMainWindow):
                 ftab.metric_combo.setCurrentIndex(i)
                 break
 
+    def _on_af_metric_auto_fallback(self, from_metric: str, to_metric: str) -> None:
+        """Worker detected a low-contrast hologram and switched metric pre-flight.
+
+        The user chose (or auto-select picked) ENTROPY, but the hologram lacks
+        enough wrapped-phase structure for ENTROPY to converge reliably. The
+        worker silently switched to PHASE_VARIANCE for this run. We surface that
+        clearly so the lab operator understands why the metric in the report
+        differs from what they selected.
+        """
+        msg = (
+            f"Autofocus: {from_metric} unsuitable for low-contrast hologram — "
+            f"switched to {to_metric}"
+        )
+        self.status_bar.show_message(msg, timeout=12000)
+        log.info("Autofocus metric auto-fallback: %s → %s", from_metric, to_metric)
+        # Reflect the actual metric being used in the focus-tab combo so the
+        # user isn't misled about what ran.
+        self._on_af_metric_selected(to_metric)
+
     def _on_af_worker_finished(self, best_z, z_arr, scores, metric_val, elapsed, evals) -> None:
         self._af_overlay.hide_overlay()
         self._af_worker = None
@@ -1546,8 +1945,30 @@ class MainWindow(QMainWindow):
             f"Auto-focus: {elapsed:.2f}s | Z={best_z*1e3:.4f} mm | {metric_val} | {evals} evals"
         )
 
+        # Snapshot AF result (for report) + audit record
+        try:
+            ftab = self.sidebar_tabs.focus_tab
+            algo = ftab.get_effective_algorithm()
+        except Exception:
+            algo = None
+        af_summary = {
+            "z_found_m": float(best_z),
+            "metric": str(metric_val),
+            "algorithm": algo,
+            "evaluations": int(evals),
+            "elapsed_s": float(elapsed),
+        }
+        self._last_af_result = af_summary
+        self._audit(
+            action="autofocus",
+            params={"metric": str(metric_val), "algorithm": algo},
+            result_summary=af_summary,
+        )
+
         self.sidebar_tabs.recon_tab.z_mm.setValue(best_z * 1e3)
         self.sidebar_tabs.focus_tab.autofocus_btn.setEnabled(True)
+        # Save the z-range + metric the user just found useful.
+        self._persist_current_settings()
         self._trigger_reconstruction()
 
     def _on_af_worker_error(self, msg: str) -> None:
@@ -2071,10 +2492,13 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QFileDialog
         from pathlib import Path
         rectab = self.sidebar_tabs.record_tab
-        path = QFileDialog.getExistingDirectory(self, "Output Directory")
+        path = QFileDialog.getExistingDirectory(
+            self, "Output Directory", self._last_folder_default()
+        )
         if path:
             rectab.out_dir_lbl.setText(str(Path(path).name))
             self._vid_output_path = Path(path)
+            self._update_io_history(last_folder=str(Path(path)))
 
     def _on_record_action(self, checked: bool = False):
         rectab = self.sidebar_tabs.record_tab
@@ -2110,9 +2534,14 @@ class MainWindow(QMainWindow):
 
     def _take_snapshot(self, state: dict):
         from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getSaveFileName(self, "Save Snapshot", "snapshot.png", "Images (*.png *.tiff *.bmp)")
+        folder = self._last_folder_default()
+        default = str(Path(folder) / "snapshot.png") if folder else "snapshot.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Snapshot", default, "Images (*.png *.tiff *.bmp)"
+        )
         if not path:
             return
+        self._update_io_history(last_folder=str(Path(path).parent))
             
         pixmap = self.image_grid.grab()
         pixmap.save(path)
@@ -2636,15 +3065,327 @@ class MainWindow(QMainWindow):
     def _on_export_view(self) -> None:
         """Export the current image grid as a PNG."""
         from PySide6.QtWidgets import QFileDialog
+        folder = self._last_folder_default()
+        default = str(Path(folder) / "view_export.png") if folder else "view_export.png"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export View", "view_export.png",
+            self, "Export View", default,
             "Images (*.png *.jpg *.tiff *.bmp)"
         )
         if not path:
             return
+        self._update_io_history(last_folder=str(Path(path).parent))
         pixmap = self.image_grid.grab()
         pixmap.save(path)
         self.status_bar.show_message(f"View exported to {path}")
+
+    # ─── Menus (Help + Tools extensions) ───
+    def _init_menus(self) -> None:
+        """Build the menu bar with Help + Tools extensions (report action).
+
+        Both actions come from the command registry so the palette, the
+        menu, and any future keybinding editor see the same titles and
+        callbacks.
+        """
+        from gui.commands import bind_to_qt, get_registry
+
+        menu_bar = self.menuBar()
+        reg = get_registry()
+
+        # ─ Tools menu (report) ─
+        tools_menu = menu_bar.addMenu("Tools")
+
+        report_cmd = reg.get("tools.generate_report")
+        if report_cmd is not None:
+            self.action_generate_report = bind_to_qt(self, report_cmd)
+            tools_menu.addAction(self.action_generate_report)
+            # Mirror report action on the toolbar for discoverability.
+            try:
+                self.toolbar.addSeparator()
+                self.toolbar.addAction(self.action_generate_report)
+            except Exception:
+                pass
+
+        # ─ Help menu ─
+        help_menu = menu_bar.addMenu("Help")
+        about_cmd = reg.get("help.about")
+        if about_cmd is not None:
+            self.action_about = bind_to_qt(self, about_cmd)
+            help_menu.addAction(self.action_about)
+
+    def _show_about_dialog(self) -> None:
+        """Show the About dialog (modal)."""
+        try:
+            from .dialogs.about_dialog import AboutDialog
+            dlg = AboutDialog(self)
+            dlg.exec()
+        except Exception as e:
+            log.exception("Failed to show About dialog")
+            self.status_bar.show_message(f"About dialog failed: {e}")
+
+    # ─── Image panel context menus ───
+    def _init_image_panel_context_menus(self) -> None:
+        """Wire right-click context menus on amplitude & phase panels."""
+        try:
+            self.panel_amp.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.panel_amp.customContextMenuRequested.connect(self._on_amp_panel_context_menu)
+        except Exception:
+            log.exception("Could not attach context menu to amplitude panel")
+
+        try:
+            self.panel_phase.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.panel_phase.customContextMenuRequested.connect(self._on_phase_panel_context_menu)
+        except Exception:
+            log.exception("Could not attach context menu to phase panel")
+
+    def _on_amp_panel_context_menu(self, pos: QPoint) -> None:
+        """Right-click menu on the amplitude panel."""
+        menu = QMenu(self.panel_amp)
+
+        act_line = menu.addAction("Line profile")
+        act_line.triggered.connect(self._trigger_line_profile_from_menu)
+
+        act_export = menu.addAction("Export image…")
+        act_export.triggered.connect(lambda: self._export_panel_image(self.panel_amp, "amplitude"))
+
+        global_pos = self.panel_amp.mapToGlobal(pos)
+        menu.exec(global_pos)
+
+    def _on_phase_panel_context_menu(self, pos: QPoint) -> None:
+        """Right-click menu on the phase panel."""
+        menu = QMenu(self.panel_phase)
+
+        act_line = menu.addAction("Line profile")
+        act_line.triggered.connect(self._trigger_line_profile_from_menu)
+
+        act_3d = menu.addAction("3D surface")
+        # Only enable 3D if we have reconstruction output with phase data
+        act_3d.setEnabled(
+            self._qpi_last_result is not None
+            or self._phase_unwrapped is not None
+        )
+        act_3d.triggered.connect(self._show_3d_surface_from_menu)
+
+        act_export = menu.addAction("Export image…")
+        act_export.triggered.connect(lambda: self._export_panel_image(self.panel_phase, "phase"))
+
+        global_pos = self.panel_phase.mapToGlobal(pos)
+        menu.exec(global_pos)
+
+    def _trigger_line_profile_from_menu(self) -> None:
+        """Toggle the line-profile tool ON via the toolbar action."""
+        try:
+            act = self.toolbar.action_line_profile
+            if not act.isChecked():
+                act.setChecked(True)  # triggers the toggled signal → _on_line_profile_toggled
+            else:
+                # Already on — just re-show the dialog if it exists
+                if self._line_profile_dlg is not None:
+                    self._line_profile_dlg.raise_()
+                    self._line_profile_dlg.activateWindow()
+        except Exception as e:
+            log.exception("Line profile trigger failed")
+            self.status_bar.show_message(f"Line profile failed: {e}")
+
+    def _show_3d_surface_from_menu(self) -> None:
+        """Open the 3D surface. Prefer the full QPI result; otherwise build a minimal one."""
+        if self._qpi_last_result is not None:
+            self._show_3d_surface(self._qpi_last_result)
+            return
+
+        if self._phase_unwrapped is None:
+            self.status_bar.show_message("Run reconstruction (and QPI) first — no phase data")
+            return
+
+        # Minimal shim: _show_3d_surface reads .height_nm / .opd_nm. Build a small object.
+        try:
+            phase = self._phase_unwrapped
+            # Convert phase → height in nm using current optical params (µm → nm)
+            height_um = self._phase_to_height_um(phase)
+            height_nm = (height_um * 1000.0).astype(np.float64)
+
+            class _Shim:
+                pass
+            shim = _Shim()
+            shim.height_nm = height_nm
+            shim.opd_nm = None
+            self._show_3d_surface(shim)
+        except Exception as e:
+            log.exception("3D surface from phase failed")
+            self.status_bar.show_message(f"3D surface failed: {e}")
+
+    def _export_panel_image(self, panel, label: str) -> None:
+        """Save the visible contents of a panel as a PNG."""
+        default_name = f"dhm_{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        folder = self._last_folder_default()
+        default = str(Path(folder) / default_name) if folder else default_name
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export image", default,
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;All Files (*)"
+        )
+        if not path:
+            return
+        self._update_io_history(last_folder=str(Path(path).parent))
+        try:
+            pixmap = panel.grab()
+            ok = pixmap.save(path)
+            if not ok:
+                raise RuntimeError("QPixmap.save returned False")
+            self.status_bar.show_message(f"Image saved: {path}", timeout=6000)
+        except Exception as e:
+            log.exception("Panel export failed")
+            self.status_bar.show_message(f"Image save failed: {e}", timeout=10000)
+
+    # ─── Audit helper ───
+    def _audit(self, **kwargs) -> None:
+        """Best-effort audit record. Never raises."""
+        if get_audit_log is None:
+            return
+        try:
+            get_audit_log().record(**kwargs)
+        except Exception:
+            log.warning("audit log failed", exc_info=True)
+
+    # ─── Report generation ───
+    def _collect_recon_params_for_report(self) -> dict:
+        """Gather a JSON-friendly snapshot of current reconstruction settings."""
+        rtab = self.sidebar_tabs.recon_tab
+        ptab = self.sidebar_tabs.process_tab
+        try:
+            method = rtab.method_combo.currentData()
+            method_str = getattr(method, "name", None) or str(method)
+        except Exception:
+            method_str = "unknown"
+
+        params = {
+            "z_m": float(rtab.z_mm.value()) * 1e-3,
+            "wavelength_m": float(rtab.wavelength_nm.value()) * 1e-9,
+            "pixel_size_m": self._get_effective_pixel_um() * 1e-6,
+            "method": method_str,
+            "mask_radius": int(rtab.mask_radius.value()),
+        }
+        try:
+            params["magnification"] = float(rtab.magnification.value())
+        except Exception:
+            pass
+        try:
+            params["fft_backend"] = rtab.fft_backend_combo.currentData()
+        except Exception:
+            pass
+        try:
+            params["subtract_mean"] = bool(ptab.subtract_mean_cb.isChecked())
+            params["hann_window"] = bool(ptab.hann_cb.isChecked())
+        except Exception:
+            pass
+        return params
+
+    def _on_generate_report_triggered(self) -> None:
+        """Gather state and generate an HTML report via core.report."""
+        default_name = f"dhm_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        # Report folder remembered separately from the image folder — the lab
+        # typically writes reports to a shared network share, not next to
+        # the holograms.
+        try:
+            default_dir = self._app_settings.io.last_report_folder or ""
+        except AttributeError:
+            default_dir = ""
+        if not default_dir and self._loaded_path is not None:
+            try:
+                default_dir = str(self._loaded_path.parent)
+            except Exception:
+                pass
+        if not default_dir:
+            default_dir = str(Path.home())
+        default_path = str(Path(default_dir) / default_name)
+
+        chosen_path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Save report", default_path, "HTML (*.html);;PDF (*.pdf)"
+        )
+        if not chosen_path:
+            return
+        self._update_io_history(last_report_folder=str(Path(chosen_path).parent))
+
+        # Resolve format from the extension first, then the filter. Add the
+        # missing extension if the user left it off (Qt does this on Linux but
+        # not on macOS, so don't trust the dialog to do it for us).
+        ext = Path(chosen_path).suffix.lower()
+        if ext not in (".html", ".htm", ".pdf"):
+            if "pdf" in (selected_filter or "").lower():
+                chosen_path += ".pdf"
+                ext = ".pdf"
+            else:
+                chosen_path += ".html"
+                ext = ".html"
+
+        try:
+            from core.report import generate_html_report, generate_pdf_report
+        except Exception as e:
+            log.exception("core.report not available")
+            self.status_bar.show_message(
+                f"Report failed: report module unavailable ({e})", timeout=10000
+            )
+            return
+
+        # Current images (2D arrays or None)
+        phase_image = None
+        amplitude_image = None
+        height_image = None
+        try:
+            if self._recon_complex is not None:
+                amplitude_image = np.abs(self._recon_complex)
+            if self._phase_unwrapped is not None:
+                phase_image = self._phase_unwrapped
+            elif self._recon_complex is not None:
+                phase_image = np.angle(self._recon_complex)
+            if self._phase_unwrapped is not None:
+                try:
+                    height_image = self._phase_to_height_um(self._phase_unwrapped)
+                except Exception:
+                    height_image = None
+        except Exception:
+            log.exception("Failed to snapshot images for report")
+
+        # Use last recon params if available, else build from UI
+        recon_params = self._last_recon_params or self._collect_recon_params_for_report()
+
+        # Autofocus summary
+        autofocus_summary = self._last_af_result
+
+        # QPI result (raw object; core.report will introspect or skip if None)
+        qpi_result = self._last_qpi_result or self._qpi_last_result
+
+        report_fn = generate_pdf_report if ext == ".pdf" else generate_html_report
+        fmt_label = "PDF" if ext == ".pdf" else "HTML"
+
+        try:
+            path = report_fn(
+                output_path=Path(chosen_path),
+                title="DHM Reconstruction Report",
+                operator=None,  # v1.1 will prompt
+                recon_params=recon_params,
+                autofocus_summary=autofocus_summary,
+                qpi_result=qpi_result,
+                phase_image=phase_image,
+                amplitude_image=amplitude_image,
+                height_image=height_image,
+                notes="",
+            )
+            self.status_bar.show_message(f"{fmt_label} report saved: {path}", timeout=8000)
+            self._audit(
+                action="export_report",
+                params={"path": str(path), "format": fmt_label.lower()},
+                result_summary={"has_phase": phase_image is not None,
+                                 "has_amplitude": amplitude_image is not None,
+                                 "has_height": height_image is not None},
+            )
+        except Exception as exc:
+            log.exception("Report generation failed")
+            self.status_bar.show_message(f"Report failed: {exc}", timeout=10000)
+
+    # ─── Worker failure slots (additions) ───
+    def _on_recording_worker_error(self, msg: str) -> None:
+        """Surface recording worker failures on the status bar."""
+        log.error("Recording worker failed: %s", msg)
+        self.status_bar.show_message(f"Recording failed: {msg}", timeout=10000)
 
     def _run_fft_benchmark(self):
         self.status_bar.show_message("Running FFT Benchmark...")
