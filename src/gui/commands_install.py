@@ -42,10 +42,26 @@ MAIN_WINDOW_COMMAND_IDS: tuple[str, ...] = (
     "view.reset_layout",
     # Reconstruct
     "reconstruct.run",
+    # Autofocus
+    "autofocus.find_multiple",
     # Tools
     "tools.generate_report",
+    "tools.export_qpi_csv",
+    "tools.compute_depth_map",
+    "tools.toggle_depth_overlay",
+    "tools.qpi_batch_candidates",
+    "tools.export_tomography_bundle",
+    # View / theme
+    "view.theme.light",
+    "view.theme.dark",
+    "view.theme.system",
+    "view.theme.high_contrast",
     # Help
     "help.about",
+    "help.show_onboarding",
+    "help.show_overlay",
+    # AI assistant (v3.0 prep)
+    "ai.toggle_panel",
 )
 
 
@@ -137,6 +153,91 @@ def install_main_window_commands(
         callback=lambda: window._on_generate_report_triggered(),
     ))
 
+    # -- Autofocus (multi-focus prototype) ---------------------------------
+    reg.register(Command(
+        id="autofocus.find_multiple",
+        title="Find multiple focus planes…",
+        category=Categories.AUTOFOCUS,
+        hint="Scan the focus landscape and list every plausible focus z",
+        callback=lambda: window._on_find_focus_candidates_triggered(),
+        # Gated on a loaded hologram — without one, the scan has no input.
+        when=lambda: getattr(window, "_loaded_array", None) is not None,
+    ))
+
+    reg.register(Command(
+        id="tools.export_qpi_csv",
+        title="Export QPI CSV…",
+        category=Categories.TOOLS,
+        hint="Write the last QPI result to a CSV row (LIMS/R/Python friendly)",
+        callback=lambda: window._on_export_qpi_csv_triggered(),
+    ))
+
+    reg.register(Command(
+        id="tools.compute_depth_map",
+        title="Compute depth map…",
+        category=Categories.TOOLS,
+        hint="Per-pixel best-focus z — tomographic depth map saved as NPZ + CSV",
+        callback=lambda: window._on_compute_depth_map_triggered(),
+        when=lambda: getattr(window, "_loaded_array", None) is not None,
+    ))
+
+    reg.register(Command(
+        id="tools.qpi_batch_candidates",
+        title="Run QPI batch for focus candidates…",
+        category=Categories.TOOLS,
+        hint="Compute QPI once per detected focus plane, save per-candidate CSV",
+        callback=lambda: window._on_qpi_batch_candidates_triggered(),
+        when=lambda: getattr(window, "_loaded_array", None) is not None,
+    ))
+
+    reg.register(Command(
+        id="tools.toggle_depth_overlay",
+        title="Toggle depth overlay on phase panel",
+        category=Categories.TOOLS,
+        hint="Compute depth map and tint the phase panel with colormap",
+        callback=lambda: window._on_toggle_depth_overlay_triggered(),
+        when=lambda: getattr(window, "_loaded_array", None) is not None,
+    ))
+
+    reg.register(Command(
+        id="tools.export_tomography_bundle",
+        title="Export tomography bundle…",
+        category=Categories.TOOLS,
+        hint="Write depth NPZ + depth CSV + cluster CSV + QPI batch into one directory",
+        callback=lambda: window._on_export_tomography_bundle_triggered(),
+        when=lambda: getattr(window, "_loaded_array", None) is not None,
+    ))
+
+    # -- View / theme (v1.4 UI Redesign) -----------------------------------
+    reg.register(Command(
+        id="view.theme.light",
+        title="Theme: Light",
+        category=Categories.VIEW,
+        hint="Switch the UI to the explicit light palette",
+        callback=lambda: window._apply_theme_by_name("light"),
+    ))
+    reg.register(Command(
+        id="view.theme.dark",
+        title="Theme: Dark",
+        category=Categories.VIEW,
+        hint="Switch the UI to the explicit dark palette",
+        callback=lambda: window._apply_theme_by_name("dark"),
+    ))
+    reg.register(Command(
+        id="view.theme.system",
+        title="Theme: System default",
+        category=Categories.VIEW,
+        hint="Follow the platform's system appearance (macOS light/dark)",
+        callback=lambda: window._apply_theme_by_name("system"),
+    ))
+    reg.register(Command(
+        id="view.theme.high_contrast",
+        title="Theme: High contrast",
+        category=Categories.VIEW,
+        hint="WCAG-AA high-contrast palette — pure black / white / yellow",
+        callback=lambda: window._apply_theme_by_name("high_contrast"),
+    ))
+
     # -- Help ---------------------------------------------------------------
     reg.register(Command(
         id="help.about",
@@ -144,6 +245,30 @@ def install_main_window_commands(
         category=Categories.HELP,
         hint="Show version information",
         callback=lambda: window._show_about_dialog(),
+    ))
+    reg.register(Command(
+        id="help.show_onboarding",
+        title="Show onboarding",
+        category=Categories.HELP,
+        hint="Re-open the first-run walkthrough of the app",
+        callback=lambda: window._show_onboarding(),
+    ))
+    reg.register(Command(
+        id="help.show_overlay",
+        title="Show contextual help (?)",
+        category=Categories.HELP,
+        hint="List tooltips of every currently-visible control",
+        callback=lambda: window._show_help_overlay(),
+    ))
+
+    # -- AI assistant -------------------------------------------------------
+    reg.register(Command(
+        id="ai.toggle_panel",
+        title="Toggle AI assistant panel",
+        category=Categories.HELP,
+        shortcut="Ctrl+Shift+A",
+        hint="Open or close the local-LLM AI co-pilot dock",
+        callback=lambda: window._toggle_ai_panel(),
     ))
 
     _LOG.debug(

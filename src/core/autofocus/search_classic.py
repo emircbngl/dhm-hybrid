@@ -9,9 +9,11 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
 from ..reconstruction import ReconstructionMethod, ReconstructionParams
+from ..fft_backend import FFTBackend
 from .evaluator import (
     AutofocusCancelled,
     AutoFocusResult,
+    _make_batch_evaluator,
     _make_fast_evaluator,
 )
 from .metrics import FocusMetric, _is_minimize
@@ -27,13 +29,50 @@ def autofocus_zscan(
     cancel_check: Optional[Callable[[], bool]] = None,
     roi_bounds=None,
     ref_field: Optional[np.ndarray] = None,
+    batch_backend: Optional[FFTBackend] = None,
 ) -> AutoFocusResult:
+    """Linear z-scan autofocus.
+
+    v2.1.0: when ``batch_backend`` is supplied AND its
+    ``supports_batched`` is True (i.e. a real GPU backend, not the
+    default-loop fallback), the scan runs through
+    :func:`_make_batch_evaluator` — one batched IFFT for every
+    requested z. Falls back to the serial path otherwise so
+    cancel + progress callbacks keep working unchanged.
+    """
+    minimize = _is_minimize(metric)
+    total = len(z_values_m)
+
+    # Batch path — only when backend reports a real batched op.
+    # Cancellation is coarser: we check before the batched call.
+    # Progress fires once at start + once at end so the UI bar
+    # still moves.
+    if batch_backend is not None and batch_backend.supports_batched:
+        if cancel_check and cancel_check():
+            raise AutofocusCancelled()
+        if on_progress:
+            on_progress(0, total)
+        evaluate_many = _make_batch_evaluator(
+            field, base_params, method, metric,
+            backend=batch_backend,
+            roi_bounds=roi_bounds, ref_field=ref_field,
+        )
+        all_scores = evaluate_many(z_values_m)
+        scores = {z: float(s) for z, s in zip(z_values_m, all_scores)}
+        if minimize:
+            best_idx = int(np.argmin(all_scores))
+        else:
+            best_idx = int(np.argmax(all_scores))
+        if on_progress:
+            on_progress(total, total)
+        return AutoFocusResult(
+            best_z_m=z_values_m[best_idx], scores=scores,
+        )
+
     _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
     scores = {}
     best_z = z_values_m[0]
-    minimize = _is_minimize(metric)
     best_score = float('inf') if minimize else -float('inf')
-    total = len(z_values_m)
 
     for i, z in enumerate(z_values_m):
         if cancel_check and cancel_check():

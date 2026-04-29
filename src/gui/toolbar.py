@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QComboBox,
     QLabel,
+    QLineEdit,
     QMenu,
     QWidgetAction,
     QHBoxLayout,
@@ -43,14 +44,42 @@ class MainToolbar(QToolBar):
         self.addWidget(QLabel(" Mode: "))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["File", "Live"])
+        # v1.4 accessibility — every control has a spoken name so
+        # screen-readers announce "Data source, combo box, File" etc.
+        self.mode_combo.setAccessibleName("Data source mode")
+        self.mode_combo.setToolTip(
+            "Data source — File loads a hologram from disk, "
+            "Live streams from the connected camera."
+        )
         self.addWidget(self.mode_combo)
 
         self.addSeparator()
 
         # Load File
         self.action_load = QAction("Load File", self)
+        self.action_load.setToolTip("Open a hologram image (TIFF, PNG, …)")
+        self.action_load.setStatusTip(
+            "Load a hologram from disk for reconstruction."
+        )
         self.action_load.triggered.connect(self._on_load_clicked)
         self.addAction(self.action_load)
+
+        self.addSeparator()
+
+        # Sample ID — optional tag that lands in every audit record so the
+        # lab's LIMS can stitch reconstruction output back to a specimen.
+        # Empty string means "not tagged" and is omitted from the audit
+        # context automatically.
+        self.addWidget(QLabel(" Sample ID: "))
+        self.sample_id_edit = QLineEdit()
+        self.sample_id_edit.setPlaceholderText("optional (LIMS)")
+        self.sample_id_edit.setMaximumWidth(140)
+        self.sample_id_edit.setAccessibleName("Sample identifier (LIMS)")
+        self.sample_id_edit.setToolTip(
+            "Optional sample identifier. Appended to every audit log entry "
+            "so external systems (LIMS, ELN) can correlate."
+        )
+        self.addWidget(self.sample_id_edit)
 
         self.addSeparator()
 
@@ -138,6 +167,9 @@ class MainToolbar(QToolBar):
         # Reconstruct (always visible, works from any tab)
         self.action_reconstruct = QAction("⬢ Reconstruct", self)
         self.action_reconstruct.setToolTip("Run reconstruction with current parameters (Ctrl+R)")
+        self.action_reconstruct.setStatusTip(
+            "Reconstruct the loaded hologram at the current z (Ctrl+R)."
+        )
         self.action_reconstruct.setEnabled(False)
         self.action_reconstruct.triggered.connect(self.reconstruct_requested.emit)
         self.addAction(self.action_reconstruct)

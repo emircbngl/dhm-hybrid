@@ -14,3 +14,6 @@ pyfftw
 matplotlib
 PyOpenGL
 PyOpenGL-accelerate
+# AI assistant — local LLM (Ollama / LM Studio) via OpenAI-compatible HTTP.
+requests>=2.31
+jsonschema>=4.21

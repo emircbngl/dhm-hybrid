@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
 )
 from PySide6.QtCore import Qt, Signal
+from gui.widgets.collapsible_box import CollapsibleBox
 
 
 class _Separator(QFrame):
@@ -160,6 +161,15 @@ class QPITab(QWidget):
 
         layout.addWidget(params_group)
 
+        # ─── Advanced QPI options (v1.4 progressive disclosure) ───
+        # Phase-correction, z-stack, and display-panel selectors sit
+        # behind an expander so the common flow (set n_sample / n_medium /
+        # threshold → Compute) stays clutter-free.
+        self.advanced_box = CollapsibleBox("Advanced QPI options")
+        advanced_layout = QVBoxLayout()
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(6)
+
         # ═══════════════════════════════════════════
         #  PHASE CORRECTION
         # ═══════════════════════════════════════════
@@ -196,7 +206,7 @@ class QPITab(QWidget):
         )
         cg.addWidget(self.ref_subtract_cb, cr, 0, 1, 2); cr += 1
 
-        layout.addWidget(correction_group)
+        advanced_layout.addWidget(correction_group)
 
         # ═══════════════════════════════════════════
         #  Z-STACK / 3D PHASE VOLUME
@@ -244,7 +254,7 @@ class QPITab(QWidget):
         zg.addWidget(self.zstack_compute_ri_cb, zr, 0, 1, 2); zr += 1
 
         self.zstack_group = zstack_group
-        layout.addWidget(zstack_group)
+        advanced_layout.addWidget(zstack_group)
 
         # ═══════════════════════════════════════════
         #  DISPLAY PANELS SELECTION
@@ -289,7 +299,12 @@ class QPITab(QWidget):
                     self.show_ri_cb, self.show_3d_cb, self.show_psd_cb, self.show_histogram_cb]:
             cb.toggled.connect(lambda _: self.display_changed.emit())
 
-        layout.addWidget(display_group)
+        advanced_layout.addWidget(display_group)
+
+        # Commit advanced block to the expander and insert before the
+        # Compute button so essentials stay at the top.
+        self.advanced_box.setContentLayout(advanced_layout)
+        layout.addWidget(self.advanced_box)
 
         # ═══════════════════════════════════════════
         #  COMPUTE BUTTON

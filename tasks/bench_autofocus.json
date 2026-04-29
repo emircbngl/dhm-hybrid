@@ -1,0 +1,50 @@
+[
+  {
+    "algorithm": "zscan",
+    "shape": "2048x2048",
+    "n_steps": 40,
+    "runtime_ms": 4278.0,
+    "best_z_mm": 8.205,
+    "evaluations": 40
+  },
+  {
+    "algorithm": "coarse_to_fine",
+    "shape": "2048x2048",
+    "n_steps": 40,
+    "runtime_ms": 6172.0,
+    "best_z_mm": 8.184,
+    "evaluations": 57
+  },
+  {
+    "algorithm": "robust",
+    "shape": "2048x2048",
+    "n_steps": 40,
+    "runtime_ms": 7705.9,
+    "best_z_mm": 8.311,
+    "evaluations": 40
+  },
+  {
+    "algorithm": "adaptive_gradient",
+    "shape": "2048x2048",
+    "n_steps": 40,
+    "runtime_ms": 4302.9,
+    "best_z_mm": 8.889,
+    "evaluations": 40
+  },
+  {
+    "algorithm": "adaptive_bracketing",
+    "shape": "2048x2048",
+    "n_steps": 40,
+    "runtime_ms": 5728.0,
+    "best_z_mm": 11.99,
+    "evaluations": 53
+  },
+  {
+    "algorithm": "adaptive_distance",
+    "shape": "2048x2048",
+    "n_steps": 40,
+    "runtime_ms": 4055.4,
+    "best_z_mm": -0.5,
+    "evaluations": 40
+  }
+]

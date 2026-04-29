@@ -1,0 +1,72 @@
+# DHM Reconstruction — CI matrix
+#
+# v2.1.0: pin Linux + macOS test runs. Windows added in v2.1.x when
+# the camera backend work lands (Pylon/IDS/Thorlabs SDKs are
+# Windows-first). Torch tests run on Linux only — macOS + arm
+# torch is fine but the venv on the dev box doesn't have it,
+# the CI image will.
+#
+# Trigger: push to main + every PR. Heavy benchmark runs are gated
+# behind a workflow_dispatch button so PR builds stay fast.
+
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_bench:
+        description: "Also run autofocus benchmark"
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install scientific deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Install torch (Linux only)
+        if: runner.os == 'Linux'
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Headless test suite
+        run: |
+          export DHM_USER=ci
+          PYTHONPATH=src:tests pytest tests/ -q --tb=short \
+              -m "not needs_gui"
+      - name: Bug regression
+        run: |
+          python scripts/check_bugs.py --no-color
+
+  bench:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_bench }}
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt torch
+      - name: Run autofocus benchmark
+        run: |
+          PYTHONPATH=src:tests \
+              python scripts/bench_autofocus.py \
+                  --backends default,torch \
+                  --shapes 256,512,1024
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-result
+          path: tasks/bench_autofocus.json

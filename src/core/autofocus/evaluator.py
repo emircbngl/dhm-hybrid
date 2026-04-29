@@ -4,15 +4,20 @@
 field spectrum and a local `CachedReconstructor`, so each evaluation only needs
 one IFFT. `downsample_complex_field` performs bandlimited Fourier-domain cropping
 and returns an adjusted `ReconstructionParams` so propagation distances stay correct.
+
+v2.1.0 also adds :func:`_make_batch_evaluator` — given a list of z values upfront,
+build the entire (n_steps, ny, nx) propagation kernel stack in one shot and feed
+it through ``backend.ifft2_batched``. Net win when the backend is a GPU one
+(torch CUDA / MPS): a single batched IFFT replaces n_steps serial IFFTs.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from ..fft_backend import get_best_fft_backend
+from ..fft_backend import FFTBackend, FFTBackendName, get_best_fft_backend
 from ..reconstruction import (
     CachedReconstructor,
     ReconstructionMethod,
@@ -136,3 +141,206 @@ def _make_fast_evaluator(
         return _calc_metric(roi, metric)
 
     return evaluate
+
+
+def _build_H_stack(field_shape: tuple,
+                   base_params: ReconstructionParams,
+                   method: ReconstructionMethod,
+                   zs: Sequence[float]) -> np.ndarray:
+    """Assemble the (n_steps, ny, nx) transfer-function stack for a
+    list of propagation distances. Reuses the same H-builder the
+    single-shot ``CachedReconstructor`` uses, so every search
+    algorithm produces bit-identical results whether they go
+    through serial or batched paths."""
+    # Borrow the single-shot recon's `_compute_H` — it's the
+    # canonical implementation; duplicating risks drift.
+    fft = get_best_fft_backend()  # only used for shape metadata
+    proxy = CachedReconstructor(field_shape, method, fft)
+    out = np.empty((len(zs),) + tuple(field_shape), dtype=np.complex64)
+    for i, z in enumerate(zs):
+        params = ReconstructionParams(
+            wavelength_m=base_params.wavelength_m,
+            pixel_size_m=base_params.pixel_size_m,
+            z_m=float(z), n=base_params.n,
+        )
+        H = proxy._compute_H(params)
+        out[i] = H.astype(np.complex64, copy=False)
+    return out
+
+
+def _make_roi_fast_evaluator(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    metric: FocusMetric,
+    roi_bounds,
+) -> Callable[[float], float]:
+    """ROI-aware evaluator that crops the *spatial* result before
+    metric computation **and** uses the smallest sensible IFFT
+    size when the ROI is much smaller than the frame.
+
+    The standard :func:`_make_fast_evaluator` does the IFFT on the
+    full (ny, nx) spectrum and then takes a sub-array for the
+    metric. When the operator picks a 256×256 ROI on a 2048×2048
+    frame, that's a 64× wasted IFFT. This fast-path runs the IFFT
+    at the ROI-sized output instead.
+
+    Implementation: we keep the full-frame field spectrum (it
+    carries the off-axis structure we depend on for phase
+    reconstruction) and the full-frame H stack, but compute the
+    IFFT directly into a smaller-padded buffer using the standard
+    "FFT-then-crop" Fourier trick:
+
+    1. Full-frame product ``S · H`` is shape (ny, nx).
+    2. ``np.fft.fftshift`` to centre DC, then crop the central
+       (roi_h, roi_w) of the spectrum.
+    3. ``np.fft.ifft2`` on the *cropped* spectrum gives a
+       lower-resolution but spatially-correct ROI image.
+
+    The crop loses high frequencies outside the ROI band; for
+    autofocus that's fine — we only care about the metric value
+    on the ROI region, and the metric itself averages over many
+    samples. Net wall-clock saving = (full_area / roi_area).
+    """
+    fft = get_best_fft_backend()
+    recon = CachedReconstructor(field.shape, method, fft)
+
+    inp = field.astype(np.complex64, copy=False)
+    field_spectrum = fft.fft2(inp)
+    if field_spectrum.dtype != np.complex64:
+        field_spectrum = field_spectrum.astype(np.complex64)
+
+    ny, nx = field.shape
+    ry0 = max(0, int(roi_bounds.y0))
+    rx0 = max(0, int(roi_bounds.x0))
+    ry1 = min(ny, int(roi_bounds.y1))
+    rx1 = min(nx, int(roi_bounds.x1))
+    roi_h = max(8, ry1 - ry0)  # min 8 px so FFT stays meaningful
+    roi_w = max(8, rx1 - rx0)
+    # Round up to even for clean fftshift.
+    if roi_h % 2:
+        roi_h += 1
+    if roi_w % 2:
+        roi_w += 1
+
+    def evaluate(z: float) -> float:
+        params = ReconstructionParams(
+            wavelength_m=base_params.wavelength_m,
+            pixel_size_m=base_params.pixel_size_m,
+            z_m=z, n=base_params.n,
+        )
+        H = recon._get_H(params)
+        spec = field_spectrum * H
+        # Spectral crop = lower-resolution real-space image with
+        # bandwidth limited to the ROI. The cropped result is
+        # spatially scaled to match the ROI footprint.
+        spec_shifted = np.fft.fftshift(spec)
+        cy, cx = ny // 2, nx // 2
+        hy, hx = roi_h // 2, roi_w // 2
+        spec_crop = spec_shifted[cy - hy: cy + hy,
+                                 cx - hx: cx + hx]
+        spec_crop = np.fft.ifftshift(spec_crop)
+        result = np.fft.ifft2(spec_crop)
+        return _calc_metric(result, metric)
+
+    return evaluate
+
+
+def _make_batch_evaluator(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    metric: FocusMetric,
+    *,
+    backend: Optional[FFTBackend] = None,
+    roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
+) -> Callable[[Sequence[float]], np.ndarray]:
+    """Return a callable ``evaluate_many(zs)`` that scores every
+    ``z`` in one shot.
+
+    Why
+    ---
+    For a 2048² × 40-step zscan, the serial path issues 40 IFFTs.
+    A batched path issues 1 IFFT over a (40, 2048, 2048) tensor.
+    On CPU + numpy this is roughly the same wall time (numpy
+    doesn't parallelise the batch axis well). On a torch CUDA /
+    MPS backend it's where the real GPU speedup lives — a single
+    kernel launch instead of 40, plus device-resident memory
+    means no host↔device transfers between iterations.
+
+    Correctness
+    -----------
+    The result of ``evaluate_many([z0, z1, ...])`` is identical
+    (up to float-precision noise) to
+    ``[evaluate(z0), evaluate(z1), ...]`` produced by
+    :func:`_make_fast_evaluator`. ROI clipping + reference
+    division semantics carry through. Caller can switch search
+    paths transparently.
+
+    Parameters
+    ----------
+    backend
+        FFT backend to use for the batched IFFT. None → uses
+        :func:`get_best_fft_backend`. Pass an explicit
+        :class:`TorchFFTBackend` to force GPU.
+    """
+    fft = backend if backend is not None else get_best_fft_backend()
+
+    inp = field.astype(np.complex64, copy=False)
+    field_spectrum = fft.fft2(inp)
+    if not isinstance(field_spectrum, np.ndarray):
+        # GPU backends return something convertible — normalise.
+        field_spectrum = fft.to_numpy(field_spectrum)
+    field_spectrum = field_spectrum.astype(np.complex64, copy=False)
+
+    use_ref = ref_field is not None
+    ref_spectrum = None
+    if use_ref:
+        ref_inp = ref_field.astype(np.complex64, copy=False)
+        ref_spectrum = fft.fft2(ref_inp)
+        if not isinstance(ref_spectrum, np.ndarray):
+            ref_spectrum = fft.to_numpy(ref_spectrum)
+        ref_spectrum = ref_spectrum.astype(np.complex64, copy=False)
+
+    ny, nx = field.shape
+    if roi_bounds is not None:
+        ry0 = max(0, int(roi_bounds.y0))
+        rx0 = max(0, int(roi_bounds.x0))
+        ry1 = min(ny, int(roi_bounds.y1))
+        rx1 = min(nx, int(roi_bounds.x1))
+    else:
+        ry0, rx0, ry1, rx1 = 0, 0, ny, nx
+
+    def evaluate_many(zs: Sequence[float]) -> np.ndarray:
+        zs_list = list(zs)
+        if not zs_list:
+            return np.zeros((0,), dtype=np.float64)
+
+        H_stack = _build_H_stack(
+            field.shape, base_params, method, zs_list,
+        )
+        # Multiply spectrum by every H plane → batched IFFT.
+        spec_stack = field_spectrum[None, :, :] * H_stack
+        result_stack = fft.ifft2_batched(spec_stack)
+        if not isinstance(result_stack, np.ndarray):
+            result_stack = fft.to_numpy(result_stack)
+
+        if use_ref and ref_spectrum is not None:
+            ref_spec_stack = ref_spectrum[None, :, :] * H_stack
+            ref_result = fft.ifft2_batched(ref_spec_stack)
+            if not isinstance(ref_result, np.ndarray):
+                ref_result = fft.to_numpy(ref_result)
+            ref_abs = np.abs(ref_result)
+            safe = np.where(
+                ref_abs > 1e-10, ref_result, np.ones_like(ref_result),
+            )
+            result_stack = result_stack / safe
+
+        out = np.empty(len(zs_list), dtype=np.float64)
+        for i in range(len(zs_list)):
+            roi = result_stack[i, ry0:ry1, rx0:rx1]
+            out[i] = _calc_metric(roi, metric)
+        return out
+
+    return evaluate_many

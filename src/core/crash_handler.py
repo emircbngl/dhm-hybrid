@@ -112,6 +112,24 @@ def _handle_exception(
         path = _dump_path()
         _write_atomic(path, payload)
         _LOG.critical("uncaught exception persisted to %s", path)
+        # Also stream the crash into the append-only audit log so tools
+        # that already scrape it (LIMS correlation, ops dashboards) see
+        # every crash without having to sniff the crash/ folder too.
+        try:
+            from core.audit import get_audit_log
+            get_audit_log().record(
+                action="crash",
+                params={
+                    "exception_type": payload["exception_type"],
+                    "thread_name": payload["thread_name"],
+                    "crash_file": str(path),
+                },
+                result_summary={
+                    "exception_message": payload["exception_message"],
+                },
+            )
+        except Exception:
+            _LOG.debug("audit emit for crash failed", exc_info=True)
     except Exception:  # noqa: BLE001 - last-resort guard
         _LOG.critical("crash handler itself failed", exc_info=True)
 
@@ -137,3 +155,44 @@ def install_crash_handler() -> None:
     global _previous_excepthook
     _previous_excepthook = sys.excepthook
     sys.excepthook = _handle_exception
+
+
+# ---------------------------------------------------------------------------
+# Threading hook — Python 3.8+. Science workers spawn threads (audit log,
+# ScienceDriver, batch_reconstruct, camera acquisition); an unhandled
+# exception in one of them would otherwise vanish into the logger noise.
+# Wiring threading.excepthook through the same ``_handle_exception`` means
+# the crash dump JSON lands in the same folder regardless of origin thread.
+# ---------------------------------------------------------------------------
+
+_previous_threading_excepthook = None  # type: ignore[var-annotated]
+
+
+def install_threading_excepthook() -> None:
+    """Route ``threading.Thread`` uncaught exceptions into the same crash
+    handler. Safe to call after or before :func:`install_crash_handler`.
+
+    KeyboardInterrupt inside a thread is ignored (matches the stdlib
+    default — only the main thread's KI turns into a graceful shutdown)."""
+    global _previous_threading_excepthook
+    _previous_threading_excepthook = threading.excepthook
+
+    def _thread_hook(args: "threading.ExceptHookArgs") -> None:
+        if issubclass(args.exc_type, KeyboardInterrupt):
+            return
+        _handle_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = _thread_hook
+
+
+def uninstall_crash_handler() -> None:
+    """Restore the hooks that were in place before installation. Exists
+    so tests can undo the global state they install — never call from
+    production code, the crash dumps are valuable."""
+    global _previous_excepthook, _previous_threading_excepthook
+    if _previous_excepthook is not None:
+        sys.excepthook = _previous_excepthook
+        _previous_excepthook = None
+    if _previous_threading_excepthook is not None:
+        threading.excepthook = _previous_threading_excepthook
+        _previous_threading_excepthook = None

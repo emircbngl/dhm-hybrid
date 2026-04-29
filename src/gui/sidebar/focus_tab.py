@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from core.autofocus import FocusMetric
+from gui.widgets.collapsible_box import CollapsibleBox
 
 
 class _Separator(QFrame):
@@ -146,6 +147,12 @@ class FocusTab(QWidget):
 
         layout.addWidget(focus_group)
 
+        # ─── Advanced focus options (v1.4 progressive disclosure) ───
+        self.advanced_box = CollapsibleBox("Advanced focus options")
+        advanced_layout = QVBoxLayout()
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(6)
+
         # ═══════════════════════════════════════════
         #  ADAPTIVE DISTANCE (toggleable)
         # ═══════════════════════════════════════════
@@ -207,7 +214,7 @@ class FocusTab(QWidget):
         adg.addWidget(QLabel("Signal threshold"), adr, 0)
         adg.addWidget(self.ad_signal_threshold, adr, 1); adr += 1
 
-        layout.addWidget(self.adapt_dist_group)
+        advanced_layout.addWidget(self.adapt_dist_group)
 
         # ═══════════════════════════════════════════
         #  ADAPTIVE STEPS (toggleable)
@@ -314,7 +321,7 @@ class FocusTab(QWidget):
         self._astep_stack.addWidget(bracket_page)  # index 1
 
         as_lay.addWidget(self._astep_stack)
-        layout.addWidget(self.adapt_step_group)
+        advanced_layout.addWidget(self.adapt_step_group)
 
         # Wire sub-mode combo to stacked widget
         self.astep_mode_combo.currentTextChanged.connect(self._on_astep_mode_changed)
@@ -415,7 +422,7 @@ class FocusTab(QWidget):
         self.roi_status_label.setStyleSheet("color: gray; font-style: italic;")
         rtg.addWidget(self.roi_status_label, rr, 0, 1, 2); rr += 1
 
-        layout.addWidget(self.roi_tracker_group)
+        advanced_layout.addWidget(self.roi_tracker_group)
 
         # ═══════════════════════════════════════════
         #  LIVE ADAPTIVE TRACKING
@@ -451,7 +458,11 @@ class FocusTab(QWidget):
         al.addWidget(QLabel("Every N frames"), ar, 0)
         al.addWidget(self.adapt_n_interval, ar, 1); ar += 1
 
-        layout.addWidget(adapt_group)
+        advanced_layout.addWidget(adapt_group)
+
+        # Commit expander after the essential focus_group. Collapsed by default.
+        self.advanced_box.setContentLayout(advanced_layout)
+        layout.addWidget(self.advanced_box)
         layout.addStretch()
 
         scroll.setWidget(inner)

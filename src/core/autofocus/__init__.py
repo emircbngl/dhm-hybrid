@@ -23,7 +23,9 @@ from .metrics import (
 from .evaluator import (
     AutoFocusResult,
     AutofocusCancelled,
+    _make_batch_evaluator,
     _make_fast_evaluator,
+    _make_roi_fast_evaluator,
     downsample_complex_field,
 )
 from .search_classic import (
@@ -46,9 +48,11 @@ from .search_adaptive import (
 from .analysis import (
     AutofocusBenchmarkResult,
     BenchmarkEntry,
+    FocusCandidate,
     MetricLandscapeResult,
     auto_select_metric,
     autofocus_benchmark,
+    find_focus_candidates,
     scan_metric_landscape,
 )
 
@@ -66,6 +70,8 @@ __all__ = [
     "AutoFocusResult",
     "AutofocusCancelled",
     "_make_fast_evaluator",
+    "_make_batch_evaluator",
+    "_make_roi_fast_evaluator",
     "downsample_complex_field",
     # classic search
     "GoldenSearchResult",
@@ -85,8 +91,10 @@ __all__ = [
     # analysis
     "AutofocusBenchmarkResult",
     "BenchmarkEntry",
+    "FocusCandidate",
     "MetricLandscapeResult",
     "auto_select_metric",
     "autofocus_benchmark",
+    "find_focus_candidates",
     "scan_metric_landscape",
 ]

@@ -214,7 +214,14 @@ class MainWindow(QMainWindow):
         self._init_menus()
         self._init_image_panel_context_menus()
         self._install_error_ui()
+        self._install_live_overlay_observer()
+        self._install_workflow_mode_persistence()
+        self._install_theme_persistence()
+        self._bind_report_tab()
         self._load_persisted_settings()
+        self._install_ai_panel()
+        self._maybe_show_onboarding()
+        self._sync_sidebar_state()
         self.status_bar.show_message("Ready")
 
         self._refresh_profiles("all")
@@ -222,12 +229,17 @@ class MainWindow(QMainWindow):
         # Default mode is File — hide Camera tab
         self._on_mode_changed(self.toolbar.mode_combo.currentText())
 
-        # Run startup FFT benchmark
+        # Run startup FFT benchmark — deferred an extra tick so the
+        # main window has a chance to paint its initial frame against
+        # the platform palette first. On macOS the 100-ms-only path
+        # was racing the first Cocoa paint event and the FFT
+        # backend's GPU init caused a paint-engine segfault.
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, self._run_fft_benchmark)
-        
-        # Restore window state
-        self._restore_layout()
+        QTimer.singleShot(1500, self._run_fft_benchmark)
+
+        # Restore window state — deferred past the FFT bench so any
+        # implicit repaint it triggers is safe.
+        QTimer.singleShot(0, self._restore_layout)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -273,6 +285,18 @@ class MainWindow(QMainWindow):
             if worker is None:
                 continue
             self._stop_worker_safely(worker, attr, timeout_ms=3000)
+
+        # AI panel hosts its own per-turn worker; stop it on close so
+        # Qt doesn't yell about a still-running QThread.
+        ai_panel = getattr(self, "_ai_panel", None)
+        if ai_panel is not None:
+            ai_worker = getattr(ai_panel, "_worker", None)
+            if ai_worker is not None and ai_worker.isRunning():
+                try:
+                    ai_worker.requestInterruption()
+                except Exception:
+                    log.warning("ai worker interrupt failed", exc_info=True)
+                ai_worker.wait(3000)
 
         try:
             self._on_camera_disconnect()
@@ -378,6 +402,11 @@ class MainWindow(QMainWindow):
         self._palette_shortcut.setObjectName("sc_open_command_palette")
         self._palette_shortcut.activated.connect(self._open_command_palette)
 
+        # ``?`` — contextual help overlay (v1.4 UI Redesign).
+        self._help_shortcut = QShortcut(QKeySequence("?"), self)
+        self._help_shortcut.setObjectName("sc_show_help_overlay")
+        self._help_shortcut.activated.connect(self._show_help_overlay)
+
         # Esc = cancel the active worker. Kept at WindowShortcut context
         # (the default) so modal dialogs and the error drawer keep their
         # own Esc-to-close behaviour — only when the main window is the
@@ -451,6 +480,48 @@ class MainWindow(QMainWindow):
                 hint="Open the session error drawer",
                 callback=lambda: self._error_drawer.toggle(),
             ))
+
+    # ─── Context-sensitive sidebar (LAB-1 / T1.7) ─────────────────────────
+    def _sync_sidebar_state(self) -> None:
+        """Grey out sidebar tabs that can't do useful work given the
+        current workflow state.
+
+        Three workflow levels the user cares about:
+
+        * **no file loaded** — only Camera/Record (Live mode) or a hint
+          to load a file (File mode) is actionable. Recon/Process/Focus/
+          QPI tabs are disabled with a tooltip so the user understands
+          *why* they can't interact yet.
+        * **file loaded, no reconstruction** — Recon + Process + Focus
+          active, QPI still locked (needs phase).
+        * **reconstruction done** — QPI unlocked.
+
+        The ``setTabEnabled(idx, False)`` path greys both the tab label
+        and the contents; ``hide`` would cause layout jumps so we stick
+        with enable/disable.
+        """
+        tabs_widget = self.sidebar_tabs.tabs
+        has_file = self._loaded_array is not None
+        has_phase = self._phase_unwrapped is not None
+
+        def _set(tab_attr: str, enabled: bool, hint: str) -> None:
+            tab = getattr(self.sidebar_tabs, tab_attr, None)
+            if tab is None:
+                return
+            idx = tabs_widget.indexOf(tab)
+            if idx < 0:
+                return  # tab removed in current mode (e.g. Camera in File mode)
+            tabs_widget.setTabEnabled(idx, enabled)
+            tabs_widget.setTabToolTip(idx, "" if enabled else hint)
+
+        _set("recon_tab", has_file,
+             "Load a hologram to enable reconstruction.")
+        _set("process_tab", has_file,
+             "Process settings apply once a hologram is loaded.")
+        _set("focus_tab", has_file,
+             "Autofocus needs a loaded hologram.")
+        _set("qpi_tab", has_phase,
+             "Run a reconstruction first — QPI operates on the phase map.")
 
     # ─── Parameter persistence (T1.4) ─────────────────────────────────────
     def _load_persisted_settings(self) -> None:
@@ -554,6 +625,326 @@ class MainWindow(QMainWindow):
             return self._app_settings.io.last_folder or ""
         except AttributeError:
             return ""
+
+    # ─── Contextual help overlay (v1.4 UI Redesign) ───
+    def _show_help_overlay(self) -> None:
+        """Open the modeless ``?`` pop-over listing tooltips of every
+        currently-visible control."""
+        try:
+            from gui.widgets.help_overlay import HelpOverlay
+        except Exception:
+            log.warning("ui: help overlay unavailable", exc_info=True)
+            return
+        overlay = HelpOverlay(self, parent=self)
+        overlay.show()
+        self._help_overlay = overlay  # hold ref to keep modeless alive
+
+    # ─── Onboarding (v1.4 UI Redesign) ───
+    def _maybe_show_onboarding(self) -> None:
+        """Show the wizard automatically the very first time the app
+        is launched on this user profile.
+
+        The ``ui/onboarding_seen`` QSettings key flips to ``"1"`` once
+        the wizard has been shown once (whether the user finished or
+        dismissed it). We only auto-show when that key is missing /
+        falsey — otherwise the command-palette entry is the only
+        way back in.
+        """
+        try:
+            seen = self._qt_settings.value("ui/onboarding_seen")
+        except Exception:
+            seen = None
+        if seen:
+            return
+        # Defer long enough (1.2 s) for the main window's first-paint
+        # cycle to settle. On macOS Cocoa a 400 ms delay raced the
+        # palette-apply path and occasionally caught a paint-engine
+        # window that didn't have its backing surface yet.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(1200, self._show_onboarding)
+
+    def _show_onboarding(self) -> None:
+        """Open the onboarding wizard **non-modal**. Any exit path
+        (Finish, Cancel, close) flips the ``ui/onboarding_seen`` flag
+        via the ``finished`` signal so the auto-show branch doesn't
+        fire again on the next launch.
+
+        Non-modal is deliberate: a modal ``exec()`` call blocks the
+        main-window event loop, which on macOS can leave the
+        OnboardingWizard rendered off-screen or behind the main
+        window — the user sees a locked UI with no visible dialog to
+        dismiss. ``show()`` lets the main window stay interactive
+        while the wizard floats in front of it.
+        """
+        try:
+            from gui.widgets.onboarding import OnboardingWizard
+        except Exception:
+            log.warning("ui: onboarding module unavailable", exc_info=True)
+            return
+
+        dialog = OnboardingWizard(self)
+
+        def _mark_seen(_result: int = 0) -> None:
+            try:
+                self._qt_settings.setValue("ui/onboarding_seen", "1")
+            except Exception:
+                log.debug("ui: could not persist onboarding_seen",
+                          exc_info=True)
+
+        dialog.finished.connect(_mark_seen)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        # Keep a reference so the modeless dialog isn't GC'd.
+        self._onboarding_dialog = dialog
+
+    def _install_theme_persistence(self) -> None:
+        """Restore the saved theme at startup.
+
+        Apply happens against the running :class:`QApplication` (we
+        fetch it inside the function so tests that don't spin one up
+        don't fail). Invalid / missing value → leave the platform
+        palette alone (equivalent to :data:`ThemeName.SYSTEM`).
+
+        Deferred by one event-loop tick so the main window has a
+        chance to paint its initial frame against the platform
+        palette before we swap palettes out from under it.
+        QApplication::setPalette while widgets are mid-first-paint
+        triggered a ``QPainter::begin: Paint device returned engine
+        == 0`` crash on macOS with PySide6 ≥ 6.6.
+        """
+        saved = self._qt_settings.value("ui/theme")
+        if not saved:
+            return
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(
+            0, lambda: self._apply_theme_by_name(str(saved), persist=False),
+        )
+
+    def _apply_theme_by_name(self, name: str, *, persist: bool = True) -> None:
+        """Apply a theme by string identifier + optionally persist.
+
+        ``persist=False`` is used by startup restore — we don't want
+        the initial load to re-write the same value and trigger
+        churn. Command-driven changes set ``persist=True`` so the
+        next launch picks up the choice.
+        """
+        from PySide6.QtWidgets import QApplication
+
+        from gui.theme import ThemeName, apply_theme
+
+        try:
+            theme = ThemeName(name)
+        except ValueError:
+            log.debug("ui: unknown theme name %r", name)
+            return
+
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            apply_theme(app, theme)
+        except Exception:
+            log.warning("ui: theme apply failed", exc_info=True)
+            return
+
+        if persist:
+            try:
+                self._qt_settings.setValue("ui/theme", theme.value)
+            except Exception:
+                log.debug("ui: could not persist theme", exc_info=True)
+
+        try:
+            self.status_bar.show_message(
+                f"Theme: {theme.value.title()}", timeout=3000,
+            )
+        except Exception:
+            pass
+
+    def _bind_report_tab(self) -> None:
+        """Wire the Report-mode sidebar tab's buttons to existing handlers.
+
+        ReportTab ships inert — the host connects its buttons to
+        ``_on_generate_report_triggered`` etc. so v1.4 doesn't
+        duplicate any command-registry logic.
+        """
+        report_tab = getattr(self.sidebar_tabs, "report_tab", None)
+        if report_tab is None:
+            return
+        try:
+            report_tab.bind_report_actions(
+                on_report=self._on_generate_report_triggered,
+                on_qpi_csv=self._on_export_qpi_csv_triggered,
+                on_depth_map=self._on_compute_depth_map_triggered,
+                on_qpi_batch=self._on_qpi_batch_candidates_triggered,
+                on_bundle=self._on_export_tomography_bundle_triggered,
+            )
+        except Exception:
+            log.debug("ui: could not bind report tab", exc_info=True)
+
+    def _install_ai_panel(self) -> None:
+        """Construct the AI assistant dock and wire it to live state.
+
+        The dock is hidden by default — copilot is always one keystroke
+        (``Cmd+Shift+A``) or one ⌘K command (``ai.toggle_panel``) away,
+        without claiming workspace by default. The panel reads the
+        AI-defaults section of ``AppSettings``; if persistence isn't
+        loaded yet, it falls back to dataclass defaults.
+
+        We also hook the existing pipeline completion paths so the panel
+        always carries up-to-date result summaries — the LLM reasons
+        from these summaries via the ``get_state`` / ``get_last_result``
+        tools.
+        """
+        try:
+            from gui.panels.ai_panel import AIPanel  # local import: heavy
+        except Exception:
+            log.warning("AI panel import failed; assistant disabled",
+                        exc_info=True)
+            self._ai_panel = None
+            return
+
+        try:
+            self._ai_panel = AIPanel(self, parent=self)
+        except Exception:
+            log.warning("AI panel construction failed; assistant disabled",
+                        exc_info=True)
+            self._ai_panel = None
+            return
+
+        self.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, self._ai_panel,
+        )
+        # Tab the AI dock behind the settings dock so the user opens
+        # whichever they need rather than getting two side-by-side.
+        try:
+            self.tabifyDockWidget(self.settings_dock, self._ai_panel)
+        except Exception:
+            log.debug("ai: tabifyDockWidget skipped", exc_info=True)
+        self._ai_panel.hide()
+
+        # Sync existing state into the cache so the first turn sees it.
+        if self._loaded_path is not None:
+            self._ai_panel.set_loaded(str(self._loaded_path), self._loaded_array)
+
+    def _ai_panel_present(self) -> bool:
+        return getattr(self, "_ai_panel", None) is not None
+
+    def _toggle_ai_panel(self) -> None:
+        """Show or hide the AI dock. Wired to ``ai.toggle_panel``."""
+        panel = getattr(self, "_ai_panel", None)
+        if panel is None:
+            self.status_bar.show_message("AI assistant unavailable")
+            return
+        if panel.isVisible():
+            panel.hide()
+        else:
+            panel.show()
+            panel.raise_()
+
+    def _push_ai_state_loaded(self) -> None:
+        if self._ai_panel_present():
+            self._ai_panel.set_loaded(
+                str(self._loaded_path) if self._loaded_path else None,
+                self._loaded_array,
+            )
+
+    def _push_ai_state_recon(self, summary: dict | None) -> None:
+        if self._ai_panel_present():
+            self._ai_panel.set_recon_summary(summary)
+
+    def _push_ai_state_af(self, summary: dict | None) -> None:
+        if self._ai_panel_present():
+            self._ai_panel.set_af_summary(summary)
+
+    def _push_ai_state_qpi(self, summary: dict | None) -> None:
+        if self._ai_panel_present():
+            self._ai_panel.set_qpi_summary(summary)
+
+    def _push_ai_state_depth(self, summary: dict | None) -> None:
+        if self._ai_panel_present():
+            self._ai_panel.set_depth_summary(summary)
+
+    def _install_workflow_mode_persistence(self) -> None:
+        """Restore the saved workflow mode + persist future changes.
+
+        Uses the same ``_qt_settings`` QSettings handle the layout
+        restore uses. The key (``ui/workflow_mode``) lives outside
+        ``AppSettings`` because it's purely a UI preference — not
+        reconstruction state — and doesn't need schema migration.
+
+        The restore itself is deferred one event-loop tick because
+        ``QTabWidget.setTabVisible`` called during MainWindow ``__init__``
+        — before the first Cocoa paint — triggered a
+        ``QPainter::begin: Paint device returned engine == 0`` segfault
+        on PySide6 6.8+. Letting Qt paint its initial frame first and
+        flipping the tabs afterwards is safe.
+        """
+        saved = self._qt_settings.value("ui/workflow_mode")
+
+        def _on_mode_changed(mode: str) -> None:
+            try:
+                self._qt_settings.setValue("ui/workflow_mode", mode)
+            except Exception:
+                log.debug("ui: could not persist workflow_mode", exc_info=True)
+
+        try:
+            self.sidebar_tabs.workflow_mode_changed.connect(_on_mode_changed)
+        except Exception:
+            log.debug("ui: could not wire workflow_mode_changed",
+                      exc_info=True)
+
+        if not saved:
+            return
+        from PySide6.QtCore import QTimer
+
+        def _restore():
+            try:
+                self.sidebar_tabs.set_workflow_mode(str(saved))
+            except Exception:
+                log.debug("ui: ignoring invalid saved workflow_mode %r",
+                          saved, exc_info=True)
+
+        QTimer.singleShot(0, _restore)
+
+    def _install_live_overlay_observer(self) -> None:
+        """Hook Focus-tab widgets to the live-recompute debounce timer.
+
+        When the depth overlay is on and the user adjusts the z range
+        or focus metric, we re-run the depth scan 500 ms after the
+        last edit so the tint + markers match what the user is
+        currently asking for. When the overlay is off, all of this
+        is a no-op — see :meth:`_on_focus_params_changed`.
+        """
+        from PySide6.QtCore import QTimer
+
+        self._overlay_recompute_timer = QTimer(self)
+        self._overlay_recompute_timer.setSingleShot(True)
+        self._overlay_recompute_timer.timeout.connect(self._fire_overlay_recompute)
+
+        ftab = getattr(self.sidebar_tabs, "focus_tab", None)
+        if ftab is None:
+            return
+
+        for attr in ("zscan_min_mm", "zscan_max_mm"):
+            widget = getattr(ftab, attr, None)
+            if widget is None:
+                continue
+            try:
+                widget.valueChanged.connect(self._on_focus_params_changed)
+            except Exception:
+                log.debug("live-overlay: could not wire %s.valueChanged",
+                          attr, exc_info=True)
+
+        metric_combo = getattr(ftab, "metric_combo", None)
+        if metric_combo is not None:
+            try:
+                metric_combo.currentIndexChanged.connect(
+                    self._on_focus_params_changed,
+                )
+            except Exception:
+                log.debug("live-overlay: could not wire metric_combo",
+                          exc_info=True)
 
     def _cancel_active_worker(self) -> None:
         """Best-effort cancel of whatever worker is live right now.
@@ -865,6 +1256,14 @@ class MainWindow(QMainWindow):
         self._phase_unwrapped = None
         self._spectrum_mag = None
 
+        # Push fresh state to the AI panel cache + clear stale results
+        # so the assistant doesn't reason from a previous file.
+        self._push_ai_state_loaded()
+        self._push_ai_state_recon(None)
+        self._push_ai_state_af(None)
+        self._push_ai_state_qpi(None)
+        self._push_ai_state_depth(None)
+
         self._clear_export_crop_roi()
 
         # Clean up stale analysis state from previous file
@@ -904,6 +1303,7 @@ class MainWindow(QMainWindow):
             log.debug("persistence: io history update on load failed",
                       exc_info=True)
 
+        self._sync_sidebar_state()
         return True
 
     def _as_field_2d(self, arr) -> np.ndarray:
@@ -1061,6 +1461,31 @@ class MainWindow(QMainWindow):
         self.sidebar_tabs.qpi_tab.compute_btn.setEnabled(has_phase)
         self.sidebar_tabs.focus_tab.detect_objects_btn.setEnabled(has_phase)
         self.status_bar.show_message("Reconstruction complete")
+        self._sync_sidebar_state()
+
+        # AI panel cache — summary scalars only, no numpy arrays.
+        try:
+            phase_arr_for_summary = (
+                self._phase_unwrapped if self._phase_unwrapped is not None
+                else (np.angle(self._recon_complex) if self._recon_complex is not None else None)
+            )
+            recon_summary: dict | None
+            if phase_arr_for_summary is not None:
+                recon_summary = {
+                    "shape": list(phase_arr_for_summary.shape),
+                    "phase_mean": float(np.mean(phase_arr_for_summary)),
+                    "phase_std": float(np.std(phase_arr_for_summary)),
+                    "phase_min": float(np.min(phase_arr_for_summary)),
+                    "phase_max": float(np.max(phase_arr_for_summary)),
+                    "has_unwrap": bool(self._phase_unwrapped is not None),
+                    "duration_s": result.get("duration_s"),
+                    "z_mm": float(self.sidebar_tabs.recon_tab.z_mm.value()),
+                }
+            else:
+                recon_summary = None
+            self._push_ai_state_recon(recon_summary)
+        except Exception:
+            log.debug("ai: failed to push recon summary", exc_info=True)
         # Persist the parameters that just produced a successful run —
         # next launch opens on the same values.
         self._persist_current_settings()
@@ -1304,6 +1729,7 @@ class MainWindow(QMainWindow):
                 params={"n_sample": summary["n_sample"], "n_medium": summary["n_medium"]},
                 result_summary=summary,
             )
+            self._push_ai_state_qpi(summary)
         except Exception:
             log.warning("audit log failed for qpi", exc_info=True)
 
@@ -1696,6 +2122,7 @@ class MainWindow(QMainWindow):
             tabs.setCurrentWidget(self.sidebar_tabs.recon_tab)
             self.toolbar.action_batch.setEnabled(True)
             self.toolbar.action_load.setEnabled(True)
+        self._sync_sidebar_state()
 
     def _on_camera_connect(self):
         camtab = self.sidebar_tabs.camera_tab
@@ -3235,12 +3662,779 @@ class MainWindow(QMainWindow):
             log.exception("Panel export failed")
             self.status_bar.show_message(f"Image save failed: {e}", timeout=10000)
 
+    # ─── QPI batch for focus candidates (v1.2-tomo beta + final) ───
+    def _on_qpi_batch_candidates_triggered(self) -> None:
+        """Find focus candidates → run QPI at each → open review dialog.
+
+        The dialog (v1.2-tomo final) lets the operator compare dry
+        mass / area / OPD range across candidates inline; *Focus here*
+        commits to a row, *Export CSV…* dumps the whole batch (the
+        v1.2-tomo beta flow).
+        """
+        if self._loaded_array is None:
+            self.status_bar.show_message(
+                "Load a hologram before running QPI batch.",
+                timeout=6000,
+            )
+            return
+
+        from core.autofocus import FocusMetric, find_focus_candidates
+        from core.qpi_batch import run_qpi_for_candidates
+        from gui.widgets.qpi_batch_review import QPIBatchReviewDialog
+
+        try:
+            fc, params, method, z_min_m, z_max_m, _ = self._prepare_af_field()
+        except Exception as exc:
+            log.exception("qpi-batch: prepare failed")
+            self.status_bar.show_message(
+                f"QPI batch preparation failed: {exc}", timeout=8000,
+            )
+            return
+        if z_max_m <= z_min_m:
+            self.status_bar.show_message(
+                "Set a valid z range on the Focus tab (min < max).",
+                timeout=6000,
+            )
+            return
+
+        qtab = self.sidebar_tabs.qpi_tab
+        n_sample = float(qtab.n_sample.value())
+        n_medium = float(qtab.n_medium.value())
+
+        # LAPLACIAN_VARIANCE catches per-object peaks in multi-sphere scenes
+        # (see docs/ACCURACY.md — Multi-focus detection).
+        self.status_bar.show_message("Scanning focus landscape…")
+        try:
+            candidates = find_focus_candidates(
+                fc, params, method,
+                z_min_m=z_min_m, z_max_m=z_max_m, n_steps=60,
+                metric=FocusMetric.LAPLACIAN_VARIANCE,
+                min_prominence=0.05,
+            )
+        except Exception as exc:
+            log.exception("qpi-batch: candidate scan failed")
+            self.status_bar.show_message(
+                f"Focus scan failed: {exc}", timeout=8000,
+            )
+            return
+
+        if not candidates:
+            self.status_bar.show_message(
+                "No focus candidates found — widen the z range or drop the "
+                "prominence threshold.",
+                timeout=8000,
+            )
+            return
+
+        self.status_bar.show_message(
+            f"Running QPI for {len(candidates)} focus plane(s)…",
+        )
+        try:
+            entries = run_qpi_for_candidates(
+                fc, params, method, candidates,
+                n_sample=n_sample, n_medium=n_medium,
+                compute_psd=False,
+            )
+        except Exception as exc:
+            log.exception("qpi-batch: run failed")
+            self.status_bar.show_message(
+                f"QPI batch failed: {exc}", timeout=8000,
+            )
+            return
+
+        self.status_bar.show_message(
+            f"QPI batch complete — {len(entries)} candidate(s). Review window open.",
+            timeout=6000,
+        )
+
+        dialog = QPIBatchReviewDialog(entries, parent=self)
+        dialog.focus_requested.connect(self._apply_focus_candidate)
+        dialog.export_csv_requested.connect(
+            lambda entries_=entries: self._export_qpi_batch_csv(entries_)
+        )
+        dialog.show()
+        # Prevent GC while modeless.
+        self._qpi_batch_review_dialog = dialog
+
+        self._audit(
+            action="qpi_batch_candidates",
+            params={"n_candidates": len(entries)},
+            result_summary={
+                "z_values_mm": [round(e.candidate.z_m * 1e3, 3) for e in entries],
+            },
+        )
+
+    def _export_qpi_batch_csv(self, entries) -> None:
+        """Called by :class:`QPIBatchReviewDialog` when the user clicks
+        *Export CSV…*. Host owns the file dialog so the widget stays
+        pure presentation."""
+        from core.qpi_batch import write_qpi_batch_csv
+        from PySide6.QtWidgets import QFileDialog
+
+        folder = self._last_folder_default()
+        base_name = f"qpi_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        default = str(Path(folder) / base_name) if folder else base_name
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Save QPI batch CSV", default,
+            "CSV (*.csv);;All Files (*)",
+        )
+        if not chosen:
+            return
+        if not chosen.lower().endswith(".csv"):
+            chosen += ".csv"
+        self._update_io_history(last_folder=str(Path(chosen).parent))
+
+        sample_id = ""
+        try:
+            sample_id = self.toolbar.sample_id_edit.text().strip()
+        except AttributeError:
+            pass
+        app_version = ""
+        try:
+            from src.__version__ import __version__ as _v  # type: ignore
+            app_version = _v
+        except Exception:
+            pass
+
+        try:
+            write_qpi_batch_csv(
+                chosen, entries,
+                sample_id=sample_id, app_version=app_version,
+            )
+        except Exception as exc:
+            log.exception("qpi-batch: CSV write failed")
+            self.status_bar.show_message(
+                f"QPI batch save failed: {exc}", timeout=8000,
+            )
+            return
+        self.status_bar.show_message(
+            f"QPI batch saved: {chosen}", timeout=8000,
+        )
+        self._audit(
+            action="qpi_batch_export_csv",
+            params={"path": str(chosen), "n_rows": len(entries)},
+        )
+
+    # ─── Tomography bundle export (v1.3-polish) ───
+    def _on_export_tomography_bundle_triggered(self) -> None:
+        """Write depth NPZ + depth CSV + cluster CSV + QPI batch CSV
+        into one directory in one shot.
+
+        Reuses ``_last_depth_map_result`` / ``_last_cluster_heights`` if
+        the overlay has been computed recently; otherwise computes them
+        fresh from the current focus-tab range. QPI batch is always
+        freshly computed — per-candidate reconstructions are cheap
+        compared with the depth scan, and caching them would invite
+        stale-state bugs across different z ranges.
+        """
+        if self._loaded_array is None:
+            self.status_bar.show_message(
+                "Load a hologram before exporting a tomography bundle.",
+                timeout=6000,
+            )
+            return
+
+        from PySide6.QtWidgets import QFileDialog
+
+        from core.autofocus import FocusMetric, find_focus_candidates
+        from core.depth_map import (
+            compute_depth_map,
+            segment_depth_clusters,
+            write_tomography_bundle,
+        )
+        from core.qpi_batch import run_qpi_for_candidates
+
+        try:
+            fc, params, method, z_min_m, z_max_m, _ = self._prepare_af_field()
+        except Exception as exc:
+            log.exception("tomography-bundle: prepare failed")
+            self.status_bar.show_message(
+                f"Bundle preparation failed: {exc}", timeout=8000,
+            )
+            return
+        if z_max_m <= z_min_m:
+            self.status_bar.show_message(
+                "Set a valid z range on the Focus tab (min < max).",
+                timeout=6000,
+            )
+            return
+
+        # 1) Depth map — reuse cached result if it's there, otherwise compute.
+        depth_result = getattr(self, "_last_depth_map_result", None)
+        if depth_result is None:
+            self.status_bar.show_message("Computing depth map…")
+            try:
+                depth_result = compute_depth_map(
+                    fc, params, method,
+                    z_min_m=z_min_m, z_max_m=z_max_m,
+                    n_steps=40, window_size=5,
+                    metric=FocusMetric.LAPLACIAN_VARIANCE,
+                )
+            except Exception as exc:
+                log.exception("tomography-bundle: depth compute failed")
+                self.status_bar.show_message(
+                    f"Bundle failed at depth compute: {exc}", timeout=8000,
+                )
+                return
+            self._last_depth_map_result = depth_result
+
+        # 2) Clusters — same caching rule.
+        clusters = getattr(self, "_last_cluster_heights", None)
+        if not clusters:
+            try:
+                clusters = segment_depth_clusters(
+                    depth_result,
+                    confidence_threshold_frac=0.30,
+                    min_area_px=40,
+                )
+                self._last_cluster_heights = clusters
+            except Exception:
+                log.debug("tomography-bundle: cluster segmentation skipped",
+                          exc_info=True)
+                clusters = []
+
+        # 3) QPI batch — always fresh.
+        qtab = self.sidebar_tabs.qpi_tab
+        n_sample = float(qtab.n_sample.value())
+        n_medium = float(qtab.n_medium.value())
+        self.status_bar.show_message("Scanning focus landscape for QPI batch…")
+        try:
+            candidates = find_focus_candidates(
+                fc, params, method,
+                z_min_m=z_min_m, z_max_m=z_max_m, n_steps=60,
+                metric=FocusMetric.LAPLACIAN_VARIANCE,
+                min_prominence=0.05,
+            )
+        except Exception:
+            log.exception("tomography-bundle: find_focus_candidates failed")
+            candidates = []
+
+        qpi_entries = []
+        if candidates:
+            self.status_bar.show_message(
+                f"Running QPI for {len(candidates)} focus plane(s)…",
+            )
+            try:
+                qpi_entries = run_qpi_for_candidates(
+                    fc, params, method, candidates,
+                    n_sample=n_sample, n_medium=n_medium,
+                    compute_psd=False,
+                )
+            except Exception:
+                log.exception("tomography-bundle: qpi batch failed")
+                qpi_entries = []
+
+        # 4) Pick a directory and write every artefact there.
+        default_dir = self._last_folder_default() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Select output directory for tomography bundle", default_dir,
+        )
+        if not chosen:
+            return
+        self._update_io_history(last_folder=chosen)
+
+        sample_id = ""
+        try:
+            sample_id = self.toolbar.sample_id_edit.text().strip()
+        except AttributeError:
+            pass
+        app_version = ""
+        try:
+            from src.__version__ import __version__ as _v  # type: ignore
+            app_version = _v
+        except Exception:
+            pass
+
+        base_name = f"tomography_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            written = write_tomography_bundle(
+                chosen, depth_result, clusters, qpi_entries,
+                base_name=base_name,
+                sample_id=sample_id, app_version=app_version,
+                pixel_size_m=float(params.pixel_size_m),
+            )
+        except Exception as exc:
+            log.exception("tomography-bundle: write failed")
+            self.status_bar.show_message(
+                f"Bundle save failed: {exc}", timeout=8000,
+            )
+            return
+
+        self.status_bar.show_message(
+            f"Tomography bundle saved: {len(written)} file(s) under {chosen}",
+            timeout=10000,
+        )
+        self._audit(
+            action="export_tomography_bundle",
+            params={"directory": str(chosen), "n_files": len(written)},
+            result_summary={
+                "n_clusters": len(clusters) if clusters else 0,
+                "n_qpi_candidates": len(qpi_entries),
+            },
+        )
+
+    # ─── Depth overlay toggle (v1.2-tomo final+ / v1.3-polish) ───
+    def _on_toggle_depth_overlay_triggered(self) -> None:
+        """Toggle a colormapped depth overlay on the phase panel.
+
+        First click: compute the depth map, tint the phase panel. Second
+        click: remove the tint. Live-recompute (v1.3-polish) kicks in
+        via :meth:`_on_focus_params_changed` whenever the z range or
+        metric changes while the overlay is on.
+        """
+        if self.panel_phase is None:
+            return
+
+        # Already on → turn off (overlay + cluster markers together).
+        if self.panel_phase.has_depth_overlay():
+            self.panel_phase.clear_depth_overlay()
+            self.panel_phase.clear_cluster_markers()
+            self.status_bar.show_message("Depth overlay off.", timeout=4000)
+            return
+
+        if self._loaded_array is None:
+            self.status_bar.show_message(
+                "Load a hologram before showing the depth overlay.",
+                timeout=6000,
+            )
+            return
+
+        self._paint_depth_overlay_fresh(log_action="toggle_depth_overlay")
+
+    def _paint_depth_overlay_fresh(self, *, log_action: str) -> None:
+        """Recompute the depth map and paint overlay + cluster markers.
+
+        Shared by :meth:`_on_toggle_depth_overlay_triggered` (initial
+        toggle) and :meth:`_fire_overlay_recompute` (live recompute
+        when focus parameters change). Handles its own status bar +
+        audit entries.
+
+        ``log_action`` is the string recorded on the audit log —
+        ``toggle_depth_overlay`` for the first paint,
+        ``live_depth_overlay_recompute`` for subsequent refreshes,
+        which keeps the audit trail readable.
+        """
+        if self._loaded_array is None or self.panel_phase is None:
+            return
+
+        from core.autofocus import FocusMetric
+        from core.depth_map import (
+            compute_depth_map,
+            mask_low_confidence,
+            segment_depth_clusters,
+        )
+
+        try:
+            fc, params, method, z_min_m, z_max_m, _ = self._prepare_af_field()
+        except Exception as exc:
+            log.exception("depth-overlay: prepare failed")
+            self.status_bar.show_message(
+                f"Depth overlay preparation failed: {exc}", timeout=8000,
+            )
+            return
+        if z_max_m <= z_min_m:
+            self.status_bar.show_message(
+                "Set a valid z range on the Focus tab (min < max).",
+                timeout=6000,
+            )
+            return
+
+        # Honour whatever local-form metric the Focus tab is set to;
+        # fall back to LAPLACIAN_VARIANCE if the choice isn't one of
+        # the two `core.depth_map` kernels (ENTROPY, etc. have no
+        # local decomposition).
+        ftab = self.sidebar_tabs.focus_tab
+        try:
+            metric_data = ftab.metric_combo.currentData()
+            metric = FocusMetric(metric_data) if metric_data else FocusMetric.LAPLACIAN_VARIANCE
+        except Exception:
+            metric = FocusMetric.LAPLACIAN_VARIANCE
+        if metric not in (FocusMetric.LAPLACIAN_VARIANCE, FocusMetric.TENENGRAD):
+            metric = FocusMetric.LAPLACIAN_VARIANCE
+
+        self.status_bar.show_message("Computing depth map for overlay…")
+        try:
+            result = compute_depth_map(
+                fc, params, method,
+                z_min_m=z_min_m, z_max_m=z_max_m,
+                n_steps=30, window_size=5,
+                metric=metric,
+            )
+        except Exception as exc:
+            log.exception("depth-overlay: compute failed")
+            self.status_bar.show_message(
+                f"Depth overlay compute failed: {exc}", timeout=8000,
+            )
+            return
+
+        self._last_depth_map_result = result
+
+        masked = mask_low_confidence(result, threshold_frac=0.20)
+        try:
+            self.panel_phase.set_depth_overlay(
+                masked, alpha=0.55, colormap="viridis",
+            )
+        except Exception as exc:
+            log.exception("depth-overlay: set failed")
+            self.status_bar.show_message(
+                f"Depth overlay paint failed: {exc}", timeout=8000,
+            )
+            return
+
+        try:
+            clusters = segment_depth_clusters(
+                result, confidence_threshold_frac=0.30, min_area_px=40,
+            )
+            self.panel_phase.set_cluster_markers(clusters)
+            self._last_cluster_heights = clusters
+        except Exception:
+            log.debug("depth-overlay: cluster markers skipped", exc_info=True)
+            clusters = []
+
+        z_min_mm = float(result.z_map.min()) * 1e3
+        z_max_mm = float(result.z_map.max()) * 1e3
+        cluster_note = f", {len(clusters)} cluster(s)" if clusters else ""
+        self.status_bar.show_message(
+            f"Depth overlay on — z in [{z_min_mm:+.2f}, {z_max_mm:+.2f}] mm"
+            f"{cluster_note}",
+            timeout=6000,
+        )
+        self._audit(
+            action=log_action,
+            params={"state": "on", "metric": result.metric.name},
+            result_summary={
+                "z_min_mm": z_min_mm, "z_max_mm": z_max_mm,
+                "mean_confidence": float(result.confidence.mean()),
+                "n_clusters": len(clusters),
+            },
+        )
+
+    # ---- live recompute (v1.3-polish) ----------------------------------
+    def _on_focus_params_changed(self) -> None:
+        """Signal hook — Focus-tab widget changed its z range / metric.
+
+        Only schedules a recompute when the overlay is currently on —
+        otherwise we'd spin CPU on parameters nobody's looking at.
+        The debounce timer (``_overlay_recompute_timer``) coalesces a
+        burst of rapid edits (spin-box arrow-key held down, for
+        example) into a single repaint 500 ms after the last change.
+        """
+        if self.panel_phase is None or not self.panel_phase.has_depth_overlay():
+            return
+        timer = getattr(self, "_overlay_recompute_timer", None)
+        if timer is None:
+            return
+        timer.start(500)
+
+    def _fire_overlay_recompute(self) -> None:
+        """Debounce timer fired — actually repaint the overlay."""
+        if self.panel_phase is None or not self.panel_phase.has_depth_overlay():
+            return
+        self._paint_depth_overlay_fresh(
+            log_action="live_depth_overlay_recompute",
+        )
+
+    # ─── Depth map (v1.2-tomo alpha) ───
+    def _on_compute_depth_map_triggered(self) -> None:
+        """Compute a tomographic depth map and save it alongside the
+        source hologram.
+
+        Alpha-scope deliberately: no overlay in the image panels yet,
+        just core + NPZ + CSV. The lab asked for it as a file they can
+        load into MATLAB / R / Python — UI integration (colormap
+        overlay on the phase panel) ships in v1.2-beta-tomo.
+        """
+        if self._loaded_array is None:
+            self.status_bar.show_message(
+                "Load a hologram before computing a depth map.",
+                timeout=6000,
+            )
+            return
+
+        from core.autofocus import FocusMetric
+        from core.depth_map import (
+            compute_depth_map,
+            write_depth_map_csv,
+            write_depth_map_npz,
+        )
+        from PySide6.QtWidgets import QFileDialog
+
+        try:
+            fc, params, method, z_min_m, z_max_m, _steps = self._prepare_af_field()
+        except Exception as exc:
+            log.exception("depth-map: prepare failed")
+            self.status_bar.show_message(
+                f"Depth-map preparation failed: {exc}", timeout=8000,
+            )
+            return
+        if z_max_m <= z_min_m:
+            self.status_bar.show_message(
+                "Set a valid z range on the Focus tab (min < max).",
+                timeout=6000,
+            )
+            return
+
+        folder = self._last_folder_default()
+        base_name = f"depth_map_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        default = str(Path(folder) / f"{base_name}.npz") if folder else f"{base_name}.npz"
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Save depth map (NPZ)", default,
+            "NumPy archive (*.npz);;All Files (*)",
+        )
+        if not chosen:
+            return
+        if not chosen.lower().endswith(".npz"):
+            chosen += ".npz"
+        self._update_io_history(last_folder=str(Path(chosen).parent))
+
+        ftab = self.sidebar_tabs.focus_tab
+        metric_data = ftab.metric_combo.currentData() if hasattr(ftab, "metric_combo") else None
+        try:
+            metric = FocusMetric(metric_data) if metric_data else FocusMetric.LAPLACIAN_VARIANCE
+        except Exception:
+            metric = FocusMetric.LAPLACIAN_VARIANCE
+        if metric not in (FocusMetric.LAPLACIAN_VARIANCE, FocusMetric.TENENGRAD):
+            # ENTROPY/variance etc don't have local-form kernels in
+            # core.depth_map. Fall back to the default with a note.
+            self.status_bar.show_message(
+                f"{metric.name} has no local form; using LAPLACIAN_VARIANCE.",
+                timeout=6000,
+            )
+            metric = FocusMetric.LAPLACIAN_VARIANCE
+
+        self.status_bar.show_message("Computing depth map…")
+        try:
+            n_steps = max(20, int(ftab.zscan_steps.value() or 40))
+            result = compute_depth_map(
+                fc, params, method,
+                z_min_m=z_min_m, z_max_m=z_max_m,
+                n_steps=n_steps, window_size=5, metric=metric,
+            )
+        except Exception as exc:
+            log.exception("depth-map: compute failed")
+            self.status_bar.show_message(
+                f"Depth-map compute failed: {exc}", timeout=8000,
+            )
+            return
+
+        sample_id = ""
+        try:
+            sample_id = self.toolbar.sample_id_edit.text().strip()
+        except AttributeError:
+            pass
+        app_version = ""
+        try:
+            from src.__version__ import __version__ as _v  # type: ignore
+            app_version = _v
+        except Exception:
+            pass
+
+        try:
+            write_depth_map_npz(chosen, result,
+                                sample_id=sample_id, app_version=app_version)
+            csv_path = Path(chosen).with_suffix(".csv")
+            write_depth_map_csv(csv_path, result,
+                                sample_id=sample_id, stride=4)
+        except Exception as exc:
+            log.exception("depth-map: write failed")
+            self.status_bar.show_message(
+                f"Depth-map save failed: {exc}", timeout=8000,
+            )
+            return
+
+        self.status_bar.show_message(
+            f"Depth map saved: {chosen}  (+ companion {csv_path.name})",
+            timeout=8000,
+        )
+        self._audit(
+            action="compute_depth_map",
+            params={"path": str(chosen), "metric": metric.name,
+                    "n_steps": n_steps},
+            result_summary={
+                "z_min_mm": float(result.z_map.min()) * 1e3,
+                "z_max_mm": float(result.z_map.max()) * 1e3,
+                "mean_confidence": float(result.confidence.mean()),
+            },
+        )
+
+    # ─── Multi-focus candidate picker (v1.1-sci prototype) ───
+    def _on_find_focus_candidates_triggered(self) -> None:
+        """Run a landscape scan, list every plausible focus plane, let
+        the user pick one.
+
+        The single-best-z autofocus discards information when a scene
+        has objects at several depths. This handler runs
+        :func:`core.autofocus.find_focus_candidates` on the same
+        demodulated field the one-shot autofocus uses, then opens a
+        non-modal picker dialog. Selecting a row sets the reconstruction
+        z and triggers :meth:`_trigger_reconstruction`, so the operator
+        lands on the chosen plane with one click.
+
+        The scan is synchronous — 50 steps × one ASM propagation each
+        finish well under a second at 256×256. If a future image grows
+        and this stalls the UI we move it to a worker; for now the
+        simplicity is worth the blocking call.
+        """
+        if self._loaded_array is None:
+            self.status_bar.show_message(
+                "Load a hologram before scanning focus candidates.",
+                timeout=6000,
+            )
+            return
+
+        from core.autofocus import FocusMetric, find_focus_candidates
+        from gui.widgets.focus_candidates import FocusCandidatesDialog
+
+        try:
+            fc, params, method, z_min_m, z_max_m, _steps = self._prepare_af_field()
+        except Exception as exc:
+            log.exception("multi-focus: prepare failed")
+            self.status_bar.show_message(
+                f"Multi-focus preparation failed: {exc}", timeout=8000,
+            )
+            return
+
+        if z_max_m <= z_min_m:
+            self.status_bar.show_message(
+                "Set a valid z range on the Focus tab (min < max).",
+                timeout=6000,
+            )
+            return
+
+        # Pick the metric from the focus tab if the operator configured
+        # one; fall back to LAPLACIAN_VARIANCE, which handles multi-
+        # object scenes better than a global metric like ENTROPY (see
+        # docs/ACCURACY.md — Multi-focus detection).
+        ftab = self.sidebar_tabs.focus_tab
+        try:
+            metric_data = ftab.metric_combo.currentData()
+            metric = FocusMetric(metric_data) if metric_data else FocusMetric.LAPLACIAN_VARIANCE
+        except Exception:
+            metric = FocusMetric.LAPLACIAN_VARIANCE
+
+        self.status_bar.show_message("Scanning focus landscape…")
+        try:
+            candidates = find_focus_candidates(
+                fc, params, method,
+                z_min_m=z_min_m, z_max_m=z_max_m,
+                n_steps=max(40, int(ftab.zscan_steps.value() or 60)),
+                metric=metric,
+                min_prominence=0.05,
+            )
+        except Exception as exc:
+            log.exception("multi-focus: scan failed")
+            self.status_bar.show_message(
+                f"Focus scan failed: {exc}", timeout=8000,
+            )
+            return
+
+        self.status_bar.show_message(
+            f"{len(candidates)} focus candidate(s) — click one to reconstruct.",
+            timeout=6000,
+        )
+
+        dialog = FocusCandidatesDialog(candidates, parent=self)
+        dialog.focus_requested.connect(self._apply_focus_candidate)
+        dialog.show()
+        # Keep a reference so the dialog isn't GC'd while modeless.
+        self._focus_candidates_dialog = dialog
+
+    def _apply_focus_candidate(self, z_m: float) -> None:
+        """User chose a focus plane — push z into the recon tab and run."""
+        try:
+            self.sidebar_tabs.recon_tab.z_mm.setValue(float(z_m) * 1e3)
+        except Exception:
+            log.warning("multi-focus: could not set z_mm", exc_info=True)
+            return
+        self._trigger_reconstruction()
+
+    # ─── QPI CSV export (LAB-2) ───
+    def _on_export_qpi_csv_triggered(self) -> None:
+        """Write the last QPI result as a one-row CSV.
+
+        The biologist's downstream analysis is in R/Python/pandas, not in
+        a rendered HTML report. This hook flattens the ``QPIResult`` into
+        a stable column set (see :mod:`core.qpi_export`) and hands the
+        lab's LIMS a file it can ingest without custom parsing.
+        """
+        result = self._last_qpi_result or self._qpi_last_result
+        if result is None:
+            self.status_bar.show_message(
+                "Run QPI first — nothing to export yet.", timeout=6000,
+            )
+            return
+
+        from PySide6.QtWidgets import QFileDialog
+        folder = self._last_folder_default()
+        default_name = f"qpi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        default = str(Path(folder) / default_name) if folder else default_name
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export QPI CSV", default,
+            "CSV (*.csv);;All Files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        self._update_io_history(last_folder=str(Path(path).parent))
+
+        sample_id = ""
+        try:
+            sample_id = self.toolbar.sample_id_edit.text().strip()
+        except AttributeError:
+            pass
+        app_version = ""
+        try:
+            from __version__ import __version__ as _v  # pragma: no cover
+            app_version = _v
+        except Exception:
+            try:
+                from src.__version__ import __version__ as _v  # type: ignore
+                app_version = _v
+            except Exception:
+                pass
+
+        try:
+            from core.qpi_export import write_qpi_csv
+            out = write_qpi_csv(
+                path, result,
+                sample_id=sample_id, app_version=app_version,
+            )
+            self.status_bar.show_message(
+                f"QPI CSV saved: {out}", timeout=8000,
+            )
+            self._audit(
+                action="export_qpi_csv",
+                params={"path": str(out)},
+                result_summary={"sample_id": sample_id or None},
+            )
+        except Exception as exc:
+            log.exception("QPI CSV export failed")
+            self.status_bar.show_message(
+                f"QPI CSV export failed: {exc}", timeout=10000,
+            )
+
     # ─── Audit helper ───
     def _audit(self, **kwargs) -> None:
-        """Best-effort audit record. Never raises."""
+        """Best-effort audit record. Never raises.
+
+        If the toolbar carries a non-empty Sample ID, splice it into the
+        ``params`` dict so every audit entry is LIMS-correlatable without
+        the caller having to remember.
+        """
         if get_audit_log is None:
             return
         try:
+            sample_id = ""
+            try:
+                sample_id = self.toolbar.sample_id_edit.text().strip()
+            except AttributeError:
+                pass
+            if sample_id:
+                params = dict(kwargs.get("params") or {})
+                params.setdefault("sample_id", sample_id)
+                kwargs["params"] = params
             get_audit_log().record(**kwargs)
         except Exception:
             log.warning("audit log failed", exc_info=True)

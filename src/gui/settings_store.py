@@ -24,6 +24,7 @@ from PySide6.QtCore import QSettings
 
 from core.settings_schema import (
     SCHEMA_VERSION,
+    AIDefaults,
     AppSettings,
     AutofocusDefaults,
     IODefaults,
@@ -137,8 +138,31 @@ def _read_typed(qs: QSettings) -> AppSettings:
                                        d.io.last_report_folder),
     )
 
+    ai = AIDefaults(
+        enabled=_coerce_bool(qs.value(f"{_PREFIX}/ai/enabled"), d.ai.enabled),
+        endpoint_url=_coerce_str(qs.value(f"{_PREFIX}/ai/endpoint_url"),
+                                 d.ai.endpoint_url),
+        model_name=_coerce_str(qs.value(f"{_PREFIX}/ai/model_name"),
+                               d.ai.model_name),
+        temperature=_coerce_float(qs.value(f"{_PREFIX}/ai/temperature"),
+                                  d.ai.temperature),
+        max_tokens=_coerce_int(qs.value(f"{_PREFIX}/ai/max_tokens"),
+                               d.ai.max_tokens),
+        max_iterations=_coerce_int(qs.value(f"{_PREFIX}/ai/max_iterations"),
+                                   d.ai.max_iterations),
+        request_timeout_s=_coerce_float(qs.value(f"{_PREFIX}/ai/request_timeout_s"),
+                                        d.ai.request_timeout_s),
+        restrict_to_home=_coerce_bool(qs.value(f"{_PREFIX}/ai/restrict_to_home"),
+                                      d.ai.restrict_to_home),
+        confirm_irreversible=_coerce_bool(qs.value(f"{_PREFIX}/ai/confirm_irreversible"),
+                                          d.ai.confirm_irreversible),
+        audit_redact_for_llm=_coerce_bool(qs.value(f"{_PREFIX}/ai/audit_redact_for_llm"),
+                                          d.ai.audit_redact_for_llm),
+    )
+
     return AppSettings(
         schema_version=SCHEMA_VERSION, recon=recon, autofocus=af, qpi=qpi, io=io,
+        ai=ai,
     )
 
 
@@ -183,6 +207,18 @@ def save(settings: AppSettings) -> None:
     qs.setValue(f"{_PREFIX}/io/last_hologram", str(io.last_hologram))
     qs.setValue(f"{_PREFIX}/io/last_report_folder", str(io.last_report_folder))
 
+    ai = settings.ai
+    qs.setValue(f"{_PREFIX}/ai/enabled", bool(ai.enabled))
+    qs.setValue(f"{_PREFIX}/ai/endpoint_url", str(ai.endpoint_url))
+    qs.setValue(f"{_PREFIX}/ai/model_name", str(ai.model_name))
+    qs.setValue(f"{_PREFIX}/ai/temperature", float(ai.temperature))
+    qs.setValue(f"{_PREFIX}/ai/max_tokens", int(ai.max_tokens))
+    qs.setValue(f"{_PREFIX}/ai/max_iterations", int(ai.max_iterations))
+    qs.setValue(f"{_PREFIX}/ai/request_timeout_s", float(ai.request_timeout_s))
+    qs.setValue(f"{_PREFIX}/ai/restrict_to_home", bool(ai.restrict_to_home))
+    qs.setValue(f"{_PREFIX}/ai/confirm_irreversible", bool(ai.confirm_irreversible))
+    qs.setValue(f"{_PREFIX}/ai/audit_redact_for_llm", bool(ai.audit_redact_for_llm))
+
     qs.sync()
 
 
@@ -203,8 +239,94 @@ def _migrate_v1_to_v2(qs: QSettings) -> None:
     _LOG.info("settings: migrated v1 → v2 (defaults used for new typed section)")
 
 
+def _migrate_v2_to_v3(qs: QSettings) -> None:
+    """v2 → v3 adds Ui2State, which lives in the Dear PyGui frontend's
+    own JSON file — Qt doesn't read or write it. Just stamp the version
+    so subsequent loads don't keep re-migrating."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v2 → v3 (ui2 state owned by v2 frontend)")
+
+
+def _migrate_v3_to_v4(qs: QSettings) -> None:
+    """v3 → v4 adds magnification fields to Ui2State — same story as
+    v2→v3: the Dear PyGui frontend owns that block. No QSettings key
+    changes, just stamp the version."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v3 → v4 (ui2 magnification fields)")
+
+
+def _migrate_v4_to_v5(qs: QSettings) -> None:
+    """v4 → v5 adds autofocus z-range fields to Ui2State. Dear PyGui
+    owns that section; Qt frontend just stamps the version."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v4 → v5 (ui2 autofocus range fields)")
+
+
+def _migrate_v5_to_v6(qs: QSettings) -> None:
+    """v5 → v6 adds advanced-physics fields to Ui2State. JSON side
+    handles the actual defaults; Qt just stamps the version."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v5 → v6 (ui2 advanced physics)")
+
+
+def _migrate_v6_to_v7(qs: QSettings) -> None:
+    """v6 → v7 adds Ui2State.user_presets — Qt frontend doesn't read
+    it, just stamp the version."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v6 → v7 (ui2 user_presets)")
+
+
+def _migrate_v9_to_v10(qs: QSettings) -> None:
+    """v9 → v10 adds display-flip fields (v2 UI only). Qt stamps
+    the version."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v9 → v10 (ui2 display flips)")
+
+
+def _migrate_v8_to_v9(qs: QSettings) -> None:
+    """v8 → v9 adds ``af_algorithm`` to Ui2State — JSON side handles
+    the default; Qt just bumps the version stamp."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v8 → v9 (ui2 af_algorithm)")
+
+
+def _migrate_v7_to_v8(qs: QSettings) -> None:
+    """v7 → v8 adds optical_mode + auto_contrast_amplitude to
+    Ui2State. Dear PyGui side owns those fields; Qt only stamps."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v7 → v8 (ui2 optical_mode)")
+
+
+def _migrate_v10_to_v11(qs: QSettings) -> None:
+    """v10 → v11 adds user_preset_archive (clobber recovery list)
+    to Ui2State. Dear PyGui side owns those fields; Qt only stamps."""
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v10 → v11 (ui2 user_preset_archive)")
+
+
+def _migrate_v11_to_v12(qs: QSettings) -> None:
+    """v11 → v12 adds AIDefaults — local-LLM assistant configuration.
+
+    Defaults are written lazily on the next ``save()`` (the dataclass
+    default factory fills them in); migration only stamps the version
+    so subsequent loads stop running this branch.
+    """
+    qs.setValue(_VERSION_KEY, SCHEMA_VERSION)
+    _LOG.info("settings: migrated v11 → v12 (AIDefaults)")
+
+
 _MIGRATIONS: list[tuple[int, int, _Migrator]] = [
     (1, 2, _migrate_v1_to_v2),
+    (2, 3, _migrate_v2_to_v3),
+    (3, 4, _migrate_v3_to_v4),
+    (4, 5, _migrate_v4_to_v5),
+    (5, 6, _migrate_v5_to_v6),
+    (6, 7, _migrate_v6_to_v7),
+    (7, 8, _migrate_v7_to_v8),
+    (8, 9, _migrate_v8_to_v9),
+    (9, 10, _migrate_v9_to_v10),
+    (10, 11, _migrate_v10_to_v11),
+    (11, 12, _migrate_v11_to_v12),
 ]
 
 

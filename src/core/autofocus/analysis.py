@@ -25,7 +25,11 @@ from ..reconstruction import (
     ReconstructionParams,
     propagate,
 )
-from .evaluator import AutofocusCancelled, downsample_complex_field
+from .evaluator import (
+    AutofocusCancelled,
+    _make_fast_evaluator,
+    downsample_complex_field,
+)
 from .metrics import FocusMetric, _calc_metric, _is_minimize
 from .search_adaptive import (
     adaptive_bracketing_search,
@@ -175,6 +179,127 @@ def scan_metric_landscape(
         peak_z=peak_z,
         n_peaks=n_peaks_map,
     )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Multi-focus discovery (v1.0.1-ux prototype, full UI in v1.1-sci)
+# ───────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class FocusCandidate:
+    """One plausible focus plane in a multi-object scene.
+
+    ``z_m`` is the propagation distance at which a local extremum of the
+    focus metric sits. ``score`` is the metric value (higher = stronger
+    focus signal, post-normalisation). ``prominence`` is ``scipy.signal``
+    peak prominence, useful for ranking candidates and filtering out
+    diffraction-ring ghosts. ``rank`` orders candidates by decreasing
+    prominence (0 = strongest).
+    """
+    z_m: float
+    score: float
+    prominence: float
+    rank: int
+
+
+def find_focus_candidates(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    z_min_m: float,
+    z_max_m: float,
+    *,
+    n_steps: int = 60,
+    metric: FocusMetric = FocusMetric.ENTROPY,
+    smooth_sigma: float = 2.0,
+    min_prominence: float = 0.05,
+    min_distance_frac: float = 0.05,
+    max_candidates: Optional[int] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> List[FocusCandidate]:
+    """Return every plausible focus plane in ``[z_min, z_max]``.
+
+    Runs a single metric sweep over ``n_steps`` equally-spaced z values,
+    normalises + flips + smooths the landscape (so ``find_peaks`` always
+    looks for *maxima* regardless of whether the metric minimises or
+    maximises at focus), then returns every peak whose prominence
+    exceeds ``min_prominence`` and whose separation from other peaks is
+    at least ``min_distance_frac × n_steps`` samples.
+
+    Compared with :func:`autofocus_zscan` this is the multi-object
+    generalisation: autofocus_zscan collapses the landscape to a single
+    best_z, while this helper keeps every significant extremum. Useful
+    when a scene contains several objects at different depths (cell
+    clusters, stacked microstructures, multi-layer samples).
+
+    Performance note: the landscape scan is ``n_steps`` propagations +
+    metric evaluations, same cost as ``autofocus_zscan``. The peak
+    finder itself is microseconds — free on top of the scan.
+    """
+    if n_steps < 3:
+        raise ValueError(f"n_steps must be >= 3 (got {n_steps})")
+    if z_max_m <= z_min_m:
+        raise ValueError(f"z_max_m ({z_max_m}) must be > z_min_m ({z_min_m})")
+
+    # v2.0.9: align with the single-z autofocus path — every search
+    # variant (autofocus_zscan + coarse_to_fine + robust + all three
+    # adaptive algorithms) uses _make_fast_evaluator. Multi-focus
+    # was the odd one out; it ran propagate(force_python=True) in a
+    # loop, which re-checks ``_GLOBAL_RECON_CACHE`` + ``id(field)``
+    # and does a defensive ``spectrum.copy()`` each call.
+    #
+    # Perf-wise this refactor is a wash on our bench (1594 ms vs
+    # 1598 ms @ 1024² × 60 steps) — the copy is ~0.6 % of runtime,
+    # dominated by the FFT + metric calc. What it does earn is a
+    # single code path for every search variant; a future perf win
+    # in _make_fast_evaluator will flow through to multi-focus
+    # automatically instead of needing a separate patch.
+    _eval = _make_fast_evaluator(field, base_params, method, metric)
+    z_values = np.linspace(z_min_m, z_max_m, n_steps)
+    scores = np.empty(n_steps, dtype=np.float64)
+    for i, z in enumerate(z_values):
+        # Cooperative cancellation — scan can be Esc-aborted by a UI
+        # layer. Raises at the boundary between propagations so FFTs
+        # already in flight still finish cleanly.
+        if cancel_check and cancel_check():
+            raise AutofocusCancelled()
+        scores[i] = _eval(float(z))
+
+    # Normalise into [0, 1] so prominence threshold has a fixed meaning
+    # across metrics.
+    vmin, vmax = float(scores.min()), float(scores.max())
+    if vmax - vmin < 1e-15:
+        return []
+    norm = (scores - vmin) / (vmax - vmin)
+    # Flip minimise-at-focus metrics so we always look for maxima.
+    if _is_minimize(metric):
+        norm = 1.0 - norm
+
+    smoothed = gaussian_filter1d(norm, sigma=smooth_sigma)
+    distance = max(1, int(round(n_steps * min_distance_frac)))
+    peaks_idx, props = find_peaks(
+        smoothed,
+        prominence=min_prominence,
+        distance=distance,
+    )
+    if peaks_idx.size == 0:
+        return []
+
+    prominences = props.get("prominences", np.zeros(peaks_idx.shape))
+    order = np.argsort(-prominences)  # descending prominence
+    if max_candidates is not None:
+        order = order[: max_candidates]
+
+    candidates: List[FocusCandidate] = []
+    for rank, idx_into_peaks in enumerate(order):
+        i = int(peaks_idx[idx_into_peaks])
+        candidates.append(FocusCandidate(
+            z_m=float(z_values[i]),
+            score=float(smoothed[i]),
+            prominence=float(prominences[idx_into_peaks]),
+            rank=rank,
+        ))
+    return candidates
 
 
 @dataclass

@@ -78,11 +78,24 @@ class AuditLog:
             }
             if result_summary is not None:
                 record["result_summary"] = result_summary
+            # v2.0.7: user_profile.current_user() honours DHM_USER env
+            # override + sanitises the result. We import lazily so the
+            # audit log keeps working when running standalone scripts
+            # that don't pull in core.user_profile (e.g. CLI smoke
+            # tests). Both 'user' and 'operator' carry the same value
+            # — 'user' is the v1 field name (back-compat for existing
+            # log readers); 'operator' is the v2.0.7 idiom the new
+            # audit viewer prefers.
             try:
-                record["user"] = getpass.getuser()
+                from core import user_profile  # noqa: WPS433
+                op = user_profile.current_user()
+                record["user"] = op
+                record["operator"] = op
             except Exception:
-                # getpass can fail in some sandboxes; skip silently
-                pass
+                try:
+                    record["user"] = getpass.getuser()
+                except Exception:
+                    pass
 
             line = json.dumps(record, default=str, ensure_ascii=False)
             path = self.log_path()
