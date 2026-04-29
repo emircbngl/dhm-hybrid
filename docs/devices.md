@@ -12,10 +12,34 @@ devices diverge sharply on what makes sense:
 
 | kind | actions |
 |------|---------|
-| stage | `move_to(x_um, y_um, z_um)`, `home()`, `position_um` |
+| stage | `move_to(x_um, y_um, z_um)`, `move_by(dx,dy,dz)`, `home()`, `position_um`, `set_speed_um_per_s(v)`, `speed_um_per_s`, `set_step_size_um(s)`, `step_size_um`, `jog(axis, direction)`, `stop_motion()` |
 | shutter | `open()`, `close()`, `is_open` |
 | LED | `on()`, `off()`, `set_intensity(percent)`, `is_on` |
 | generic | `send_command(str, expect_reply=True)` |
+
+### APT-style stage controls
+
+Real lab stage controllers (Thorlabs APT, Newport, Märzhäuser, PI)
+expose more than absolute moves. The `StageDevice` Protocol covers
+all of it:
+
+- **Speed control**: `set_speed_um_per_s(v)` / `speed_um_per_s` —
+  subsequent moves use this velocity. Pass `None` to reset to
+  factory default.
+- **Relative move**: `move_by(dx, dy, dz)` — shift from current
+  position without reading + adding manually.
+- **Jog mode**: `set_step_size_um(s)` picks a discrete step;
+  `jog(axis, direction)` takes one (or `direction × N`) steps in
+  ±X / ±Y / ±Z. Operator's APT-pad arrow buttons map 1:1 to
+  this primitive.
+- **Emergency stop**: `stop_motion()` — real controllers cut
+  actuator current; the mock cancels in-flight synthetic settle.
+
+The AI agent gets seven tools matching this surface:
+`stage_set_speed`, `stage_get_speed`, `stage_move_by`,
+`stage_set_step_size`, `stage_get_step_size`, `stage_jog`,
+`stage_stop`. Soft limits + clamp bounds enforce ranges so an
+LLM hallucination can't drive the actuator past safety.
 
 A single Protocol with everything optional pushes `hasattr` calls
 into every consumer. Per-kind Protocols (StageDevice / ShutterDevice

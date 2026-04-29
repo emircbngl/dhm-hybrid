@@ -314,6 +314,131 @@ def test_include_devices_false_removes_new_tools():
 # Cancel-aware timelapse smoke
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# APT-style stage tools (v2.1.z+)
+# ---------------------------------------------------------------------------
+
+def _ctx_with_apt_stage(tmp_path: Path):
+    """ToolContext with the v2.1.z mock_stage wired into ctx.stage —
+    exercises the new APT tools (which require StageDevice
+    Protocol surface, not the legacy v1 stub)."""
+    from core.devices import make_device
+    audit = AuditLog(directory=tmp_path / "_dhm_test_audit")
+    err = ErrorCenter()
+    stage = make_device("mock_stage")
+    stage.connect()
+
+    return ToolContext(
+        state=lambda: {},
+        last_recon_summary=lambda: None,
+        last_af_summary=lambda: None,
+        last_qpi_summary=lambda: None,
+        last_depth_summary=lambda: None,
+        audit_tail=lambda n: [],
+        load_hologram=lambda p: {"loaded": True},
+        set_recon_param=lambda d: {"applied": True},
+        invoke_recon=lambda d: {},
+        invoke_autofocus=lambda d: {},
+        invoke_qpi=lambda d: {},
+        invoke_depth_map=lambda d: {},
+        invoke_find_focus_candidates=lambda d: {},
+        stage=stage,
+        capture_frame=lambda: None,
+        sample_map=_StubSampleMap(),
+        measure_sharpness=lambda f: 0.0,
+        persist_sample_map=lambda: None,
+        capture_and_process=lambda d: {},
+        audit=audit,
+        error_center=err,
+        confirm=lambda name, args: True,
+        settings=None,
+        is_cancelled=None,
+    )
+
+
+def test_stage_set_speed_round_trip(tmp_path):
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    res = _dispatch(reg, "stage_set_speed",
+                    {"speed_um_per_s": 2500.0}, ctx)
+    assert res.get("ok") is True
+    assert res["speed_um_per_s"] == pytest.approx(2500.0)
+
+
+def test_stage_get_speed_reflects_setter(tmp_path):
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    _dispatch(reg, "stage_set_speed", {"speed_um_per_s": 750.0}, ctx)
+    res = _dispatch(reg, "stage_get_speed", {}, ctx)
+    assert res["speed_um_per_s"] == pytest.approx(750.0)
+
+
+def test_stage_move_by_um_shifts_position(tmp_path):
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    ctx.stage.move_to(100.0, 200.0, 50.0)
+    res = _dispatch(reg, "stage_move_by",
+                    {"dx_um": 25.0, "dy_um": -10.0}, ctx)
+    assert res["x_um"] == pytest.approx(125.0)
+    assert res["y_um"] == pytest.approx(190.0)
+
+
+def test_stage_set_step_size_round_trip(tmp_path):
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    res = _dispatch(reg, "stage_set_step_size",
+                    {"step_um": 25.0}, ctx)
+    assert res["step_size_um"] == 25.0
+
+
+def test_stage_jog_uses_current_step(tmp_path):
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    _dispatch(reg, "stage_set_step_size", {"step_um": 50.0}, ctx)
+    res = _dispatch(reg, "stage_jog",
+                    {"axis": "x", "direction": +2}, ctx)
+    assert res["x_um"] == pytest.approx(100.0)
+
+
+def test_stage_jog_negative_direction(tmp_path):
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    ctx.stage.move_to(500.0, 500.0, 500.0)
+    _dispatch(reg, "stage_set_step_size", {"step_um": 100.0}, ctx)
+    res = _dispatch(reg, "stage_jog",
+                    {"axis": "y", "direction": -1}, ctx)
+    assert res["y_um"] == pytest.approx(400.0)
+
+
+def test_stage_stop_no_motion_in_flight(tmp_path):
+    """Mock with no active motion — stop_motion is still safe."""
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    res = _dispatch(reg, "stage_stop", {}, ctx)
+    assert res.get("ok") is True
+
+
+def test_stage_apt_tools_no_device_returns_error(tmp_path):
+    """When ctx.stage is None or doesn't support APT, the tools
+    return a clean error dict instead of crashing."""
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    object.__setattr__(ctx, "stage", None)
+    res = _dispatch(reg, "stage_set_speed",
+                    {"speed_um_per_s": 100.0}, ctx)
+    assert "error" in res
+
+
+def test_stage_set_speed_clamp_enforced(tmp_path):
+    """speed > 100k µm/s is rejected by NUMERIC_BOUNDS."""
+    from core.ai.security import SecurityError
+    reg = build_tool_registry()
+    ctx = _ctx_with_apt_stage(tmp_path)
+    with pytest.raises(SecurityError):
+        _dispatch(reg, "stage_set_speed",
+                  {"speed_um_per_s": 1_000_000.0}, ctx)
+
+
 def test_record_timelapse_honours_cancel_hook(tmp_path):
     """``ctx.is_cancelled`` polled every iteration; cancelling
     after frame 1 should leave 1 frame in the result + flag set."""

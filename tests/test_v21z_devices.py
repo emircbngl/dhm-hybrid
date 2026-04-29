@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -136,6 +137,155 @@ def test_mock_stage_disconnect_resets_state():
     s.move_to(10, 20, 30)
     s.disconnect()
     assert not s.is_connected
+
+
+# ---------------------------------------------------------------------------
+# Mock stage — APT-style features (speed + step + jog)
+# ---------------------------------------------------------------------------
+
+def test_mock_stage_default_speed_and_step():
+    s = make_device("mock_stage")
+    s.connect()
+    # Sane defaults for the lab.
+    assert s.speed_um_per_s > 0
+    assert s.step_size_um > 0
+
+
+def test_mock_stage_set_speed_round_trip():
+    s = make_device("mock_stage")
+    s.connect()
+    s.set_speed_um_per_s(2500.0)
+    assert s.speed_um_per_s == pytest.approx(2500.0)
+
+
+def test_mock_stage_set_speed_none_resets_to_default():
+    """Pass ``None`` → revert to factory default speed.
+    Convenience for the operator UI's 'reset speed' button."""
+    s = make_device("mock_stage")
+    s.connect()
+    default = s.speed_um_per_s
+    s.set_speed_um_per_s(50.0)
+    assert s.speed_um_per_s == 50.0
+    s.set_speed_um_per_s(None)
+    assert s.speed_um_per_s == default
+
+
+def test_mock_stage_speed_must_be_positive():
+    s = make_device("mock_stage")
+    s.connect()
+    with pytest.raises(ValueError, match="speed"):
+        s.set_speed_um_per_s(-100.0)
+    with pytest.raises(ValueError, match="speed"):
+        s.set_speed_um_per_s(0.0)
+
+
+def test_mock_stage_move_by_relative_shift():
+    s = make_device("mock_stage")
+    s.connect()
+    s.move_to(100, 200, 50)
+    s.move_by(10, -20, 0)
+    assert s.position_um == (110.0, 180.0, 50.0)
+
+
+def test_mock_stage_set_step_size_round_trip():
+    s = make_device("mock_stage")
+    s.connect()
+    s.set_step_size_um(25.0)
+    assert s.step_size_um == 25.0
+
+
+def test_mock_stage_step_size_must_be_positive():
+    s = make_device("mock_stage")
+    s.connect()
+    with pytest.raises(ValueError, match="step"):
+        s.set_step_size_um(0.0)
+    with pytest.raises(ValueError, match="step"):
+        s.set_step_size_um(-1.0)
+
+
+def test_mock_stage_jog_x_plus_uses_step_size():
+    s = make_device("mock_stage")
+    s.connect()
+    s.set_step_size_um(50.0)
+    s.jog("x", +1)
+    assert s.position_um == (50.0, 0.0, 0.0)
+    s.jog("x", +1)
+    assert s.position_um == (100.0, 0.0, 0.0)
+
+
+def test_mock_stage_jog_y_minus_negates():
+    s = make_device("mock_stage")
+    s.connect()
+    s.set_step_size_um(10.0)
+    s.move_to(100, 100, 0)
+    s.jog("y", -1)
+    assert s.position_um == (100.0, 90.0, 0.0)
+
+
+def test_mock_stage_jog_multistep_direction():
+    """direction=+3 → three jogs in one call."""
+    s = make_device("mock_stage")
+    s.connect()
+    s.set_step_size_um(10.0)
+    s.jog("z", +3)
+    assert s.position_um == (0.0, 0.0, 30.0)
+
+
+def test_mock_stage_jog_direction_zero_is_noop():
+    s = make_device("mock_stage")
+    s.connect()
+    s.move_to(50, 50, 50)
+    s.jog("x", 0)
+    assert s.position_um == (50.0, 50.0, 50.0)
+
+
+def test_mock_stage_jog_unknown_axis_raises():
+    s = make_device("mock_stage")
+    s.connect()
+    with pytest.raises(ValueError, match="axis"):
+        s.jog("a", 1)
+
+
+def test_mock_stage_jog_before_connect_raises():
+    s = make_device("mock_stage")
+    with pytest.raises(RuntimeError, match="before connect"):
+        s.jog("x", 1)
+
+
+def test_mock_stage_stop_motion_aborts_simulated_settle():
+    """``simulate_motion_time=True`` makes ``move_to`` sleep
+    distance/speed; ``stop_motion`` must wake it within ~50 ms."""
+    import threading
+    s = make_device("mock_stage", simulate_motion_time=True)
+    s.connect()
+    s.set_speed_um_per_s(100.0)  # slow → 1 s for 100 µm
+
+    done = threading.Event()
+
+    def _go():
+        s.move_to(100.0, 0.0, 0.0)
+        done.set()
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+    time.sleep(0.05)  # let the motion start
+    s.stop_motion()
+    finished = done.wait(timeout=1.0)
+    assert finished, "stop_motion didn't unblock the move"
+
+
+def test_mock_stage_jog_respects_soft_limits():
+    """Jog far enough to cross the limit → ValueError, position
+    stays unchanged."""
+    s = make_device("mock_stage", limits_um=(-50, 50))
+    s.connect()
+    s.set_step_size_um(40.0)
+    s.jog("x", +1)
+    assert s.position_um == (40.0, 0.0, 0.0)
+    with pytest.raises(ValueError, match="outside"):
+        s.jog("x", +1)
+    # Position pinned at 40 — limit-rejected move doesn't roll
+    # over.
+    assert s.position_um == (40.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------

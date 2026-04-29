@@ -76,6 +76,12 @@ NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "spacing_x_um": (0.1, 50_000.0),
     "spacing_y_um": (0.1, 50_000.0),
     "settle_time_s": (0.0, 10.0),
+    # v2.1.z+ — APT-style stage controls
+    "speed_um_per_s": (0.1, 100_000.0),
+    "step_um_jog": (0.01, 50_000.0),
+    "dx_um": (-50_000.0, 50_000.0),
+    "dy_um": (-50_000.0, 50_000.0),
+    "dz_um": (-50_000.0, 50_000.0),
 }
 
 

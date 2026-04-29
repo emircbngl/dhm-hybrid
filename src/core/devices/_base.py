@@ -30,12 +30,41 @@ class Device(Protocol):
 
 @runtime_checkable
 class StageDevice(Device, Protocol):
-    """Motorised XYZ stage."""
+    """Motorised XYZ stage.
+
+    Core motion: absolute ``move_to`` + ``home`` + ``position_um``.
+    APT-style controllers also need:
+
+    * **Speed control** — ``set_speed_um_per_s(v)`` and the
+      mirroring ``speed_um_per_s`` property. Movement uses this
+      velocity until changed; reset to default with ``set_speed_um_per_s(None)``.
+    * **Relative jog** — ``move_by(dx, dy, dz)`` shifts from the
+      current position. Gives the AI agent a "step right by 50 µm"
+      verb without having to read the position first.
+    * **Step-mode** — operator-side discrete step size + jog
+      verbs (``jog_x_plus`` etc.). The DPG control panel's
+      arrow buttons translate to these; the agent's
+      ``stage_jog_step`` tool calls into them.
+    """
     def move_to(self, x_um: float, y_um: float,
                 z_um: float = 0.0) -> None: ...
     def home(self) -> None: ...
     @property
     def position_um(self) -> Tuple[float, float, float]: ...
+
+    # ── Speed control ─────────────────────────────────────────
+    def set_speed_um_per_s(self, v: float) -> None: ...
+    @property
+    def speed_um_per_s(self) -> float: ...
+
+    # ── Relative + step-by-step ──────────────────────────────
+    def move_by(self, dx_um: float, dy_um: float,
+                dz_um: float = 0.0) -> None: ...
+    def set_step_size_um(self, step_um: float) -> None: ...
+    @property
+    def step_size_um(self) -> float: ...
+    def jog(self, axis: str, direction: int) -> None: ...
+    def stop_motion(self) -> None: ...
 
 
 @runtime_checkable

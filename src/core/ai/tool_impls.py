@@ -1167,6 +1167,211 @@ def _tool_acquire_grid(ctx: ToolContext, args: dict) -> dict:
 
 
 # ===========================================================================
+# 24–28. APT-style stage controls (speed + step + jog)
+# ===========================================================================
+#
+# The legacy ``stage_*`` family above (move_relative / move_absolute
+# / home / get_position) talks to the v1 ``ctx.stage`` MockStage.
+# The v2.1.z+ device-registry stages add: variable speed, step-size
+# jog, and emergency stop — what real APT / Thorlabs / Newport
+# controllers expose. These tools target ``ctx.stage`` too but
+# require it to implement the wider :class:`StageDevice` Protocol
+# (mock_stage does; legacy v1 MockStage may not — we surface a
+# friendly error in that case rather than crashing).
+
+def _stage_or_error(ctx: ToolContext, *, needs_apt: bool = True) -> dict:
+    if ctx.stage is None:
+        return {"error": "stage device not configured"}
+    if needs_apt:
+        # APT-extended attribute. Legacy MockStage doesn't expose
+        # set_speed_um_per_s, so we degrade gracefully for those.
+        if not hasattr(ctx.stage, "set_speed_um_per_s"):
+            return {"error": "stage backend does not support APT-style "
+                              "controls (set_speed/jog/step). Upgrade "
+                              "to core.devices.mock_stage or a vendor "
+                              "backend that implements StageDevice."}
+    if hasattr(ctx.stage, "is_connected") \
+            and not ctx.stage.is_connected:
+        try:
+            ctx.stage.connect()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"stage connect failed: {exc}"}
+    return {}
+
+
+_STAGE_SET_SPEED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "speed_um_per_s": {
+            "type": "number", "minimum": 0.1, "maximum": 100_000.0,
+            "description": "Traverse speed for subsequent moves "
+                           "(µm/s). Realistic lab values 100–10000.",
+        },
+    },
+    "required": ["speed_um_per_s"],
+    "additionalProperties": False,
+}
+
+
+def _tool_stage_set_speed(ctx: ToolContext, args: dict) -> dict:
+    err = _stage_or_error(ctx)
+    if err:
+        return err
+    v = float(clamp("speed_um_per_s", args["speed_um_per_s"]))
+    try:
+        ctx.stage.set_speed_um_per_s(v)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"set_speed failed: {exc}"}
+    return {"ok": True, "speed_um_per_s": float(ctx.stage.speed_um_per_s)}
+
+
+_STAGE_GET_SPEED_SCHEMA = {
+    "type": "object", "properties": {}, "additionalProperties": False,
+}
+
+
+def _tool_stage_get_speed(ctx: ToolContext, args: dict) -> dict:
+    err = _stage_or_error(ctx)
+    if err:
+        return err
+    return {"speed_um_per_s": float(ctx.stage.speed_um_per_s)}
+
+
+_STAGE_MOVE_BY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dx_um": {"type": "number", "minimum": -50_000.0,
+                  "maximum": 50_000.0},
+        "dy_um": {"type": "number", "minimum": -50_000.0,
+                  "maximum": 50_000.0},
+        "dz_um": {"type": "number", "minimum": -50_000.0,
+                  "maximum": 50_000.0},
+    },
+    "additionalProperties": False,
+}
+
+
+def _tool_stage_move_by(ctx: ToolContext, args: dict) -> dict:
+    """Relative XYZ move in µm (APT-style; complements the legacy
+    ``stage_move_relative`` which uses mm). Use this when the
+    operator says 'shift right by 50 µm'."""
+    err = _stage_or_error(ctx, needs_apt=False)
+    if err:
+        return err
+    dx = float(clamp("dx_um", args.get("dx_um", 0.0)))
+    dy = float(clamp("dy_um", args.get("dy_um", 0.0)))
+    dz = float(clamp("dz_um", args.get("dz_um", 0.0)))
+    if not hasattr(ctx.stage, "move_by"):
+        return {"error": "stage backend has no move_by — use "
+                          "stage_move_relative (mm) for the legacy "
+                          "stage abstraction."}
+    try:
+        ctx.stage.move_by(dx, dy, dz)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"move_by failed: {exc}"}
+    pos = ctx.stage.position_um if hasattr(ctx.stage, "position_um") \
+        else (None, None, None)
+    return {
+        "ok": True,
+        "x_um": float(pos[0]) if pos[0] is not None else None,
+        "y_um": float(pos[1]) if pos[1] is not None else None,
+        "z_um": float(pos[2]) if pos[2] is not None else None,
+    }
+
+
+_STAGE_SET_STEP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "step_um": {
+            "type": "number", "minimum": 0.01, "maximum": 50_000.0,
+            "description": "Discrete jog step. Lab presets: 1, 10, "
+                           "100, 1000 µm.",
+        },
+    },
+    "required": ["step_um"],
+    "additionalProperties": False,
+}
+
+
+def _tool_stage_set_step_size(ctx: ToolContext, args: dict) -> dict:
+    err = _stage_or_error(ctx)
+    if err:
+        return err
+    step = float(clamp("step_um_jog", args["step_um"]))
+    try:
+        ctx.stage.set_step_size_um(step)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"set_step_size failed: {exc}"}
+    return {"ok": True,
+            "step_size_um": float(ctx.stage.step_size_um)}
+
+
+_STAGE_GET_STEP_SCHEMA = {
+    "type": "object", "properties": {}, "additionalProperties": False,
+}
+
+
+def _tool_stage_get_step_size(ctx: ToolContext, args: dict) -> dict:
+    err = _stage_or_error(ctx)
+    if err:
+        return err
+    return {"step_size_um": float(ctx.stage.step_size_um)}
+
+
+_STAGE_JOG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "axis": {"type": "string", "enum": ["x", "y", "z"]},
+        "direction": {"type": "integer", "minimum": -10, "maximum": 10,
+                      "description": "Sign + multiplier. +1 = one "
+                                     "step in positive direction; -2 "
+                                     "= two steps negative."},
+    },
+    "required": ["axis", "direction"],
+    "additionalProperties": False,
+}
+
+
+def _tool_stage_jog(ctx: ToolContext, args: dict) -> dict:
+    """Single discrete step in axis × direction. Distance = the
+    current step_size_um. Operator's APT-pad arrow buttons map
+    1:1 to this tool when the agent is given control."""
+    err = _stage_or_error(ctx)
+    if err:
+        return err
+    axis = str(args["axis"]).lower()
+    direction = int(args["direction"])
+    try:
+        ctx.stage.jog(axis, direction)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"jog failed: {exc}"}
+    pos = ctx.stage.position_um
+    return {
+        "ok": True, "axis": axis, "direction": direction,
+        "x_um": float(pos[0]), "y_um": float(pos[1]),
+        "z_um": float(pos[2]),
+    }
+
+
+_STAGE_STOP_SCHEMA = {
+    "type": "object", "properties": {}, "additionalProperties": False,
+}
+
+
+def _tool_stage_stop(ctx: ToolContext, args: dict) -> dict:
+    """Emergency-stop the stage. APT controllers cut actuator
+    current; the mock cancels any in-flight synthetic settle."""
+    err = _stage_or_error(ctx)
+    if err:
+        return err
+    try:
+        ctx.stage.stop_motion()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"stop_motion failed: {exc}"}
+    return {"ok": True}
+
+
+# ===========================================================================
 # Registry factory
 # ===========================================================================
 
@@ -1418,6 +1623,59 @@ def build_tool_registry(*, include_devices: bool = True) -> ToolRegistry:
             parameters=_ACQUIRE_GRID_SCHEMA,
             handler=_tool_acquire_grid,
             requires_gui_thread=True,
+        ))
+        # ── APT-style stage extensions (v2.1.z+) ────────────────
+        reg.register(ToolSpec(
+            name="stage_set_speed",
+            description="Set the stage's traverse speed in µm/s. "
+                        "Subsequent moves use this until changed. "
+                        "Realistic lab values 100–10000.",
+            parameters=_STAGE_SET_SPEED_SCHEMA,
+            handler=_tool_stage_set_speed,
+        ))
+        reg.register(ToolSpec(
+            name="stage_get_speed",
+            description="Return current stage traverse speed (µm/s).",
+            parameters=_STAGE_GET_SPEED_SCHEMA,
+            handler=_tool_stage_get_speed,
+        ))
+        reg.register(ToolSpec(
+            name="stage_move_by",
+            description="Relative XYZ shift in µm. Use when the "
+                        "operator says 'shift right by 50 µm' — "
+                        "complements stage_move_relative which "
+                        "uses mm.",
+            parameters=_STAGE_MOVE_BY_SCHEMA,
+            handler=_tool_stage_move_by,
+        ))
+        reg.register(ToolSpec(
+            name="stage_set_step_size",
+            description="Set the discrete jog step (µm). Lab "
+                        "presets: 1, 10, 100, 1000.",
+            parameters=_STAGE_SET_STEP_SCHEMA,
+            handler=_tool_stage_set_step_size,
+        ))
+        reg.register(ToolSpec(
+            name="stage_get_step_size",
+            description="Return current jog step (µm).",
+            parameters=_STAGE_GET_STEP_SCHEMA,
+            handler=_tool_stage_get_step_size,
+        ))
+        reg.register(ToolSpec(
+            name="stage_jog",
+            description="One discrete jog step on axis × direction "
+                        "(distance = current step_size_um). axis ∈ "
+                        "{x, y, z}; direction ±1 to ±10 (multiplier).",
+            parameters=_STAGE_JOG_SCHEMA,
+            handler=_tool_stage_jog,
+        ))
+        reg.register(ToolSpec(
+            name="stage_stop",
+            description="Emergency-stop the stage. APT controllers "
+                        "cut actuator current; the mock cancels "
+                        "any in-flight synthetic settle.",
+            parameters=_STAGE_STOP_SCHEMA,
+            handler=_tool_stage_stop,
         ))
 
     return reg
