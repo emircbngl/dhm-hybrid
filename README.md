@@ -134,9 +134,18 @@ Some design notes and code-review records under `docs/` and `tasks/` are written
 
 ## License
 
-[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later).
+[Apache License 2.0](LICENSE) (see also `NOTICE`).
 
-You may use, study, modify and redistribute this freely. Derivative works must also be AGPL-3.0 — **including when you only offer them to users over a network**. If you use this in published research, a citation is appreciated.
+You may use, study, modify and redistribute this freely, including inside
+closed-source and commercial work. Keep the copyright notice, the licence text
+and the `NOTICE` file with the code, and state any changes you made. Apache-2.0
+also grants an explicit patent licence, which matters for the reconstruction and
+phase-retrieval methods here. If you use this in published research, a citation
+is appreciated.
+
+> Relicensed from AGPL-3.0-or-later on 2026-08-05, to prioritise academic reuse
+> and citation. Versions published before that date remain available under
+> AGPL-3.0-or-later; that grant cannot be withdrawn retroactively.
 
 ---
 
