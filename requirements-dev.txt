@@ -1,0 +1,10 @@
+# Test and development dependencies.
+#
+# requirements.txt is what the application needs to RUN; this file is what
+# you need to test it. CI installs both. Keeping pytest out of the runtime
+# requirements is deliberate -- a lab install should not pull a test runner.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m pytest tests/ -q
+
+pytest>=8.0

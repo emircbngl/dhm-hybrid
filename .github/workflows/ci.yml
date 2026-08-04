@@ -37,14 +37,14 @@ jobs:
       - name: Install scientific deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-dev.txt
       - name: Install torch (Linux only)
         if: runner.os == 'Linux'
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Headless test suite
         run: |
           export DHM_USER=ci
-          PYTHONPATH=src:tests pytest tests/ -q --tb=short \
+          PYTHONPATH=src:tests python -m pytest tests/ -q --tb=short \
               -m "not needs_gui"
       - name: Bug regression
         run: |

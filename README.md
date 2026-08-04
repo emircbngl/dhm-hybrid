@@ -77,8 +77,11 @@ This exposes the same tool registry the in-app AI panel uses, with no GUI thread
 ### Tests
 
 ```bash
+pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 ```
+
+Test dependencies are kept out of `requirements.txt` on purpose — a lab install should not pull a test runner. CI installs both files.
 
 ## Bring your own data
 
