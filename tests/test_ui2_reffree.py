@@ -266,11 +266,28 @@ def test_reffree_cnn_toggle_degrades_gracefully(tmp_path):
 
 
 def test_reffree_cnn_available_checks_checkpoint_path(tmp_path):
-    """Even with a checkpoint file present, no torch means still
-    unavailable — both conditions are required."""
+    """Both conditions are required: a checkpoint on disk AND torch.
+
+    A missing checkpoint is False regardless of torch. With the
+    checkpoint present the answer follows torch's importability, so
+    assert against that rather than against whichever box happens to
+    be running the suite — the original version hard-coded False and
+    only passed without torch installed (it broke the moment CI
+    installed it).
+    """
+    missing_ckpt = tmp_path / "absent.pt"
+    assert reffree_cnn_available(missing_ckpt) is False
+
     fake_ckpt = tmp_path / "model.pt"
     fake_ckpt.write_bytes(b"not a real checkpoint")
-    assert reffree_cnn_available(fake_ckpt) is False  # no torch
+
+    try:
+        import torch  # noqa: F401
+        torch_present = True
+    except ImportError:
+        torch_present = False
+
+    assert reffree_cnn_available(fake_ckpt) is torch_present
 
 
 # ---------------------------------------------------------------------------
