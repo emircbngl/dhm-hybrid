@@ -156,7 +156,7 @@ def test_redact_replaces_operator():
 def test_redact_trims_absolute_paths_in_params():
     record = {
         "action": "load",
-        "params": {"path": "/Users/alice/secret/sample.tif",
+        "params": {"path": "/Users/<user>/secret/sample.tif",
                    "shape": [1024, 1024]},
     }
     out = redact_for_llm(record)

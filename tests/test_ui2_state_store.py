@@ -45,9 +45,9 @@ def test_save_load_roundtrip(tmp_state_path):
         viewport_w=1400, viewport_h=900, theme="midnight",
         sample_id="A-12", workflow_mode="Analyse",
         selected_preset="USAF",
-        recent=["/Users/x/a.tif", "/Users/x/b.tif"],
-        last_dir="/Users/x", last_hologram="/Users/x/a.tif",
-        reference_path="/Users/x/ref.tif", subtract_reference=True,
+        recent=["/Users/<user>/a.tif", "/Users/<user>/b.tif"],
+        last_dir="/Users/<user>", last_hologram="/Users/<user>/a.tif",
+        reference_path="/Users/<user>/ref.tif", subtract_reference=True,
         wavelength_nm=488.0, pixel_um=2.2, z_mm=4.5,
         mask_radius=55, method="Fresnel",
     )
@@ -61,8 +61,8 @@ def test_save_load_roundtrip(tmp_state_path):
     assert loaded.ui2.sample_id == "A-12"
     assert loaded.ui2.workflow_mode == "Analyse"
     assert loaded.ui2.selected_preset == "USAF"
-    assert loaded.ui2.recent == ["/Users/x/a.tif", "/Users/x/b.tif"]
-    assert loaded.ui2.reference_path == "/Users/x/ref.tif"
+    assert loaded.ui2.recent == ["/Users/<user>/a.tif", "/Users/<user>/b.tif"]
+    assert loaded.ui2.reference_path == "/Users/<user>/ref.tif"
     assert loaded.ui2.subtract_reference is True
     assert loaded.ui2.wavelength_nm == pytest.approx(488.0)
     assert loaded.ui2.mask_radius == 55
