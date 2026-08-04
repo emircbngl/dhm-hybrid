@@ -682,7 +682,7 @@ her panel için explicit teardown yap (shutdown() kancası + panel.close()); doc
 
 ## 2026-07-05 — Bozuk venv (yeniden-adlandırılmış proje yolu)
 
-venv/pyvenv.cfg eski "Windsurf Projects" yoluna işaret ediyor (proje "Claude Projects"e taşınmış);
+venv/pyvenv.cfg eski "<workdir>" yoluna işaret ediyor (proje "<workdir>"e taşınmış);
 tek başına ilk-Qt-import bir pytest sürecinde bazen segfault verebiliyor (bayat derlenmiş yol).
 Tam süit / Qt-free-test-önce sırası bunu atlatıyor. Kalıcı çözüm: venv'i yeniden kur (ayrı iş).
 
@@ -730,8 +730,8 @@ yükleme, iki-knob bg hepsi GUI'de doğru ama MCP'de eksikti).
 ## 2026-07-06 — Taşınmış venv + bayat __pycache__: hayalet-yol test hataları
 
 **Pattern:** Tam süitte 3 `test_crash_handler` hatası; traceback'ler VAR OLMAYAN
-`~/Documents/Windsurf Projects/.../Hybrid/tests/...` yolunu gösteriyordu. İki katmanlı kök neden:
-1. `venv/pyvenv.cfg`'nin `command =` satırı venv'in aslında `Windsurf Projects/.../Phyton/venv`
+`<repo>` yolunu gösteriyordu. İki katmanlı kök neden:
+1. `venv/pyvenv.cfg`'nin `command =` satırı venv'in aslında `<workdir>/.../Phyton/venv`
    olarak YARATILIP buraya kopyalandığını kanıtladı — venv'ler taşınabilir değildir (shebang'ler,
    pyvenv.cfg, derlenmiş yollar bayat kalır).
 2. Proje `__pycache__`/pytest-rewrite .pyc'leri eski konumda derlenmişti; kaynak mtime/size

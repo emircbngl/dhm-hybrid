@@ -185,12 +185,10 @@ def main():
     if args.image_dir:
         img_dir = Path(args.image_dir)
     else:
-        # Try labtest in main repo
-        main_repo = Path.home() / "Documents" / "Windsurf Projects" / "Reconstruction(Mac)" / "Hybrid" / "labtest"
-        if main_repo.exists():
-            img_dir = main_repo
-        else:
-            img_dir = ROOT / "labtest"
+        # Sample holograms are not distributed with the source. Point
+        # DHM_DATA_ROOT at your own captures, or pass --image-dir.
+        env_root = os.environ.get("DHM_DATA_ROOT")
+        img_dir = Path(env_root) if env_root else ROOT / "labtest"
 
     if not img_dir.exists():
         print(f"ERROR: Image directory not found: {img_dir}")

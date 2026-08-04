@@ -569,7 +569,7 @@ def main():
     if args.image_dir:
         img_dir = Path(args.image_dir)
     else:
-        main_repo = Path.home() / "Documents" / "Windsurf Projects" / "Reconstruction(Mac)" / "Hybrid" / "labtest"
+        main_repo = Path(os.environ.get("DHM_DATA_ROOT", ROOT / "labtest"))
         img_dir = main_repo if main_repo.exists() else ROOT / "labtest"
 
     if not img_dir.exists():

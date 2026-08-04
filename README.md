@@ -82,7 +82,9 @@ python -m pytest tests/ -q
 
 ## Bring your own data
 
-No lab data or trained weights ship with this repository — they are gitignored. Both the batch scripts and the Track C pipeline read from a single root:
+**No holograms, sample images, reconstructions or trained weights ship with this repository.** All laboratory imagery is deliberately excluded and gitignored — the code is open, the lab captures are not. You supply your own.
+
+That means the sample-dependent entry points (`tools/*`, `full_benchmark.py`, `benchmark_landscape.py`, the Track C pipeline, and a handful of tests) will report missing data until you point them somewhere. Both the batch scripts and the Track C pipeline read from a single root:
 
 ```bash
 export DHM_DATA_ROOT=/path/to/your/captures

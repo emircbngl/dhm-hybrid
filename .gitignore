@@ -10,10 +10,19 @@ __pycache__/
 venv/
 .venv/
 
-# Lab data and trained weights — not distributed with the source.
-# Point DHM_DATA_ROOT at your own capture directory (see README).
+# Lab captures, sample holograms and trained weights are NOT distributed
+# with this source tree. Point DHM_DATA_ROOT at your own capture directory
+# (see README). Never commit raw or reconstructed lab imagery here.
 data/
 models/
+labtest/
+Test Samples/
+benchmark/
+adaptive_steps/
+*.tif
+*.tiff
+*.npy
+*.npz
 
 # Generated output
 benchmark_output_*/

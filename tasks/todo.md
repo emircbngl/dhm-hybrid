@@ -1710,7 +1710,7 @@ entegrasyonundan). Hepsi düzeltildi, regresyon yazıldı, bug registry'ye işle
 
 **Doğrulama:** `tests/test_ui3_review_2026_07_06.py` (11 yeni regresyon, tümü PASS) +
 ilgili süitler. Tam repo **1400 PASS**, 11 skip. 3 `test_crash_handler` başarısızlığı
-**pre-existing** — bayat `venv/pyvenv.cfg` "Windsurf Projects" yolundan test yükleme
+**pre-existing** — bayat `venv/pyvenv.cfg` "<workdir>" yolundan test yükleme
 harness artefaktı, dokunulan koddan bağımsız (venv rebuild ayrı iş). Obsidian
 [[DHM-ui3-Qt-Rebuild]] güncellendi.
 
