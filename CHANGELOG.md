@@ -3,6 +3,75 @@
 All notable changes to DHM Reconstruction are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), semver.
 
+## [Unreleased] — 2026-07-06: ui3 becomes the v2 frontend; ui2 (Dear PyGui) retired
+
+### Changed
+- **ui3 (PySide6 + pyqtgraph) is now the canonical v2 frontend** — built
+  from scratch at 1:1 feature parity (`docs/UI3_DESIGN.md` coverage
+  matrix), entry `run_ui3.py`.
+- The framework-free compute drivers moved `src/ui2/` → `src/core/drivers/`
+  (`reconstruction`, `workers`, `camera_feed`). Old `ui2.*` import paths
+  remain valid via sys.modules-aliasing shims (same module objects).
+- Autofocus default algorithm `zscan` → `robust`, pinned by a 9-scene
+  real-lab benchmark (`docs/AUTOFOCUS_ADAPTIVE.md`, B-095). Frozen state
+  migrations keep existing installs unchanged.
+
+### Removed
+- The Dear PyGui presentation layer (`ui2/app.py`, theme, widgets,
+  dialogs, image panel, surface, device/AI panels) and `run_ui2.py`.
+  Recoverable from git history. `ui2.state_store` (persisted settings +
+  frozen v1..v10 migrations) and the driver shims remain.
+- DPG-only tests; the driver/state tests inside mixed `test_ui2_*` files
+  were kept (51 tests) — they now exercise `core.drivers.*` through the
+  shims.
+
+### Fixed
+- 26 bug-registry entries B-072..B-097 from four review rounds the same
+  day (ui3 wiring/ownership, MCP parity, observe scalebar/spectrum,
+  moved-venv artefacts, relocation regressions). Suite green throughout.
+
+## [Unreleased] — Track C: reference-free reconstruction (hybrid CNN)
+
+End-to-end pipeline that removes the need for a reference hologram at
+inference time. A small residual U-Net learns the reproducible
+illumination + sensor + carrier-residual aberration the off-axis
+demodulation pipeline can't fully cancel. See
+[`docs/REFFREE_HYBRID.md`](docs/REFFREE_HYBRID.md).
+
+### Added
+- `scripts/build_synthetic_refs.py` — temporal-median synthetic
+  reference per session (handles bacteria-contaminated saved refs).
+- `scripts/build_track_c_dataset.py` — generate `(phi_classical,
+  phi_target, residual)` `.npz` triplets with outlier filtering.
+- `scripts/train_track_c.py` — UNetLite training with AdamW, cosine
+  LR, MPS-aware, NaN-skip guard.
+- `scripts/eval_track_c.py` — quantitative + visual evaluation reports.
+- `scripts/reffree_reconstruct.py` — production CLI; reconstructs a
+  single hologram with no reference at runtime.
+- `scripts/run_track_c_pipeline.sh` — one-command end-to-end orchestrator.
+- `src/recon_dl/` — `unet_lite`, `dataset`, `losses`, `inference`
+  modules. UNetLite ~3.3M params, near-zero residual init for graceful
+  degradation.
+- `tests/test_track_c_pipeline.py` — 6 smoke tests covering model,
+  loss, cosine window, dataset, manifest, inference glue.
+- `tasks/track_b_pure_dl_notes.md` — what would be needed to graduate
+  to a pure end-to-end DL approach (data, architecture, validation).
+
+### Findings (recorded in tasks/lessons.md)
+- Saved per-session "reference" frames contain bacteria; using them as
+  GT pollutes training. Solution: temporal median across all frames in
+  a session synthesizes a clean reference (moving bacteria average out).
+- Autofocus mismatch between ref-based and ref-free pipelines unfairly
+  inflated the original benchmark RMSE by ~25%. Fixed by locking z to
+  the GT manifest's value when comparing.
+- 10/63 GT manifest frames have outlier z values; the dataset builder
+  filters them via session-median half-space heuristic.
+- Track A (pure classical Zernike/poly fit) median test RMSE ~2.2 rad
+  on centre crop; insufficient for the <0.15 rad target. Track C target
+  is ~0.5 rad on centre crop with full LOSO.
+- Track B (pure DL) requires 5,000+ frames and 8+ sample types to
+  generalize; current 63-frame dataset is far too small.
+
 ## [1.0.1-ux] — 2026-04-21
 
 Patch release responding to the Lindqvist-lab pilot's UX feedback.

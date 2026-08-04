@@ -99,7 +99,14 @@ def auto_select_metric(
 
         peaks_idx, props = find_peaks(values_smooth, prominence=0.05)
         n_peaks = len(peaks_idx)
-        max_prominence = float(np.max(props["prominences"])) if n_peaks > 0 else float(np.max(values_smooth))
+        # No INTERIOR peak → the metric's optimum sits at/outside the scanned
+        # range (monotonic / edge-focus curve): it is the LEAST reliable, so it
+        # scores 0. The old fallback used np.max(values_smooth) ≈ 1.0 on the
+        # [0,1]-normalised curve, which let a peakless edge metric beat a
+        # genuinely-peaked one (prominence < 1) — selecting the worst metric
+        # (2026-07-08 review). Reliability == peak prominence, and a peakless
+        # curve has none.
+        max_prominence = float(np.max(props["prominences"])) if n_peaks > 0 else 0.0
 
         # Score: high prominence, few secondary peaks
         scores[fm] = max_prominence - 0.2 * max(0, n_peaks - 1)

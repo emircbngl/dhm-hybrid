@@ -1,0 +1,20 @@
+# Optional deps for scripts/finetune_lora.py. Not pulled in by the main
+# requirements.txt because the lab default workflow is Pipeline A
+# (Modelfile, no weight updates) — this file is for the LoRA path only.
+#
+# Install once before running the LoRA fine-tune:
+#     pip install -r requirements_finetune.txt
+#
+# Versions pinned to the combination that ships clean LoRA + Qwen2.5
+# tool-calling tokens as of 2026-Q2.
+
+transformers>=4.46
+trl>=0.12
+peft>=0.13
+datasets>=3.0
+accelerate>=1.0
+
+# torch is already in the main requirements; if installing into a fresh
+# env, add an explicit line for the right backend, e.g.:
+#   torch>=2.5.0           # CPU / MPS
+#   torch>=2.5.0 --index-url https://download.pytorch.org/whl/cu124   # CUDA 12.4

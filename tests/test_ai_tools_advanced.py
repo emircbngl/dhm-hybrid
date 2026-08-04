@@ -482,12 +482,18 @@ def test_record_timelapse_propagates_capture_failure(monkeypatch):
     assert out.payload.get("frame") == 1
 
 
-def test_registry_now_has_19_tools():
-    """Sprint 2 added 5 — original 14 + 5 = 19. v2.1.z added 9
-    device tools behind ``include_devices=True``; this test pins
-    the canonical 19-tool surface (devices opted out)."""
+def test_registry_now_has_24_tools():
+    """Sprint 2 added 5 — original 14 + 5 = 19. Phase 1b (core.observe
+    wiring) added 5 more observation/vision tools — 19 + 5 = 24.
+    v2.1.z added 16 device tools behind ``include_devices=True``;
+    this test pins the canonical 24-tool surface (devices opted
+    out)."""
     r = build_tool_registry(include_devices=False)
-    assert len(r) == 19
+    assert len(r) == 24
     expected_new = {"stage_focus_search", "map_sample_grid",
                     "list_mapped_cells", "goto_cell", "record_timelapse"}
     assert expected_new.issubset(set(r.names()))
+    expected_observation = {"inspect_reconstruction", "inspect_phase",
+                            "inspect_field", "render_view",
+                            "set_reconstruction_mode"}
+    assert expected_observation.issubset(set(r.names()))

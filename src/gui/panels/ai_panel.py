@@ -430,6 +430,8 @@ class AIPanel(QDockWidget):
             shutter=shutter,
             led=led,
             orchestrator=orchestrator,
+            get_last_field=self._get_last_field,
+            set_reference_mode=self._set_reference_mode,
         )
 
     def _make_device_hooks(self):
@@ -842,6 +844,64 @@ class AIPanel(QDockWidget):
         except Exception as exc:  # noqa: BLE001
             return {"error": "find_focus_candidates failed", "message": str(exc)}
         return {"submitted": True}
+
+    # ------------------------------------------------------------------
+    # Observation / vision hooks (2026-07-05, core.observe wiring)
+    # ------------------------------------------------------------------
+
+    def _get_last_field(self, target: str) -> Optional[np.ndarray]:
+        """Return main_window's latest array for ``target``, or None.
+
+        Thread-safety note: ``main_window`` assigns these arrays
+        wholesale on the GUI thread (``self._recon_complex = result...``)
+        and never mutates them in place — a fresh array replaces the
+        old one. Reading the current reference from the AI thread is
+        therefore safe without a lock: worst case we read the array
+        from just before or just after an assignment, never a
+        partially-written one.
+        """
+        mw = self._main_window
+        if target == "recon_complex":
+            return getattr(mw, "_recon_complex", None)
+        if target == "phase_unwrapped":
+            return getattr(mw, "_phase_unwrapped", None)
+        if target == "raw":
+            return getattr(mw, "_loaded_array", None)
+        if target == "depth":
+            depth_result = getattr(mw, "_last_depth_map_result", None)
+            if depth_result is None:
+                return None
+            return getattr(depth_result, "z_map", None)
+        return None
+
+    def _set_reference_mode(self, args: dict) -> dict:
+        """Delegate mode switching to the v1 sidebar's reference toggle.
+
+        v1 only knows "off" (reference disabled) and "reference"
+        (reference hologram subtraction via ``ptab.ref_enable_cb``).
+        ``reference_free`` is a ui2-only capability (background-fit
+        subtraction, no reference hologram) — v1 reports a friendly
+        error rather than pretending to support it.
+        """
+        mode = str(args.get("mode", "")).strip().lower()
+        if mode == "reference_free":
+            return {"error": "reference_free is only available in the "
+                              "v2 (ui2) frontend"}
+        if mode not in ("off", "reference"):
+            return {"error": f"unknown mode {mode!r}"}
+
+        def _apply() -> dict:
+            mw = self._main_window
+            ptab = getattr(getattr(mw, "sidebar_tabs", None),
+                          "process_tab", None)
+            if ptab is None or not hasattr(ptab, "ref_enable_cb"):
+                return {"error": "reference toggle unavailable"}
+            if mode == "reference" and getattr(mw, "_reference_complex", None) is None:
+                return {"error": "load a reference hologram first"}
+            ptab.ref_enable_cb.setChecked(mode == "reference")
+            return {"ok": True, "mode": mode}
+
+        return self._run_on_gui(_apply)
 
     # ------------------------------------------------------------------
     # Sprint 2: capture / sharpness / map / capture-and-process

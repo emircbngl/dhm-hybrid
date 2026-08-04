@@ -147,10 +147,11 @@ def _make_ctx(**overrides) -> ToolContext:
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_registry_has_all_19_tools():
-    """Canonical 19 (10 pipeline + 4 stage + 5 sprint-2). v2.1.z
-    added device tools behind ``include_devices=True``; this test
-    pins the legacy surface."""
+def test_registry_has_all_24_tools():
+    """Canonical 24 (10 pipeline + 4 stage + 5 sprint-2 + 5
+    observation/vision). v2.1.z added device tools behind
+    ``include_devices=True``; this test pins the legacy+observation
+    surface."""
     r = build_tool_registry(include_devices=False)
     expected = {
         "load_hologram", "set_recon_param", "run_reconstruction",
@@ -161,6 +162,9 @@ def test_registry_has_all_19_tools():
         # Sprint 2 — focus search, mapping, time-lapse:
         "stage_focus_search", "map_sample_grid", "list_mapped_cells",
         "goto_cell", "record_timelapse",
+        # Phase 1b — observation / vision (core.observe wiring):
+        "inspect_reconstruction", "inspect_phase", "inspect_field",
+        "render_view", "set_reconstruction_mode",
     }
     assert set(r.names()) == expected
 
@@ -176,14 +180,14 @@ def test_registry_default_includes_v21z_device_tools():
         "led_status", "acquire_grid",
     }
     assert new_tools.issubset(set(r.names()))
-    # Canonical 19 still present.
+    # Canonical (pipeline + observation) tools still present.
     assert "run_reconstruction" in r.names()
 
 
 def test_schemas_are_openai_tools_array_shape():
     r = build_tool_registry(include_devices=False)
     schemas = r.schemas()
-    assert len(schemas) == 19
+    assert len(schemas) == 24
     for s in schemas:
         assert s["type"] == "function"
         assert "function" in s

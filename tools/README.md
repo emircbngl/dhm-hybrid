@@ -4,7 +4,7 @@ Her modülü bağımsız olarak test etmek için hazır araçlar.
 Tüm tool'lar `Hybrid/` kök dizininden çalıştırılmalıdır:
 
 ```bash
-cd "/path/to/dhm-hybrid"
+cd /path/to/dhm-hybrid       # repo kök dizini
 python -m tools.<tool_adı>
 ```
 

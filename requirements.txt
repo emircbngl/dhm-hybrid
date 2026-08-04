@@ -17,3 +17,7 @@ PyOpenGL-accelerate
 # AI assistant — local LLM (Ollama / LM Studio) via OpenAI-compatible HTTP.
 requests>=2.31
 jsonschema>=4.21
+# Track C — reference-free reconstruction (hybrid CNN). MPS-compatible
+# torch ≥ 2.0; Pillow for synthetic ref I/O.
+torch>=2.0
+Pillow>=9.0

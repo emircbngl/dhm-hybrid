@@ -326,6 +326,28 @@ def _v11_to_v12(raw: dict) -> dict:
     return raw
 
 
+def _v12_to_v13(raw: dict) -> dict:
+    """v13 adds the reference-mode block (Phase 3, AI_VISION_MCP_PLAN.md):
+    ``reference_mode`` + ``reffree_bg_method``/``reffree_bg_order``/
+    ``reffree_n_terms``/``reffree_cnn``. Backfill matches the pre-Phase-3
+    world exactly — ``reference_mode="off"`` defers to the existing
+    ``subtract_reference`` flag via ``ReconParams.effective_reference_mode``,
+    so a v12 dump with subtract_reference=True keeps dividing by its
+    reference exactly as before, with no behaviour change until the
+    operator explicitly picks a mode from the new combo."""
+    ui2 = raw.setdefault("ui2", {})
+    if not isinstance(ui2, dict):
+        raw["ui2"] = {}
+        ui2 = raw["ui2"]
+    ui2.setdefault("reference_mode", "off")
+    ui2.setdefault("reffree_bg_method", "zernike")
+    ui2.setdefault("reffree_bg_order", 4)
+    ui2.setdefault("reffree_n_terms", 15)
+    ui2.setdefault("reffree_cnn", False)
+    raw["schema_version"] = 13
+    return raw
+
+
 _MIGRATIONS: list[tuple[int, int, Callable[[dict], dict]]] = [
     (1, 2, _v1_to_v2),
     (2, 3, _v2_to_v3),
@@ -338,6 +360,7 @@ _MIGRATIONS: list[tuple[int, int, Callable[[dict], dict]]] = [
     (9, 10, _v9_to_v10),
     (10, 11, _v10_to_v11),
     (11, 12, _v11_to_v12),
+    (12, 13, _v12_to_v13),
 ]
 
 

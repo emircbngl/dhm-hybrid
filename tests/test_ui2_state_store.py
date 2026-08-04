@@ -143,7 +143,13 @@ def test_migration_v2_adds_ui2_block(tmp_state_path):
     loaded = state_store.load(tmp_state_path)
     assert loaded.schema_version == SCHEMA_VERSION
     assert loaded.io.last_folder == "/tmp"
-    assert loaded.ui2 == Ui2State()
+    # NOT plain Ui2State(): a pre-v9 file passes through the FROZEN v9
+    # migration, which pins af_algorithm="zscan" so existing lab setups
+    # keep their behaviour — while the dataclass default moved to
+    # "robust" with the 2026-07-06 settlement (B-095). Missing/corrupt
+    # files (no migration chain) get the pure defaults instead — see
+    # test_load_missing_file_returns_defaults.
+    assert loaded.ui2 == Ui2State(af_algorithm="zscan")
 
 
 def test_forward_compat_unknown_keys_dropped(tmp_state_path):

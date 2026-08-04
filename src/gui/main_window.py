@@ -36,18 +36,6 @@ except Exception:  # pragma: no cover — audit module may not be present yet
     get_audit_log = None  # type: ignore[assignment]
 
 
-def _nice_scalebar_length(pixel_um: float) -> float:
-    """Pick a round scale-bar length (in µm) that spans ~10-20 % of a 1000 px field."""
-    target_um = pixel_um * 150  # ~150 px worth
-    import math
-    exp = math.floor(math.log10(max(target_um, 1e-6)))
-    mantissa = target_um / (10 ** exp)
-    for nice in [1, 2, 5, 10, 20, 50, 100]:
-        if nice >= mantissa:
-            return nice * (10 ** exp)
-    return round(target_um)
-
-
 class _ReturnToDockOnClose(QDockWidget):
     """Utility dock that returns to its layout home rather than closing permanently."""
     def closeEvent(self, event):
@@ -1213,6 +1201,16 @@ class MainWindow(QMainWindow):
                 ptab = self.sidebar_tabs.process_tab
                 if ptab.ref_enable_cb.isChecked() and self._reference_complex is not None:
                     cfg["reference_complex"] = self._reference_complex
+                    # 2026-04-29: also hand over the pre-propagation
+                    # reference (+1 order in Fourier) so batch's
+                    # autofocus / sweep paths can re-propagate the
+                    # reference to each trial z and divide consistently
+                    # with what _make_fast_evaluator expects. Without
+                    # this, best-Z was selected on un-referenced fields
+                    # while the saved field used a fixed-z reference —
+                    # a silent ~µm-level drift in best-Z on real lab data.
+                    if getattr(self, "_reference_fc", None) is not None:
+                        cfg["reference_fc"] = self._reference_fc
                 self._batch_worker.setup(cfg, self._profile_manager)
                 self._batch_worker.start()
                 
@@ -1283,6 +1281,7 @@ class MainWindow(QMainWindow):
         # Update input image view
         img = self._as_field_2d(self._loaded_array)
         self.panel_input.set_image(img, autoLevels=True)
+        self._push_scalebars()
         self._frame_counter += 1
         
         # Enable processing buttons now that we have data
@@ -1362,6 +1361,16 @@ class MainWindow(QMainWindow):
         if ptab.ref_enable_cb.isChecked() and self._reference_complex is not None:
             ref_field = self._reference_complex
 
+        # Same n_medium source as the autofocus/depth prep — the live
+        # reconstruction used to hardcode n=1.0 (air) while autofocus read
+        # the qpi tab (default 1.337), so best-focus z and the displayed
+        # reconstruction diverged by a factor of n (2026-07-05 review).
+        n_medium = 1.0
+        try:
+            n_medium = float(self.sidebar_tabs.qpi_tab.n_medium.value())
+        except (AttributeError, RuntimeError):
+            pass  # qpi_tab missing or not yet wired — keep air.
+
         return {
             'frame_num': self._frame_counter,
             'image': self._as_field_2d(self._loaded_array),
@@ -1369,7 +1378,7 @@ class MainWindow(QMainWindow):
             'wavelength': wl,
             'pixel_size': px,
             'z': z_m,
-            'n_medium': 1.0,
+            'n_medium': n_medium,
             'subtract_mean': ptab.subtract_mean_cb.isChecked(),
             'hann_window': ptab.hann_cb.isChecked(),
             'mask_radius': int(rtab.mask_radius.value()),
@@ -1524,8 +1533,56 @@ class MainWindow(QMainWindow):
                 self.panel_phase.set_unwrapped(phase_display, autoLevels=True)
             else:
                 self.panel_phase.set_unwrapped(self._phase_unwrapped, autoLevels=True)
+        # Refresh the scalebar overlay against the current effective
+        # pixel size — bar length adapts to magnification + camera
+        # pixel choice without the user touching anything.
+        self._push_scalebars()
+
+    def _push_scalebars(self) -> None:
+        """Paint µm scalebar on every preview panel.
+
+        Reads the effective pixel size off the recon tab (camera_um /
+        magnification, or camera_um directly when 'pixel is effective'
+        is checked). Silently no-ops when the recon tab isn't built
+        yet — keeps unit-test instantiation cheap.
+        """
+        try:
+            rtab = self.sidebar_tabs.recon_tab
+            px_um = float(rtab.pixel_um.value())
+            if not rtab.pixel_is_effective_cb.isChecked():
+                mag = float(rtab.magnification.value())
+                if mag > 0:
+                    px_um = px_um / mag
+        except (AttributeError, RuntimeError):
+            return
+        for panel in (getattr(self, "panel_input", None),
+                      getattr(self, "panel_amp", None),
+                      getattr(self, "panel_phase", None)):
+            if panel is None:
+                continue
+            try:
+                panel.set_scalebar(px_um)
+            except Exception:
+                # Best-effort overlay — never block recon on a paint glitch.
+                pass
 
     # ─── Reference Hologram ─────────────────────────────────────────────
+
+    def _active_reference_fc(self):
+        """Pre-propagation reference field, honoring the process tab's
+        'Enable reference subtraction' checkbox.
+
+        The reconstruct path always gated the reference on this checkbox;
+        the autofocus/depth/tomography paths used ``_reference_fc``
+        unconditionally, so unchecking the box changed the displayed
+        reconstruction but depth maps kept dividing by the reference —
+        a silent divergence (2026-07-05 review). All non-reconstruct
+        consumers must go through this helper.
+        """
+        ptab = self.sidebar_tabs.process_tab
+        if not ptab.ref_enable_cb.isChecked():
+            return None
+        return getattr(self, "_reference_fc", None)
 
     def _reconstruct_reference(self, img_array: np.ndarray, source_name: str):
         """
@@ -2228,7 +2285,19 @@ class MainWindow(QMainWindow):
             mag = float(rtab.magnification.value())
             px = px / (mag if mag > 0 else 1.0)
 
-        params = ReconstructionParams(wavelength_m=wl, pixel_size_m=px, z_m=0.0, n=1.0)
+        # Medium refractive index — water = 1.337, air = 1.0. Hardcoding
+        # 1.0 propagates the wrong wavelength inside the medium and
+        # silently throws focus / depth z by a factor of n. Pull from
+        # the qpi tab's n_medium spinbox when the user has set one.
+        n_medium = 1.0
+        try:
+            qtab = self.sidebar_tabs.qpi_tab
+            n_medium = float(qtab.n_medium.value())
+        except (AttributeError, RuntimeError):
+            # qpi_tab missing or not yet wired — keep air.
+            pass
+        params = ReconstructionParams(wavelength_m=wl, pixel_size_m=px, z_m=0.0,
+                                      n=n_medium)
 
         zmin = float(ftab.zscan_min_mm.value()) * 1e-3
         zmax = float(ftab.zscan_max_mm.value()) * 1e-3
@@ -2290,8 +2359,9 @@ class MainWindow(QMainWindow):
             if ftab.roi_tracker_group.isChecked() and self._phase_tracker.active:
                 roi_bounds = self._phase_tracker.get_roi_bounds()
 
-            # Pass pre-propagation reference field for phase-based focus metrics
-            ref_fc = getattr(self, '_reference_fc', None)
+            # Pass pre-propagation reference field for phase-based focus
+            # metrics — gated on the same checkbox as reconstruction.
+            ref_fc = self._active_reference_fc()
 
             worker = AutofocusWorker(self)
             worker.configure(
@@ -3008,6 +3078,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QGraphicsRectItem
         from PySide6.QtGui import QBrush, QColor, QPen
         from PySide6.QtCore import QRectF
+        from core.scalebar import compute_scalebar
 
         if enabled:
             rtab = self.sidebar_tabs.recon_tab
@@ -3018,12 +3089,23 @@ class MainWindow(QMainWindow):
                     px_um = px_um / mag
 
             custom_um = self.toolbar.scalebar_um.value()
-            bar_um = custom_um if custom_um > 0 else _nice_scalebar_length(px_um)
+            # Reference width for the auto-pick: compute_scalebar sizes the
+            # bar as a fraction of the frame width, whereas the previous
+            # local heuristic targeted ~150 px directly. Passing a synthetic
+            # 1000 px frame with the default 0.15 target_fraction reproduces
+            # the same ~150 px target while routing through the canonical
+            # 1/2/5 ladder in core.scalebar (matches the image-panel bars).
+            spec = compute_scalebar(
+                1000, px_um,
+                fixed_length_um=custom_um if custom_um > 0 else None,
+            )
+            if spec is None:
+                return
+            bar_um = spec.length_um
+            label_str = spec.label
             bar_px = bar_um / px_um
             bar_h = max(4, bar_px * 0.06)  # bar thickness
             margin = 12  # px from edge
-
-            label_str = f"{bar_um:.0f} µm" if bar_um >= 1 else f"{bar_um*1000:.0f} nm"
 
             for panel in [self.panel_amp, self.panel_phase, self.panel_spectrum]:
                 try:
@@ -3869,6 +3951,7 @@ class MainWindow(QMainWindow):
                     z_min_m=z_min_m, z_max_m=z_max_m,
                     n_steps=40, window_size=5,
                     metric=FocusMetric.LAPLACIAN_VARIANCE,
+                    ref_field=self._active_reference_fc(),
                 )
             except Exception as exc:
                 log.exception("tomography-bundle: depth compute failed")
@@ -4059,6 +4142,7 @@ class MainWindow(QMainWindow):
                 z_min_m=z_min_m, z_max_m=z_max_m,
                 n_steps=30, window_size=5,
                 metric=metric,
+                ref_field=self._active_reference_fc(),
             )
         except Exception as exc:
             log.exception("depth-overlay: compute failed")
@@ -4209,6 +4293,7 @@ class MainWindow(QMainWindow):
                 fc, params, method,
                 z_min_m=z_min_m, z_max_m=z_max_m,
                 n_steps=n_steps, window_size=5, metric=metric,
+                ref_field=self._active_reference_fc(),
             )
         except Exception as exc:
             log.exception("depth-map: compute failed")

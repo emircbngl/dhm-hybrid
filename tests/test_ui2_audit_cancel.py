@@ -132,7 +132,10 @@ def test_autofocus_audit_captures_z_range_and_metric(captured_audit):
          patch("ui2.workers.autofocus_zscan", return_value=fake_result):
         driver.run_autofocus(
             Path("/dev/null"),
-            ReconParams(autofocus_metric="TENENGRAD"),
+            # zscan pinned: this test patches ui2.workers.autofocus_zscan,
+            # so it must dispatch that branch regardless of the app default
+            # (robust since the 2026-07-06 settlement, B-095).
+            ReconParams(autofocus_metric="TENENGRAD", af_algorithm="zscan"),
             z_min_mm=-2.0, z_max_mm=5.0, n_steps=10,
             sample_id="LIMS-42",
             on_result=lambda r: done.__setitem__(0, True),
@@ -233,7 +236,8 @@ def test_cancel_autofocus_raises_autofocus_cancelled(captured_audit):
                              (8, 8))), \
          patch("ui2.workers.autofocus_zscan", side_effect=slow_scan):
         driver.run_autofocus(
-            Path("/dev/null"), ReconParams(),
+            # zscan pinned — the patched branch (see B-095 note above).
+            Path("/dev/null"), ReconParams(af_algorithm="zscan"),
             z_min_mm=-1.0, z_max_mm=1.0, n_steps=10,
             on_result=lambda r: outcome.__setitem__("ok", r) or done.__setitem__(0, True),
             on_error=lambda e: outcome.__setitem__("err", e) or done.__setitem__(0, True),
@@ -290,7 +294,8 @@ def test_driver_discards_late_result_after_cancel():
                              (8, 8))), \
          patch("ui2.workers.autofocus_zscan", side_effect=immediate_scan):
         driver.run_autofocus(
-            Path("/dev/null"), ReconParams(),
+            # zscan pinned — the patched branch (see B-095 note above).
+            Path("/dev/null"), ReconParams(af_algorithm="zscan"),
             z_min_mm=-1.0, z_max_mm=1.0, n_steps=10,
             on_result=lambda r: events.__setitem__("result_called", True)
                                  or done.__setitem__(0, True),

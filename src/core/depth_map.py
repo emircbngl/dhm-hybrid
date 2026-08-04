@@ -54,6 +54,7 @@ from .reconstruction import (
     ReconstructionMethod,
     ReconstructionParams,
     propagate,
+    safe_reference_divide,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -194,6 +195,7 @@ def compute_depth_map(
     window_size: int = 5,
     metric: FocusMetric = FocusMetric.LAPLACIAN_VARIANCE,
     cancel_check: Optional[Callable[[], bool]] = None,
+    ref_field: Optional[np.ndarray] = None,
 ) -> DepthMapResult:
     """Build a per-pixel best-focus z map.
 
@@ -219,6 +221,15 @@ def compute_depth_map(
         One of :data:`_LOCAL_KERNELS`' keys. ``LAPLACIAN_VARIANCE`` is
         the default — handles phase-edge objects. ``TENENGRAD`` is a
         gradient alternative.
+    ref_field
+        Optional pre-propagation reference (same +1-order Fourier
+        complex field as the sample). When supplied, both sample and
+        reference are propagated to each trial z and complex-divided
+        before the local sharpness kernel runs — the metric judges the
+        same referenced field the user gets back from the live
+        reconstruct path. Without this the depth map is reference-blind
+        and best-z saturates to the scan boundaries on real lab data
+        (illumination drift dominates the local Laplacian).
 
     Returns
     -------
@@ -246,6 +257,12 @@ def compute_depth_map(
     # Stack ``(N_z, H, W)`` of local sharpness maps.
     stack = np.empty((n_steps, h, w), dtype=np.float32)
 
+    use_ref = ref_field is not None
+    if use_ref and ref_field.shape[-2:] != (h, w):
+        raise ValueError(
+            f"ref_field shape {ref_field.shape} doesn't match field {field.shape}"
+        )
+
     for i, z in enumerate(z_values):
         # Cooperative cancellation — depth scans are the longest jobs
         # in the pipeline (O(n_steps * H * W)), so Esc must actually
@@ -260,6 +277,10 @@ def compute_depth_map(
             n=base_params.n,
         )
         recon = propagate(field, params, method, fft=fft, force_python=True)
+        if use_ref:
+            ref_recon = propagate(ref_field, params, method, fft=fft,
+                                  force_python=True)
+            recon = safe_reference_divide(recon, ref_recon)
         stack[i] = local_kernel(recon, window_size)
 
     # Per-pixel arg-max + max.
@@ -267,10 +288,26 @@ def compute_depth_map(
     confidence = np.take_along_axis(stack, idx[None, :, :], axis=0)[0]
     z_map = _refine_subpixel_z(stack, idx, z_values)
 
+    # Boundary saturation diagnostic. When the scan range is too narrow,
+    # too wide, or the field carries no usable focus signal (flat metric
+    # → noise argmax), most pixels pin to the scan extremes. We log a
+    # warning so the operator notices instead of trusting a pinned map.
+    boundary_frac = float(((idx == 0) | (idx == n_steps - 1)).mean())
+    if boundary_frac > 0.5:
+        _LOG.warning(
+            "depth-map: %.0f%% of pixels saturated to scan boundary "
+            "(z_min=%.3f, z_max=%.3f mm). Likely causes: scan range "
+            "doesn't cover the focus plane, no reference division on a "
+            "ref-required setup, or the metric is flat on this field.",
+            boundary_frac * 100,
+            z_min_m * 1e3, z_max_m * 1e3,
+        )
+
     _LOG.info(
-        "depth-map: %d×%d → z in [%.3f, %.3f] mm, mean conf %.3g",
+        "depth-map: %d×%d → z in [%.3f, %.3f] mm, mean conf %.3g, "
+        "boundary %.0f%%",
         h, w, float(z_map.min()) * 1e3, float(z_map.max()) * 1e3,
-        float(confidence.mean()),
+        float(confidence.mean()), boundary_frac * 100,
     )
     return DepthMapResult(
         z_map=z_map.astype(np.float32),

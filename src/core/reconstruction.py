@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
@@ -51,9 +52,18 @@ class CachedReconstructor:
         self._sqrt_term: Optional[np.ndarray] = None   # ASM
         self._freq_sq: Optional[np.ndarray] = None      # Fresnel
 
-        # Field spectrum cache
+        # Field spectrum cache. Identity is held via a weakref, NOT a bare
+        # id(): Python reuses object ids after garbage collection, so a
+        # same-shape array allocated after the cached field died could
+        # collide with the stale id and be served the previous field's
+        # spectrum (silently reconstructing the wrong frame — observed as
+        # cross-test contamination on 2026-07-05; batch/timelapse loops
+        # that free and reallocate frames are the production analogue).
+        # A dead weakref can never match a live array, so id reuse is safe.
+        # In-place mutation of the SAME array is still not detected — the
+        # long-standing documented caveat of this cache.
         self._field_spectrum: Optional[np.ndarray] = None
-        self._field_id: Optional[int] = None  # id() of cached field
+        self._field_ref: Optional["weakref.ref"] = None
 
     # ── frequency grid (reused across z values) ──
     def _ensure_freq_grid(self, params: ReconstructionParams) -> None:
@@ -116,13 +126,17 @@ class CachedReconstructor:
 
     # ── field spectrum cache ──
     def _get_field_spectrum(self, field: np.ndarray) -> np.ndarray:
-        fid = id(field)
-        if self._field_spectrum is None or self._field_id != fid:
+        cached = self._field_ref() if self._field_ref is not None else None
+        if self._field_spectrum is None or cached is not field:
             inp = field.astype(np.complex64, copy=False)
             self._field_spectrum = self.fft.fft2(inp)
             if self._field_spectrum.dtype != np.complex64:
                 self._field_spectrum = self._field_spectrum.astype(np.complex64)
-            self._field_id = fid
+            try:
+                self._field_ref = weakref.ref(field)
+            except TypeError:
+                # Non-weakrefable input (plain memoryview etc.) — never cache.
+                self._field_ref = None
         return self._field_spectrum
 
     # ── public API ──
@@ -181,3 +195,14 @@ def propagate_asm(field: Any, params: ReconstructionParams, fft: Optional[FFTBac
 
 def propagate_fresnel(field: Any, params: ReconstructionParams, fft: Optional[FFTBackend] = None) -> Any:
     return propagate(field, params, ReconstructionMethod.FRESNEL, fft)
+
+
+def safe_reference_divide(sample: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Complex-divide ``sample`` by ``ref`` with a singularity guard.
+
+    Where ``|ref|`` is near zero the divisor is replaced by 1 so the result
+    stays finite (the B-053 reference-division idiom, single source — used
+    by the reffree pipeline, batch renderer, and depth-map ref-aware scan).
+    """
+    safe = np.where(np.abs(ref) > 1e-10, ref, np.ones_like(ref))
+    return sample / safe

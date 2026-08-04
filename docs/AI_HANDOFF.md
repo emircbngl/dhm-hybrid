@@ -96,6 +96,7 @@ bunun **üzerine bina edecek**:
 | [src/gui/workers/ai_worker.py](../src/gui/workers/ai_worker.py) | `AIWorker(QThread)` — bir agent run'ı, Qt signal'leri |
 | [src/gui/panels/ai_panel.py](../src/gui/panels/ai_panel.py) | `AIPanel(QDockWidget)` — chat UI, tool call rendering |
 | [src/gui/dialogs/ai_settings_dialog.py](../src/gui/dialogs/ai_settings_dialog.py) | `AISettingsDialog` — endpoint/model/temp ayarları |
+| [src/ui2/device_panel.py](../src/ui2/device_panel.py) | **v2.2.0-devices** — Stage HUD + shutter/LED/jog controls (DPG; W2 + W5) |
 
 ### Yeni — script + doküman
 | Dosya | Amaç |
@@ -388,18 +389,27 @@ Sonra `MAIN_WINDOW_COMMAND_IDS` tuple'ına `"ai.show_map"` ekle.
 - **State**: `QFileSystemWatcher` ile sample_map.json'u izle
 - **Komut**: `ai.show_map_panel`
 
-### W2 — Device control panel (öncelik 2)
+### W2 — Device control panel ✅ SHIPPED (v2.2.0-devices, 2026-04-29)
 - **Hedef**: shutter/LED/manuel stage move butonları + slider
-- **Plug-in noktası**: yeni `gui/panels/device_control_panel.py`
-- **Backend hazır**: tools 20–28 (shutter_*, led_*, acquire_grid)
-- **Direkt çağırma**: AI'a sormak yerine kullanıcı butonu → `ctx.shutter.open()`
-  veya tool'u programmatic dispatch et:
-  ```python
-  reg = build_tool_registry()
-  result = reg.dispatch(ctx, ToolCall(id="ui1", name="shutter_open",
-                                       arguments_json="{}"))
-  ```
-- **Status display**: poll `shutter_status` / `led_status` her 1 sn
+- **Ship'lenen**: `src/ui2/device_panel.py` (DPG track) — W5 ile birleşik tek panel.
+  - **Stage card**: XYZ HUD + jog grid (X±/Y±/Z± + 4 diagonal) + step
+    selector (1 µm / 10 µm / 100 µm / 1 mm / 5 mm) + Home + collapsible
+    absolute move.
+  - **Shutter card**: tek toggle button (Open/Close) + status pill.
+  - **LED card**: On/Off toggle + 0–100 % slider + intensity readout.
+  - **Connection footer**: stage / shutter / LED bound durumu.
+- **Backend bağlantısı**: `core.devices` Protocols (`StageDevice`,
+  `ShutterDevice`, `LEDDevice`); pre-wired ``app._stage`` / ``_shutter``
+  / ``_led`` varsa onlar, yoksa `make_device("mock_*")` lazy.
+- **Threading**: 5 Hz polling timer → `("device_state", snapshot)`
+  mailbox event → app shell `_handle_device_state` → `device_panel.
+  handle_mailbox_event` → DPG widget refresh. AI thread'in pipeline
+  pattern'ı ile bire bir aynı handshake.
+- **Komut**: Tools menu → "Devices…" (ayrı shortcut yok; AI panel'in
+  yanına eklendi).
+- **Test**: `tests/test_ui2_device_panel.py` — 25 test (snapshot, jog,
+  home, absolute move, shutter/LED toggle, intensity clamp, step-label
+  round-trip, mailbox handler, polling lifecycle).
 
 ### W3 — Tool-call inspector (öncelik 3)
 - **Hedef**: AI'ın geçmişte ne yaptığını listeleme + replay
@@ -413,10 +423,15 @@ Sonra `MAIN_WINDOW_COMMAND_IDS` tuple'ına `"ai.show_map"` ekle.
 - **UI**: scrubber + line chart (phase_std / dry_mass / cell_count zaman serisi)
 - **Bonus**: her frame için snapshot rebuild (recon at frame's z)
 
-### W5 — Stage position HUD (öncelik 5)
-- **Hedef**: status bar'da gerçek zamanlı XYZ
-- **Bind**: `stage.add_listener(lambda pos: status_widget.update(pos))`
-- **UI**: 3 küçük QLabel ya da kompakt `X:0.0 Y:0.0 Z:0.0 mm` widget
+### W5 — Stage position HUD ✅ SHIPPED (v2.2.0-devices, 2026-04-29)
+- **Ship'lenen**: W2 ile aynı panelde (Stage card en üstte). Üç satır
+  big-mono XYZ readout — `+0.1234 mm` formatı, sabit genişlik (jog
+  sırasında rakam atlamaz). 5 Hz polling, listener-bağımsız (Devices
+  Protocol `position_um` property'si üzerinden, mm'ye boundary'de
+  çevirilir).
+- **Status bar varyantı**: bu ship'te dahil değil — panel açıkken zaten
+  daha okunabilir bir HUD var. Ayrı status-bar widget'i ileride status
+  bar refactor'ında.
 
 ---
 

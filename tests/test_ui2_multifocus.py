@@ -27,6 +27,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+# Order-independent `from fixtures...` — see B-085.
+sys.path.insert(0, str(ROOT / "tests"))
 
 from core.autofocus import FocusMetric  # noqa: E402
 from core.autofocus.analysis import find_focus_candidates  # noqa: E402

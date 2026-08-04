@@ -31,7 +31,9 @@ def is_available() -> bool:
 
 def make(*, size_px: int = 512, target_fps: float = 30.0,
          rng_seed: int = 42):
-    from ui2.camera_feed import SyntheticCamera
+    # core.drivers since 2026-07-06 — previously this was an inverted
+    # layering (core importing up into the ui2 frontend package).
+    from core.drivers.camera_feed import SyntheticCamera
     return SyntheticCamera(
         size_px=size_px,
         target_fps=target_fps,

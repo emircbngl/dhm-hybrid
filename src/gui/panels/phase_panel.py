@@ -64,6 +64,15 @@ class PhasePanel(QWidget):
     def set_colormap(self, cmap_name: str) -> None:
         self.image_panel.set_colormap(cmap_name)
 
+    def set_scalebar(self, pixel_size_um: float | None,
+                     *, fixed_length_um: float | None = None) -> None:
+        """Proxy to the inner ImagePanel — keeps callers panel-agnostic."""
+        self.image_panel.set_scalebar(pixel_size_um,
+                                      fixed_length_um=fixed_length_um)
+
+    def clear_scalebar(self) -> None:
+        self.image_panel.clear_scalebar()
+
     # ---- depth-map overlay (v1.2-tomo final+) -----------------------
 
     def set_depth_overlay(

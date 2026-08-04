@@ -25,7 +25,12 @@ from core.qpi_batch import (
 )
 from core.reconstruction import ReconstructionMethod, ReconstructionParams
 
-from fixtures.synthetic_hologram import (
+# Order-independent `from fixtures...` — see B-085.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
+from fixtures.synthetic_hologram import (  # noqa: E402
     HologramConfig,
     SphereSpec,
     build_hologram,

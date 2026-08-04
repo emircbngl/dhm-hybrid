@@ -38,3 +38,25 @@ def test_roughness_no_nan_on_degenerate():
     r = compute_roughness(h)
     assert np.isfinite(r.Rsk)
     assert np.isfinite(r.Rku)
+
+
+def test_cell_morphology_phase_stats_have_correct_scale():
+    """mean_phase_rad / phase_std_rad must be the true phase φ = 2π·OPD/λ.
+
+    Regression for the 2026-07-05 review: the old code did opd_m*(2π)
+    (dropping the /λ), yielding values ~1e6× too small and dimensionally
+    wrong. We impose a known constant phase and check it round-trips.
+    """
+    from core.qpi import compute_cell_morphology, phase_to_opd
+
+    wl = _WL
+    known_phase = 1.2  # rad, uniform over the cell
+    opd = np.full((16, 16), phase_to_opd(known_phase, wl), dtype=np.float64)
+    mask = np.ones((16, 16), dtype=bool)
+    morph = compute_cell_morphology(
+        opd, pixel_size_m=0.1e-6, mask=mask, wavelength_m=wl,
+    )
+    assert morph.mean_phase_rad == pytest.approx(known_phase, rel=1e-6)
+    assert morph.phase_std_rad == pytest.approx(0.0, abs=1e-9)
+    # Sanity: a plain opd*2π would be ~1e6× smaller — guard the regression.
+    assert morph.mean_phase_rad > 1.0

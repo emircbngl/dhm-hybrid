@@ -32,6 +32,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+# Order-independent `from fixtures...`: without this the import only worked
+# when an earlier-collected module (alphabetically: test_calibration) had
+# already inserted tests/ — this file collects BEFORE it and failed (B-085).
+sys.path.insert(0, str(ROOT / "tests"))
 
 from core.autofocus import FocusMetric, autofocus_zscan  # noqa: E402
 from core.autofocus.analysis import find_focus_candidates  # noqa: E402

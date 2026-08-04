@@ -22,6 +22,7 @@ from ..reconstruction import (
     CachedReconstructor,
     ReconstructionMethod,
     ReconstructionParams,
+    safe_reference_divide,
 )
 from .metrics import FocusMetric, _calc_metric
 
@@ -35,6 +36,49 @@ class AutofocusCancelled(Exception):
 class AutoFocusResult:
     best_z_m: float
     scores: Dict[float, float]
+    # Non-fatal diagnostic: set when the focus-score landscape is
+    # degenerate (nearly flat, or mostly non-finite) so ``best_z_m`` is
+    # argmax-of-noise rather than a real focus. The result is still
+    # returned (best guess) but callers/UI should surface this
+    # (2026-07-08 version audit — ported from the original Phyton app's
+    # autofocus diagnostics, which Hybrid's plain linear z-scan lacked).
+    warning: Optional[str] = None
+
+
+def focus_landscape_warning(scores: Dict[float, float]) -> Optional[str]:
+    """Return an actionable warning when a focus-score curve is degenerate.
+
+    Two soft guards mirroring the original Phyton autofocus (which *raised*
+    here — we return a string instead so the best-guess z is preserved):
+
+    * fewer than 3 finite scores → the reconstruction produced non-finite
+      metrics for most z (bad z-range / method / physical parameters);
+    * normalized dynamic range ``(max-min)/scale < 1e-3`` → the curve is
+      essentially flat, so the picked z is noise, not focus (usually wrong
+      pixel size / magnification / wavelength, an unsuitable z-range, or a
+      bad +1-order mask center/radius).
+
+    Returns ``None`` when the landscape looks healthy.
+    """
+    if not scores:
+        return None
+    ys = np.asarray(list(scores.values()), dtype=np.float64)
+    finite = ys[np.isfinite(ys)]
+    if finite.size < 3:
+        return ("Autofocus unreliable: the reconstruction produced non-finite "
+                "focus scores for most z values. Try narrowing the z-range, "
+                "switching method (ASM/Fresnel), or checking the pixel size / "
+                "magnification / wavelength.")
+    y_min = float(np.min(finite))
+    y_max = float(np.max(finite))
+    y_scale = max(abs(y_max), abs(y_min), 1e-12)
+    if (y_max - y_min) / y_scale < 1e-3:
+        return ("Autofocus unreliable: focus scores are nearly flat across the "
+                "scan, so the chosen z is not a real focus. This usually means "
+                "incorrect physical parameters (pixel size / magnification / "
+                "wavelength), an unsuitable z-range, or a wrong +1-order mask "
+                "(center / radius).")
+    return None
 
 
 def downsample_complex_field(
@@ -132,10 +176,7 @@ def _make_fast_evaluator(
 
         if use_ref and ref_spectrum is not None:
             ref_result = recon.reconstruct_from_spectrum(ref_spectrum, params)
-            ref_abs = np.abs(ref_result)
-            safe = np.where(ref_abs > 1e-10, ref_result,
-                            np.ones_like(ref_result))
-            result = result / safe
+            result = safe_reference_divide(result, ref_result)
 
         roi = result[ry0:ry1, rx0:rx1]
         return _calc_metric(roi, metric)
@@ -331,11 +372,7 @@ def _make_batch_evaluator(
             ref_result = fft.ifft2_batched(ref_spec_stack)
             if not isinstance(ref_result, np.ndarray):
                 ref_result = fft.to_numpy(ref_result)
-            ref_abs = np.abs(ref_result)
-            safe = np.where(
-                ref_abs > 1e-10, ref_result, np.ones_like(ref_result),
-            )
-            result_stack = result_stack / safe
+            result_stack = safe_reference_divide(result_stack, ref_result)
 
         out = np.empty(len(zs_list), dtype=np.float64)
         for i in range(len(zs_list)):

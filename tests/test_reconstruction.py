@@ -43,3 +43,40 @@ def test_fresnel_output_shape_matches_input(synthetic_complex_field):
     out = propagate(field, _fresh_params(5e-5), ReconstructionMethod.FRESNEL)
     assert out.shape == field.shape
     assert np.all(np.isfinite(out))
+
+
+def test_spectrum_cache_survives_id_reuse():
+    """Regression (2026-07-05): the global propagate() spectrum cache keyed
+    on a bare id(field). Python reuses ids after GC, so a same-shape array
+    allocated after the cached field died could collide and be served the
+    PREVIOUS field's spectrum — silently reconstructing the wrong frame
+    (batch/timelapse loops free+realloc frames constantly). The cache now
+    holds a weakref, which can never match a new object.
+    """
+    from core.reconstruction import (
+        propagate, ReconstructionParams, ReconstructionMethod,
+    )
+
+    params = ReconstructionParams(wavelength_m=633e-9, pixel_size_m=1e-6,
+                                  z_m=1e-4)
+    a = np.ones((64, 64), dtype=np.complex64)
+    out_a = np.abs(propagate(a, params, ReconstructionMethod.ASM)).copy()
+    stale_id = id(a)
+    del a
+
+    # Try to land a new same-shape array on the freed object slot; CPython
+    # usually reuses it on the first allocation. If no collision happens
+    # the assertion below still holds — correctness must not depend on it.
+    b = None
+    for _ in range(64):
+        b = np.full((64, 64), 2.0, dtype=np.complex64)
+        if id(b) == stale_id:
+            break
+
+    out_b = np.abs(propagate(b, params, ReconstructionMethod.ASM))
+    # Linear propagator: doubling the field must double the output. A
+    # poisoned cache would return out_a's magnitude instead.
+    assert np.allclose(out_b, 2.0 * out_a, rtol=1e-4, atol=1e-6), (
+        "propagate() served a stale spectrum for a different field "
+        "(id-reuse cache poisoning)"
+    )

@@ -1405,3 +1405,656 @@ Lab profili netleşti: HeNe λ=632.8 nm + 50× obj + USAF/bead/RBC/E.coli/Bacill
 | Staphylococcus | 1.40 | 1.337 | kok |
 | Pseudomonas | 1.39 | 1.337 | basil |
 | Lactobacillus | 1.39 | 1.337 | uzun rod |
+
+---
+
+# Plan — 2026-05-05 — Track C (Hybrid CNN) Reference-Free Reconstruction
+
+## Context (kararın çıkış noktası)
+
+Müşteri reconstruction sırasında referans hologram kullanmaktan kurtulmak istiyor (operatif yük, alignment hassasiyeti, vardiya başı kalibrasyon).
+
+Üç yol incelendi (bkz. lessons.md 2026-05-05 ve `track_b_pure_dl_notes.md`):
+
+- **Track A — saf klasik (Zernike/polynomial fit)**: 14-frame fair benchmark'ta median RMSE = **3.92 rad** (hedef <0.15 rad). Floor ~26x üstte. **Yetersiz**.
+- **Track B — saf DL (eHoloNet/Y-Net stili)**: 63 frame ve düşük sample diversity ile pure DL için ölçek tamamen yetersiz. Notlar `track_b_pure_dl_notes.md`'ye kaydedildi, ileride veri kampanyası ile yeniden gündeme alınır.
+- **Track C — hybrid (klasik + küçük CNN residual corrector)**: ✅ **bu sprint** — diff görsellerinde **structured stripe pattern** + session-stable + 63 frame'in 50'si train + 13 test için yeterli.
+
+## Hedef
+
+Tek hologram + referanssız reconstruction:
+- **median RMSE ≤ 0.50 rad** (Track A'dan ~8x iyileşme, hedefe ~3x uzaklık)
+- **p95 abs err ≤ 1.50 rad**
+- **inference < 100 ms** (1024² frame, M-series Mac CPU yeterli; GPU plus)
+- **leave-one-session-out** validation: cross-session generalization gap < 2x
+
+## Mimari kararı
+
+**Pipeline (canlı çalışırken)**:
+```
+Raw hologram (1024×1024 uint16)
+   ↓ demodulate (Fourier sideband, classical)
+   ↓ propagate at autofocus z (classical, ASM)
+   ↓ wrapped phase + amplitude (classical)
+   ↓ polynomial bg-fit order 5 (classical, 5 ms)
+   → ϕ_classical (still has structured stripes)
+   ↓ small residual CNN (U-Net lite, ~1.5M params)
+   → ϕ_clean (production output)
+```
+
+**Eğitim hedefi (residual learning)**:
+```
+input  = ϕ_classical (poly5 reffree output)
+target = ϕ_classical - ϕ_ref_based  (the residual stripe pattern)
+loss   = L1 + 0.1·SSIM + 0.05·TV
+```
+
+Residual prediction tercih sebebi:
+- Network sıfır-output verse pipeline degrade yapmaz (hala Track A poly5 floor'unda)
+- "Aberration patterns"i öğrenmek "phase'in kendisini" öğrenmekten kolay
+- Sample-tip diversity'sine az duyarlı (residual sample-bağımsız aberration)
+
+**Architecture**: U-Net lite, 1024×1024 input, 4 down + 4 up, base 32 channels, total ~1.5M params. Single output channel (residual phase).
+
+## Adımlar
+
+### A. Veri pipeline (1-2 gün)
+- [ ] `scripts/build_track_c_dataset.py`: GT manifest + outlier filter → 53 valid frame
+  - Her frame için: ϕ_classical (poly5 reffree, fixed z) + ϕ_GT (ref-based, fixed z) + residual = ϕ_classical - ϕ_GT
+  - `.npz` dump per frame (compressed) + master `dataset.json` index
+  - Train/val/test split: leave-one-session-out (her session bir kere test'te)
+- [ ] Augmentation: random flip H/V, random 90° rotate, random crop 768², piston offset
+- [ ] Sanity check: bir frame'in residual'ini görselleştir, RMSE'sini logla, structured stripe hâlâ orada olmalı
+
+### B. Model + training loop (2-3 gün)
+- [ ] `src/recon_dl/unet_lite.py`: U-Net lite mimarisi (4-down 4-up, base=32, GroupNorm, GELU, skip connections)
+- [ ] `src/recon_dl/dataset.py`: PyTorch Dataset wrapper, .npz lazy load + augmentation
+- [ ] `src/recon_dl/losses.py`: L1 + SSIM (`pytorch-msssim`) + TV combine
+- [ ] `scripts/train_track_c.py`: training loop, AdamW lr=3e-4 cosine decay, 200 epoch, batch=4 (M-series MPS) / 16 (CUDA), early stop on val RMSE
+- [ ] Checkpoint: `models/track_c/v0.1/{model.pt, train_log.json, config.yaml}`
+
+### C. Evaluation (1 gün)
+- [ ] `scripts/eval_track_c.py`: held-out test session üzerinde RMSE/p95/SSIM/inference latency
+- [ ] LOSO cross-validation: 9 session × 9 model (her session sırayla test), her run sonucunu `eval_loso.csv`'ye yaz
+- [ ] Karşılaştırma raporu: `_benchmark_track_c/report.png` — Track A vs Track C, frame-level RMSE distribution + delta visualization
+- [ ] Pass/fail: median RMSE ≤ 0.50 rad? p95 ≤ 1.50? Yoksa hangi sample tipinde başarısız?
+
+### D. Production wiring (1-2 gün, B+C geçtiyse)
+- [ ] `src/core/pipelines/reffree_hybrid.py`: classical pipeline wrap + CNN inference plug-in
+- [ ] Model serving: TorchScript export + lazy load (CPU fallback)
+- [ ] UI flag: ProcessTab "Reference-free reconstruction (CNN-corrected)" checkbox
+- [ ] Telemetry: her CNN inference için input/output statistics audit log'a; drift için
+- [ ] Smoke test: live UI'dan referanssız mod aktif → 5 frame koş → RMSE histogram göster
+
+### E. Docs
+- [ ] `docs/REFFREE_HYBRID.md`: mimari, training rehberi, retrain trigger'ları
+- [ ] `tasks/lessons.md`: training sırasında karşılaşılan tuzaklar (her major correction sonrası)
+- [ ] `CHANGELOG.md`: feature entry
+
+## Zaman tahmini
+- A: 1-2 gün
+- B: 2-3 gün
+- C: 1 gün
+- D: 1-2 gün
+- E: paralel
+- **Toplam: 5-8 iş günü**
+
+## Risk & mitigation
+
+| Risk | Olasılık | Etki | Mitigation |
+|---|---|---|---|
+| 53 frame yetersiz, overfit | orta | yüksek | Augmentation agresif + dropout 0.1; eğer overfit, synthetic stripe injection augmentation ekle |
+| Cross-session generalization zayıf | orta | yüksek | LOSO CV ile erken yakala; başarısızlıkta session-conditional film/adain ekle |
+| Inference latency >100 ms | düşük | orta | Model boyutunu azalt (base=24 veya 16); ONNX/CoreML export |
+| Sample-tipi farklılığında degrade | orta | orta | Production drift monitoring + Track A fallback; lab veri kampanyasıyla yeni sample örnekleri ekle |
+| GT manifest 10 frame outlier var | bilindik | düşük | `--filter-z-outliers` ile zaten ayıklandı (53/63 valid) |
+
+## Definition of done
+1. ✅ LOSO median RMSE ≤ 0.50 rad
+2. ✅ p95 abs err ≤ 1.50 rad
+3. ✅ Inference < 100 ms (CPU, 1024²)
+4. ✅ Production wired + UI flag
+5. ✅ docs + lessons güncel
+6. ✅ Track A fallback hâlâ çalışıyor (CNN bypass mod)
+
+## Out of scope (Track C kapsamı dışı, daha sonra)
+- Multi-sample augmentation (RBC + bakteri synthetic injection) — yeni veri geldiğinde
+- Track B pivot — 5000+ frame 8+ sample tipi geldiğinde
+- Real-time GPU inference optimizasyonu — production'da CPU yetiyorsa atla
+- Tek shot autofocus + reffree birleşik DL (autofocus de CNN'e gömülsün) — bir sonraki sprint
+
+---
+
+# Backlog — 2026-07-05 (kullanıcı notları)
+
+## 1. "Adaptive" konseptli autofocus algoritmalarını oturt
+Kullanıcı: "adaptive konseptli algoritmalarımız vardı, onları oturtamadık tam — bir ara oturtalım."
+- Kapsam: `src/core/autofocus/search_adaptive.py` — adaptive_gradient / adaptive_ratio / adaptive_bracketing / adaptive_distance + `AdaptiveFocusState` (canlı kamera state machine). Kök `adaptive_steps/` staging klasörü (Mar 2026 prototipi) hâlâ merge artığı olarak duruyor.
+- Bilinen bağlam: B-023 (v1→v2 portunda adaptive algoritmalar kaybolmuştu, geri eklendi); v2 `workers.py` 6 algoritmayı listeliyor ama adaptive'lerin gerçek lab verisinde güvenilirliği hiç sistematik ölçülmedi (bench_autofocus.py sentetik tek-küre ile koşuyor).
+- Yapılacak (önerilen): (a) gerçek lab hologramlarında (labtest/ + rapor data) adaptive vs klasik benchmark; (b) hangi adaptive modun hangi manzara tipinde kazandığını belgele; (c) default'ları/parametreleri buna göre sabitle; (d) adaptive_steps/ staging klasörünü temizle.
+
+## 2. Kitap-algoritma tutarlılık doğrulaması (başlatıldı 2026-07-05)
+Optik/rekonstrüksiyon/mikroskopi/holografi kitaplarından analitik test vakalarını çıkarıp motorda tutarlılık testi — `tests/validation_textbook/` süiti.
+
+## Review — 2026-07-05 oturumu (kitap-doğrulama + code review + fix sprint)
+
+1. **Kitap-algoritma tutarlılık süiti** `tests/test_textbook_validation.py`: 13 PASS + 1 scope-skip.
+   Kaynaklar Kim/Kreis/Hecht (gerçek PDF'ler); Born&Wolf ve Schnars&Jüptner dosyaları SAHTE çıktı
+   (biri 3-sayfalık kitap incelemesi, biri indirme-scam placeholder) → formüller gerçek kaynaklardan
+   çapraz-alındı. Yük-taşıyan formüller physics_verify (Docker oracle) yeşil. Rapor:
+   tasks/textbook-validation-2026-07-05.md. Kapsam sınırı belgelendi (Fraunhofer far-field +
+   single-FFT Fresnel pixel motor kapsamı dışı).
+2. **Code review (8 açı + adversarial doğrulama)**: 10 bulgu → 7 CONFIRMED + 1 jog-guard düzeltildi,
+   regresyon testli; B-055..B-063 registry'de. Rapor: tasks/code-review-2026-07-05.md.
+3. **BONUS motor bug'ı (B-058)**: propagate() spektrum cache id-reuse zehirlenmesi — textbook süiti
+   yakaladı, weakref-kimlikle düzeltildi. Batch/timelapse döngülerinde yanlış-frame rekonstrüksiyonu
+   riskiydi.
+4. Süit: **1171 PASS + 10 skip**; bug sweep **63 entry FAIL=0**. crash_handler'daki 3 hata ön-var-olan
+   ortam sorunu (stash'li ağaçta da aynı) — ayrıca incelenmeli.
+5. Açık: review #8/#9 (bilinçli dokunulmadı), reffree'nin core/pipelines'a çıkarılması (yapısal tema),
+   qpi.py:418 OPD→radyan bug'ı (wiki'de işaretli, ayrı fix bekliyor — bu diff'in dışında).
+
+## Devam (2026-07-05, ikinci tur) — qpi fix + reffree refactor
+
+6. **qpi.py boyut bug'ı DÜZELTİLDİ (B-060)**: compute_cell_morphology'ye wavelength_m eklendi,
+   φ=2π·OPD/λ (physics_verify'lı bağıntı); compute_qpi gerçek λ'yı geçiriyor. Test:
+   test_qpi.py::test_cell_morphology_phase_stats_have_correct_scale. Wiki callout'ları güncellendi.
+7. **Reffree layering fix (B-064)**: src/core/pipelines/reffree_hybrid.py oluşturuldu (OpticalConfig
+   parametreli). src/recon_dl/inference.py artık core'dan import ediyor (scripts→src inversion kırıldı,
+   kaynak-guard testli). benchmark_reffree + run_rapor_data_batch core'a delege eden ince wrapper
+   (byte-parity testli). Testler: test_reffree_pipeline.py (7). Suite: 1179 PASS; sweep 65 entry FAIL=0.
+   Kalan: batch_renderer/depth_map ref-division kopyaları, reffree testlerini tmp_path'e taşıma,
+   ProcessTab reffree entegrasyonu.
+
+## Devam (2026-07-05, üçüncü tur) — 4 subagent cleanup sprint'i (orkestrasyon + review)
+
+4 paralel Sonnet-5 subagent + 2 reviewer subagent; orkestrasyon/onay/final doğrulama ana oturumda.
+- **A (ref-division dedup):** `safe_reference_divide` → core/reconstruction.py; reffree_hybrid re-export;
+  depth_map + batch_renderer._apply_ref (2 dal) helper'a bağlandı. Reviewer side-note'uyla ana oturum
+  3 kalan kopyayı da bağladı (qpi.subtract_reference_wave, autofocus/evaluator ×2 [tekli+batched],
+  reconstruction_worker._subtract_reference) → idiom artık TEK kaynak.
+- **B (track_c test taşınabilirliği):** sentetik tmp_path fixture (gerçek şemayla birebir); bayat
+  Windsurf model yolu → REPO_ROOT-relative (inference testi torch'lu env'de artık GERÇEKTEN koşuyor —
+  sistem python3 + torch 2.11/MPS ile 7/7 doğrulandı, losses device fix'i MPS'te kanıtlı);
+  yeni torch'suz tests/test_track_c_dataset_schema.py; DHM_TRACK_C_DATA env override.
+- **C (scalebar birleştirme + bg basis cache):** main_window._nice_scalebar_length silindi →
+  core.scalebar.compute_scalebar (image-panel'le tutarlı; not: sub-µm etiketler artık '0.3 µm',
+  '300 nm' değil); background_phase Zernike/poly basis+grid lru_cache(4) — sayısal birebir,
+  3000-frame reffree batch'te frame-başına ~230-640MB yeniden-kurulum yok.
+- **D (device_panel):** çift kurulum yolu kaldırıldı (__init__ gerçek çözümleme, __new__ hilesi silindi);
+  per-tick threading.Timer → tek daemon thread + Event.wait + dirty-check publish.
+- **Review turu (2 reviewer):** core-fizik değişiklikleri TEMİZ (0 bulgu; divide bit-for-bit, cache
+  mutasyonsuz, circular-import her sırada yok). UI reviewer 1 HIGH yakaladı: stop_polling'in _closed
+  latch'i reopen'da HUD'u kalıcı donduruyordu → ana oturum düzeltti (start her seferinde taze Event,
+  loop kendi event referansını taşır — clear() yarışı imkânsız) + reopen regresyon testi.
+- Süit: **1191 PASS + 10 skip**; bug sweep 65 FAIL=0. Düşük bulgular kabul edildi: px_um≤0 latent
+  guard (spinbox floor'u nedeniyle erişilmez, yeni davranış daha güvenli), fixture helper'ın iki test
+  dosyasında bilinçli kopyası (docstring'lerde senkron notu).
+
+## Phase 3 (2026-07-05) — ui2 reference-mode UI + reffree pipeline yolu
+
+Plan: docs/AI_VISION_MCP_PLAN.md ("Phase 3 — ui2 reference-mode UI").
+
+- [x] `ReconParams` (src/ui2/reconstruction.py): yeni alanlar `reference_mode`
+  ("off"|"reference"|"reference_free"), `reffree_bg_method`, `reffree_bg_order`,
+  `reffree_n_terms`, `reffree_cnn`. `effective_reference_mode()` helper: mode=="off"
+  ve legacy `subtract_reference=True` ise "reference" döner (geriye uyum, tek yer).
+  `_extract_field_with_reference` + `_prepare_sample_and_ref_fields` bu helper'a
+  bağlandı (grep edilen tüm subtract_reference tüketicileri).
+- [x] `ReconResult`e `unwrapped_phase` (Optional) + `reffree_note` (Optional[str])
+  eklendi — sadece reference_free modunda dolduruluyor, "off"/"reference" hiç
+  dokunmuyor (wrapped `phase` degismedi, geriye uyum tam).
+- [x] `ReconstructionDriver._run`: reference_free ise unwrap (params.unwrap_method) +
+  `core.background_phase.subtract_background` (reffree_bg_method/order/n_terms) →
+  `unwrapped_phase`. CNN toggle: `reffree_cnn_available()` (torch importable VE
+  models/track_c/v0.1/model.pt var) guard'lı, lazy import, hata/unavailable →
+  `reffree_note` ile status'a yansir (asla sessiz cokme/no-op).
+- [x] Depth-map yolu: `_prepare_sample_and_ref_fields` reference_free'de
+  `ref_field=None` döner (bg fit derinlik taramasına uygulanmıyor — bilinçli
+  kapsam disi, docstring'de belgeli).
+- [x] app.py UI: "Reference mode" combo (Off/Reference/Reference-free) +
+  reference_free icin bg-method combo + order input + CNN checkbox (gate'li,
+  tooltip "requires torch + trained model"). `_on_param_changed`,
+  `_hydrate_widgets`, `_snapshot_state`, `_apply_preset`, `_compose_info_text`
+  (yeni "Ref mode:" satırı, eski "Reference: … (on/loaded/none)" satırı
+  DOKUNULMADI — mevcut testler kırılmadı) güncellendi.
+- [x] Persistence: `Ui2State` + `SCHEMA_VERSION` 12→13 no-op stamp migration
+  (`state_store._v12_to_v13`), settings_schema.py yorum + alanlar.
+- [x] Testler: tests/test_ui2_reffree.py (24 test) — ReconParams defaults/back-compat,
+  gercek sentetik off-axis hologram uzerinden reference_free kosumu (bg fit
+  degistigini kanitlar), reference_free bir reference yuklu olsa bile ref
+  division'i atlar, CNN gate (torch yok → zarif skip + note), state round-trip +
+  migration, DhmApp combo label/handler.
+
+Kosuldu: `pytest tests/test_ui2_reffree.py tests/test_ui2_logic.py
+tests/test_ui2_scientific_params.py tests/test_ui2_state_store.py
+tests/test_settings_schema.py tests/test_batch_v2_parity.py` → **106 PASS**.
+Tam suite: 1249 PASS + 10 skip, 3 FAIL (test_crash_handler.py — degisiklik
+oncesi de ayni sekilde fail ediyor, bu gorevin disinda, dokunulmadi).
+
+## AI Vision + MCP + Reffree UI — 3 faz (2026-07-05, multiagent) TAMAM
+
+Plan: docs/AI_VISION_MCP_PLAN.md. Karar: core-first · MCP full-drive headless · vision numeric+PNG · reffree UI→ui2.
+Workflow: Faz A (1b tools + 3 ui2 paralel) → Faz B (MCP) → 2 reviewer. Orkestrasyon + review-fix ana oturumda.
+
+- **Phase 1 core/observe.py** (ana oturum): inspect_reconstruction/inspect_phase_map/inspect_field/render_view (saf, Qt-free). 15 test; gerçek PNG render doğrulandı.
+- **Phase 1b tool wiring** (agent): 5 AI tool (inspect_*/render_view/set_reconstruction_mode) tool_impls'e; ToolContext.get_last_field/set_reference_mode (dondurulmus kontrat); v1 ai_panel wiring; render_view PNG'yi ~/.dhm-reconstruction/renders'a yazar, sonucta base64 YOK. 24 canonical tool (docstring guncel).
+- **Phase 2 dhm-mcp** (agent): src/dhm_mcp/ headless MCP sunucu, build_tool_registry generic kopru + dispatch (clamp/schema/confirm/audit devrede), render_view→MCP image content, mcp'siz durust SystemExit.
+- **Phase 3 ui2 reffree** (agent): ReconParams reference_mode(off/reference/reference_free)+reffree_bg/cnn; workers reference_free→background_phase.subtract_background; app.py 3-yonlu combo+bg/CNN gate; SCHEMA_VERSION 12→13.
+
+**Review (2 gozden gecirici) + ana-oturum fix'leri:**
+- **B-066 CRITICAL** (MCP): FastMCP tool schema'yi imzadan cikariyor → **kwargs handler'lar tum tool'lari cagirilamaz yapmisti; her ToolSpec JSON-schema'sindan explicit keyword-only imza sentezlendi. mcp'li ortamda 3 test canli dogrulandi (mcp-gated → manual).
+- **B-067 HIGH** (ui2): reference-mode combo ↔ legacy subtract_reference iki-yonlu senkronsuzlugu (explicit Off flag'i birakmiyordu → divide devam) duzeltildi (combo/toggle/load/clear); + QPI yolu artik reffree bg-fit uyguluyor (MED); audit RESOLVED mode logluyor (LOW); hydrate honourable-olmayan CNN istegini dusuruyor (LOW).
+- render_view dosya adina uuid suffix (mikrosaniye cakismasi).
+
+Suite: **1261 PASS + 11 skip**; sweep 67 entry FAIL=0. core/observe thread-safety + unit-conversion + no-base64-leak reviewer'ca CLEAN.
+Kalan (dusuk): render retention/cleanup yok; irreversible tool henuz yok (confirm-gate sentetik test'te); ui2 AI paneli hala bozuk (ayri is).
+
+## ui3 — Qt yeniden inşası (2026-07-05, multiagent)
+
+Kullanıcı: "ui2'yi sıfırdan inşa et, arayüz paketini sen seç, hiçbir parçayı atlama."
+Toolkit KARARI (kolayına gelen değil, değerlendirilmiş): **PySide6 (Qt6) + pyqtgraph**.
+Web/Tauri reddedildi (numpy compute'a IPC vergisi); Dear PyGui reddedildi (bug registry'nin
+en büyük fazı DPG_PORT 17 macOS bug'ıydı). Gerekçe: docs/UI3_DESIGN.md.
+
+- **Yeni paket src/ui3/** (31 dosya, 8145 satır): tasarım sistemi (design.py token'lar + qss,
+  4 palet WCAG-AA), wcag.py, state.py (persist+migration, ReconParams reuse), bridge.py
+  (Qt-free ui2 ScienceDriver/ReconstructionDriver üzerine QThread/Signal köprüsü — compute
+  YENİDEN YAZILMADI), viewport.py (pyqtgraph ImagePanel zoom/pan/colormap/scalebar/drop),
+  main_window.py (dock shell, 4-panel grid, tam menü, workflow modları, ⌘K palette, tema,
+  maximize, onboarding), context.py (dondurulmuş PanelContext kontratı).
+- **11 panel/dialog multiagent ile paralel inşa** (kontrata karşı): recon (zengin, tüm ReconParams
+  + reference-mode off/reference/reference-free + CNN gate + presets), focus, qpi, depth,
+  camera, device, report, timelapse, ai (Qt-native AIWorker + vision render_view inline),
+  + dialoglar (surface 3D pyqtgraph.opengl, qpi_batch, focus_candidates, audit_viewer,
+  onboarding, preset_dialogs, line_profile, preset_chips).
+- **Entegrasyon (elle):** inline dock → ReconPanel (source-of-truth self._params), 8 feature
+  panel dock (Analyse'da tabbed), dialoglar menü/sonuç-tetikli, depth.surface_requested →
+  SurfaceViewer, onboarding first-run.
+- **Kapsam matrisi (docs/UI3_DESIGN.md) 1:1 karşılandı** — hiçbir ui2 parçası atlanmadı.
+- run_ui3.py giriş. Eski ui2 (Dear PyGui) parite gelene kadar DOKUNULMADI.
+- Test: **131 ui3 testi** (offscreen Qt, gerçek QApplication — DPG-stub yok); tam repo **1392 PASS**.
+- Kalan: gerçek Mac ekranında görsel doğrulama (offscreen GL context surface-viewer'ı çizmiyor,
+  fallback var); ui2 emekliye ayırma (parite teyidinden sonra); adaptive-autofocus backlog hâlâ açık.
+
+---
+
+## Review — 2026-07-06: ui3/observe/dhm_mcp 2. kod-review turu (B-072…B-082)
+
+Kullanıcı: "code review + bulguları düzelt." 8-açılı finder + adversarial doğrulama turu
+ui3+observe+dhm_mcp'yi ilk kez bu derinlikte taradı → **11 gerçek bug** (birkaçı ui3
+entegrasyonundan). Hepsi düzeltildi, regresyon yazıldı, bug registry'ye işlendi.
+
+- **B-072 (ÇÖKME)** `main_window._on_load_reference` silinmiş `_cb_ref_mode` combo'suna
+  `setCurrentText` → AttributeError. Fix: params + `_sync_controls_from_params()`.
+- **B-073 (KRİTİK)** `panels/ai_panel` bridged tool'ları argümansız `signal.disconnect()`
+  → sinyaldeki tüm slot'ları koparıyor (viewport paint + paneller). Fix: `_disconnect_one(handle)`.
+- **B-074** `core/observe.render_view` scalebar downsample stride'ı yok saydı → etiket
+  stride kadar yanlış. Fix: `_downsample` stride döndürür, `pixel_size_um*stride`.
+- **B-075** `ui3/state._params_to_dict` `str(tuple)` → `af_roi` round-trip bozuk. Fix:
+  JSON list + yüklemede tuple coerce.
+- **B-076** `ui3/bridge.busy_changed` iki executor arası tek boolean → erken idle. Fix:
+  lock'lu referans-sayımı.
+- **B-077 (B-067 sınıfı)** AI `_gui_set_reference_mode` legacy `subtract_reference`'ı
+  senkron tutmuyordu → bayat True açık "off"u eziyor. Fix: `= mode=="reference"`.
+- **B-078** headless `set_recon_param` türetilmiş cache invalidate etmiyor → bayat inspect.
+  Fix: cache temizle.
+- **B-079** MCP'de referans modu erişilemezdi (`reference_raw` dolmuyor). Fix: opsiyonel
+  `reference_path` (validate_path'li) → headless + ui3 AIPanel yükler.
+- **B-080** reference-free tek `bg_order` iki knob'u besliyordu → polynomial'de dejenere.
+  Fix: method-özel default + doğru knob.
+- **B-081** AIPanel health thread öksüz bırakma → "QThread destroyed while running". Fix:
+  probe set izleme + `shutdown()` hepsini bekler.
+- **B-082 (çift-wiring)** shell + paneller aynı sinyale bağlı → autofocus çift-compute,
+  depth çift-repaint. Fix: shell auto-reconstruct'ı bıraktı, depth'i yalnız cache'ler.
+
+**Doğrulama:** `tests/test_ui3_review_2026_07_06.py` (11 yeni regresyon, tümü PASS) +
+ilgili süitler. Tam repo **1400 PASS**, 11 skip. 3 `test_crash_handler` başarısızlığı
+**pre-existing** — bayat `venv/pyvenv.cfg` "Windsurf Projects" yolundan test yükleme
+harness artefaktı, dokunulan koddan bağımsız (venv rebuild ayrı iş). Obsidian
+[[DHM-ui3-Qt-Rebuild]] güncellendi.
+
+---
+
+## Devam — 2026-07-06 (2. seans): B-083/084/085 + venv rebuild → TAM YEŞİL
+
+- [x] **B-083** — 17 bulgudan kalan son #15: QPI/candidates çift-wiring. Sahiplik kontratı:
+  paneller domain statüsü (one-shot QPI + dry mass), dialoglar batch/candidates statü+tablo,
+  shell yalnız recon-paint + z-sync + cache + `present()` (repopulate'siz göster); shell'in
+  error lambda'ları kaldırıldı. +2 regresyon testi.
+- [x] **Venv rebuild** — `pyvenv.cfg` kanıtı: venv `Windsurf .../Phyton/venv` olarak yaratılıp
+  kopyalanmış (taşınamaz). pip freeze yedeği → aynı yorumlayıcı (3.13.5) → aynı pinli 56 paket
+  → tüm `__pycache__`/`.pytest_cache` temizliği. Eski venv silindi.
+- [x] **B-084** — 3 crash_handler hatasının GERÇEK kökü (bayat-pyc değil): pytest-qt (ui3 ile
+  geldi) handler'ın doğru excepthook zincirlemesini "Exceptions caught in Qt event loop" diye
+  yalancı FAIL'e çeviriyordu. Testler zararsız önceki-hook sabitliyor → 7/7.
+- [x] **B-085** — `from fixtures...` koleksiyon-sırası şansı: hiç toplanamayan
+  test_autofocus_speed_baseline dahil 6 dosya kendine-yeter yapıldı; `--ignore` kalktı.
+- [x] Registry: **85 kayıt, FAIL=0** (`check_bugs.py`). Tam süit (ignore'suz): **1411 PASS,
+  0 FAIL, 11 skip** (torch/mcp/ffmpeg opsiyonelleri).
+- [~] Bugünkü tüm diff'in adversarial review workflow'u (4 boyut × 2 refuter) — sonuç bekleniyor.
+
+## Review turu #2 — 2026-07-06: kendi fix diff'ime adversarial workflow (B-086…B-094)
+
+Bugünkü B-072..B-083 diff'i 4-boyutlu finder + 2'şer refuter'lık workflow'la (32 agent)
+bağımsız incelendi → 8 onaylı + 3 belirsiz bulgu; belirsizlerin ÜÇÜ de elle doğrulanıp gerçek
+çıktı. Hepsi düzeltildi (9 benzersiz fix, +9 regresyon testi):
+- [x] B-086 headless: set_reference_mode + invoke_autofocus'un z yazımı cache invalidation'ı
+      atlıyordu (B-078'in eksik yüzü) → tek `_invalidate_derived()` her mutator'da.
+- [x] B-087 ui3 AI snapshot HAM kamera pikselini geçiyordu → dry mass M² (40x'te 1600×) şişik,
+      scalebar M× yanlış → snapshot artık effective_pixel_um().
+- [x] B-088 AI tool'ları senkron busy-reddini kaçırıp 60-120s timeout'a asılıyordu → `if not got` guard'ı.
+- [x] B-089 B-076 refcount'un kendi yarışı: worker'dan kuyruklanan idle, yeni busy'den sonra
+      inip UI'ı temizliyordu → idle kararı GUI thread'de teslim anında (_idle_check sinyali).
+- [x] B-090 set_status auto-toast + panellerin explicit toast'u = çift toast → status-only.
+- [x] B-091 ui3 AI bg_order zernike'de sessiz no-op (yanlış knob) → method'a göre yönlendirme.
+- [x] B-092 is_cancelled closure worker'ı atamadan ÖNCE yakalıyordu → Stop çalışmıyordu → dinamik okuma.
+- [x] B-093 observe spectrum karmaşık girişte fft2 atlıyordu (|field| log|F| diye çiziliyordu) → tek fft2 yolu.
+- [x] B-094 get_field('phase_unwrapped') off/reference modda SARILI fazı sessizce veriyordu
+      (yalnız reffree unwrap dolduruyor) → talep-üzerine unwrap + cache.
+
+---
+
+## Adaptive Autofocus — OTURDU (2026-07-06, B-095)
+
+2026-07-05 backlog maddesi (satır 1531-1534) kapandı; plan (a)-(d) tamamı uygulandı:
+- [x] (a) **Gerçek-veri benchmark**: 9 lab sahnesi (session_01..09 orta kareleri, 1600×1200,
+      lab optiği) × 2 metrik × 6 algoritma; gerçek = 201-adım yoğun tarama ±20mm; bütçe = 40 eval.
+      Harness `scripts/benchmark_af_real.py`, ham veri `tasks/af_real_benchmark.json` (108 satır).
+- [x] (b) **Sahne/metrik verdiktleri belgelendi** (`docs/AUTOFOCUS_ADAPTIVE.md` + UI tip'leri):
+      robust iki metrikte de tepe (%78/%67 hit, 0.07/0.15mm); adaptive_bracketing laplacian
+      doğruluk şampiyonu (0.03mm/%78, bütçe +%30); adaptive_gradient hızlı ama ENTROPY ile
+      GÜVENİLMEZ (7.2mm — düz-omuz stall'ı); adaptive_distance bu kurulumda güvenilmez (%0-22);
+      ESKİ default zscan en kötü ikinci (%33/%44 — grid aralığı = doğruluk tabanı).
+- [x] (c) **Default'lar sabitlendi**: ReconParams + settings şeması af_algorithm="robust"
+      (v9 migration zscan'de DONMUŞ — mevcut state dosyaları davranış değiştirmez); headless/MCP
+      autofocus adaptive_gradient→robust + default metric PHASE_VARIANCE→LAPLACIAN_VARIANCE
+      (GUI paritesi); yeni ReconParams knob'u YOK (darboğaz algoritma+metrik eşleşmesi, iç
+      parametreler değil — ui3 FocusPanel docstring'i "settled" olarak güncellendi).
+- [x] (d) **`adaptive_steps/` staging klasörü silindi** (Mart 2026 prototipi, git rm ile staged).
+- [x] Regresyon: `tests/test_af_settlement.py` (5 test). Registry: **B-095**.
+
+---
+
+## Driver Relocation — 2026-07-06: ui2 → core/drivers (ui2 emekliliğinin ön koşulu)
+
+- [x] `src/ui2/{reconstruction,workers,camera_feed}.py` → `src/core/drivers/` (git mv,
+      geçmiş korunarak; modül adları aynı → içteki göreli importlar sıfır değişiklik).
+- [x] Eski yollar **sys.modules-aliasing shim**: `ui2.workers` ile `core.drivers.workers`
+      kelimenin tam anlamıyla AYNI modül nesnesi → `patch("ui2.workers.X")` gerçek
+      global'leri vurmaya devam eder, private isimler + sınıf kimliği korunur.
+- [x] Dış tüketiciler core.drivers'a çevrildi: ui3 (context/main_window/bridge/state +
+      camera/recon/focus panelleri) + `core/cameras/synthetic.py` (core→ui2 ters katmanlama
+      da düzeldi). **ui3 ve core artık ui2'yi HİÇ import etmiyor** (test pin'li).
+- [x] Regresyon: `tests/test_driver_relocation.py` (alias kimliği, patch-through,
+      katmanlama pin'i). Tam süit: **1429 PASS, 0 FAIL, 11 skip**.
+- [~] Relocation diff'ine adversarial review workflow — sonuç bekleniyor.
+- Kalan (ui2 emekliliği için): kapsam-parite teyidi + kullanıcı onayı; ui2 dizini artık
+  yalnız DPG sunum katmanı + shim'ler.
+
+### Relocation review sonucu (2026-07-06): 2 onaylı bug, ikisi de düzeltildi
+- [x] **B-096 (HIGH):** workers.py bir seviye derine taşınınca `_REPO_ROOT parents[2]` →
+      `<repo>/src`'a çözüldü; Track C CNN checkpoint yolu bayat → `reffree_cnn_available()`
+      sessizce False (geçerli checkpoint varken CNN gri). Fix: `parents[3]` + yol pin testi.
+      DERS: dosya taşımasında __file__-göreli yolları MUTLAKA yeniden denetle.
+- [x] **B-097:** yeni `core/drivers/__init__` eager `.workers` importu → `import
+      core.drivers.camera_feed` (numpy-only modül) matplotlib+skimage+tüm bilim yığınını
+      çekip ~0.7s'e çıktı; ui2 shim'leri de regresyonu miras aldı. Fix: PEP 562 lazy
+      __getattr__ (ui2/__init__ kalıbı) + hafiflik subprocess testi.
+- [x] Relocation test dosyası 7 teste çıktı; registry B-096/B-097.
+
+---
+
+## ui2 EMEKLİ — 2026-07-06 (kullanıcı onayı: "kaldır")
+
+- [x] **DPG sunum katmanı silindi** (13 modül: app/theme/image_panel/surface/widgets/dialogs/
+      device_panel/ai_panel/ai_bridge/ai_panel_state/line_profile_state/ui_state/wcag) +
+      `run_ui2.py`. Git geçmişinden geri getirilebilir. dearpygui zaten ne requirements'ta
+      ne venv'deydi (testler stub'luyordu — ui2 bu ortamda çalışamıyordu bile).
+- [x] **Kalanlar**: `ui2/__init__` (emeklilik notu), `ui2/state_store.py` (kalıcı ayarlar +
+      DONMUŞ v1..v10 migration'ları — disk-uyumluluğunun tek kaynağı), 3 driver shim'i.
+- [x] **Test triage**: 7 salt-DPG dosyası + test_v21y_ui_polish silindi; v209'un WCAG bölümü
+      ve test_scalebar'ın DPG testi kesildi; 5 karışık dosya paralel agent'larla cerrahî
+      ayıklandı — **51 driver/state testi korundu** (reffree gating, preset persistence,
+      migration'lar, ROI, QPI halving), 48 DhmApp testi kaldırıldı. Preset kapsamı ui3
+      recon_panel testlerinde yaşıyor (doğrulandı).
+- [x] **Registry**: silinen DPG koduna pinli 7 tarihsel kayıt (B-011/026/028/031/057/060/067)
+      not düşülerek manual'a çevrildi — düzeltilen kod silindiği için gerileyemezler.
+- [x] CHANGELOG'a emeklilik bölümü eklendi.
+- [x] Tam süit: **1194 PASS, 0 FAIL, 11 skip** (238 DPG testi emekliyle gitti).
+      Registry: 97 kayıt, FAIL=0.
+
+---
+
+## 3-Versiyon Denetimi — 2026-07-08 (kullanıcının en baştaki hedefi kapandı)
+
+Kullanıcı: "bu programın başka versionları da var... daha sonra diğerlerini de inceleriz."
+Julia + Phyton, Hybrid'e karşı 6-ajanlı workflow ile denetlendi (5 okuyucu + skeptik sentez).
+
+**Soyağacı:** Phyton = orijinal PySide6 app (Hybrid'in atası) AMA çekirdeği juliacall RPC shim'i
+(gerçek fizik Julia CoreModule'de); Julia = Phyton'un yarım-kalmış deneysel portu (~360 satır);
+Hybrid = keeper, neredeyse temiz üst-küme. Kararlar: Hybrid keep-active / Julia archive-dead /
+Phyton salvage-then-archive. Detay: Obsidian [[DHM-Version-Audit-Phyton-Julia-Hybrid]].
+
+**Salvage: 10 ham aday → 3 elemeyi geçti:**
+- [x] **B-098 (do-now):** Phyton'un düz-eğri/non-finite autofocus teşhisi Hybrid'in çıplak
+      `autofocus_zscan`'ine taşındı. Mis-parametrede sessiz argmax-of-noise yerine artık
+      `focus_landscape_warning()` → `AutoFocusResult.warning` (raise değil, en-iyi tahmin korunur)
+      → worker→FocusPanel "warn" statü + ⚠. 8 test. Flatness mantığı Hybrid'de zaten vardı ama
+      yalnız adaptive_distance_search'te.
+- [ ] **backlog (task-chip):** spectrum-tıkla +1-order merkez override (ui3 hook; çekirdek hazır).
+- [ ] **backlog (task-chip):** gerçek USAF-1951 seti (data/220825, zaten repoda, kullanılmıyor)
+      → regresyon testi. Hybrid şimdiye dek yalnız sentetik round-trip doğruladı.
+- [x] skip (6): Julia kernel tweak'leri, MAD spike, endpoint-nudge, export-crop — hepsi ya
+      zaten karşılanıyor ya marjinal.
+
+**KORU:** `Hybrid/data/220825` — üç versiyondaki tek gerçek çekilmiş korpus + fizik ground-truth.
+
+Süit: **1202 PASS, 0 FAIL, 11 skip**. Registry: 98 kayıt, FAIL=0.
+
+---
+
+## Version-audit backlog kapandı — 2026-07-08 (iki task-chip)
+
+- [x] **B-099 — Spectrum-tıkla +1-order merkez override (ui3).** Çekirdek `center_yx`'i kabul
+      ediyordu ama 3 OffAxisParams çağrı yerinin HİÇBİRİ ReconParams'tan geçirmiyordu + alan
+      yoktu. Fix: `ReconParams.offaxis_center` + tek `_offaxis_params()` helper (reconstruct/
+      qpi/autofocus+depth); ui3 spectrum-viewport tıklama (Process ▸ Pick +1 order, tek-atım,
+      crosshair marker+cursor) → param + yeniden-reconstruct + Reset-to-auto; tuple kalıcı. 10 test.
+- [x] **Gerçek USAF-1951 regresyon testi** (`tests/test_real_usaf_reconstruction.py`, `slow`,
+      veri yoksa skip). Config türetildi: kamera pikseli 3.45µm @ z=43mm ASM → orijinal-app
+      referansına korr **0.71** (300mm'de 0.56, odak-duyarlı); yalnız genlik (USAF genlik hedefi,
+      faz korr 0.04 → assert edilmedi); + gerçek-veri ASM round-trip 9.8e-7 + off-axis +1-tespit
+      sağlaması. `data/220825` (75MB) artık load-bearing korpus.
+
+---
+
+## Version-audit salvage — 2026-07-08 devam (B-100 + kalanların değerlendirmesi)
+
+- [x] **B-100 — default 'robust' path'inde flat/non-finite uyarısı ölüydü.** Audit'in
+      "HIGH confidence" salvage'ı (flat-curve tanısı) aslında ZATEN vardı (B-098,
+      `focus_landscape_warning`) — ama driver `getattr(core_result,'warning',None)` yaptığı
+      için yalnız linear zscan taşıyordu; settled default 'robust' (B-095) + coarse_to_fine/
+      golden/adaptive hep None dönüyordu → yanlış-parametreli run default path'te hâlâ SESSİZCE
+      dejenere oluyordu. Kök-neden fix: `_landscape_warning()` helper her aramanın tuttuğu
+      landscape'ten hesaplıyor (robust → uniform coarse_z/coarse_scores; golden/coarse_to_fine
+      landscape tutmaz, adaptive trace non-uniform → false-positive'i önlemek için bilinçli None).
+      5 yeni test (uçtan-uca robust dahil). Körü körüne port etseydim mevcut mantığı çoğaltır,
+      asıl boşluğu kaçırırdım — doğrulama kazandırdı.
+
+### Kalan salvage adayları — DEĞERLENDİRİLDİ, kullanıcı kararına bırakıldı (silent-fix YOK)
+- **Evanescent decay (ASM kernel, physics, medium-conf):** Julia `exp(-|Im(kz)|·|z|)` uyguluyor;
+  Hybrid radicand'ı 0'a clamp'leyip evanescent bandı H≈1 geçiriyor. AMA asıl NaN-büyüme bug'ı
+  Hybrid'de zaten çözülü (|H|≤1 clamp, reconstruction.py:99-105). Bu bir *iyileştirme* (yüksek-NA/
+  büyük-z'de gürültü sızıntısı), bug değil. ASM çekirdeği 1200+ testin bağlı olduğu taç mücevher →
+  medium-conf bir refinement için dokunmak riskli. **Öneri: ayrı, dikkatli bir oturumda + physics_verify ile.**
+- **Endpoint-avoidance nudge (trivial, medium):** audit'in kendisi `adaptive_distance_search`'ün
+  "asıl çözüm" olduğunu not ediyor → linear path'e marjinal katkı. Düşük öncelik.
+- **MAD impulse rejection (small, low):** audit "Hybrid'in phase-domain metrikleri + reference
+  division zaten z~0 spike'ına bağışık mı, doğrula" diyor → önce doğrulama gerek, düşük güven.
+- **mod(phase,2π) before exp (trivial, low):** complex64 precision mikro-iyileştirme; ölçülebilir
+  etki kanıtı yok. Düşük öncelik.
+
+---
+
+## CLAUDE.md-lens review — 2026-07-08 ("uygulamayı yeni claude.md'ye göre elden geçir")
+
+7 alt-sistem finder × CLAUDE.md lensi (silent-degrade / kök-neden / uydurma-API / staff-bar)
+→ her bulguya 2 çürütücü → **sentez** aşaması (find→verify→SENTEZ; kullanıcı düzeltmesi).
+10 onaylı + 2 belirsiz → 4 sistemik desen. Baskın risk: normal-görünüp niceliksel YANLIŞ üreten
+silent-degrade ailesi (özellikle reference-düzeltmesinin 3 bağımsız yoldan sessizce atlanması).
+
+### fix_now — DÜZELTİLDİ (B-101..B-107, 8 test, süit yeşil)
+- [x] **B-101 (SECURITY):** LLM sample_id path-traversal → charset guard (state-dir kaçışı kapandı).
+- [x] **B-102:** ReconPanel "referans yüklenmedi" uyarısı info satırıyla eziliyordu → else branch.
+- [x] **B-103:** coarse_to_fine golden fine-fazına roi_bounds geçmiyordu (ROI autofocus tam-kare
+      optimize ediyordu) → forward edildi.
+- [x] **B-104:** state reference_path (Path) round-trip'te düşüp mode="reference" kalıyordu
+      (sessiz referanssız QPI) → Path str olarak kalıcı + load'da Path'e coerce.
+- [x] **B-105:** _extract_evaluations robust'un total_evaluations'ını okumuyordu (default algo
+      eval sayısını ~yarı raporluyordu) → total_evaluations de onurlandırılıyor.
+- [x] **B-106:** depth cluster segmentasyon swallow'u log'suzdu → _LOG.exception eklendi.
+- [x] **B-107:** headless recon summary phase_std_rad emit ediyordu; timelapse extractor phase_std
+      okuyor (MCP timelapse faz-drift sinyalini sessizce kaybediyordu) → unsuffixed alias'lar.
+
+### flag_for_decision — "devam" ile net olanlar DÜZELTİLDİ, gerçek-karar olanlar bekliyor
+- [x] **B-108 (qpi.py:371):** compute_cell_morphology n_sample==n_medium'da hardcoded Δn=0.043
+  (default kontrast) uyduruyordu → guard'lı kardeş `opd_to_height`'e bağlandı (Δn≈0→raise +
+  tek-kaynak). compute_qpi'nin log'suz bare-except'i WARNING'e çevrildi (uncertain-2 kapandı). 2 test.
+- [x] **B-109 (camera_feed.py):** AcquisitionThread hata kanalı yoktu → additive `on_error`
+  callback + CameraPanel signal/slot (error status/toast + kontrolleri "stopped"a resetler). 2 test.
+### "hepsini yapalım sırayla" — 3 gerçek-karar maddesi de DÜZELTİLDİ
+- [x] **B-110 (workers reference-division runtime-surfacing):** aile'nin 3. yolu (config B-102,
+  persistence B-104, bu = runtime). `_extract_field_with_reference` + `_prepare_sample_and_ref_fields`
+  artık actionable not döndürüyor; ReconResult.reference_note (reconstruct), `_prepare_field` 4-tuple
+  → AutofocusResult.warning (`_join_notes` ile birleşik) / QPI / QPIBatch / MultiFocus / DepthMapWrap
+  .warning; shell recon handler + qpi/depth/focus panellerinde warn status+toast. Referans runtime'da
+  patlarsa artık "başarılı" boyanmıyor. 6 test.
+- [x] **B-111 (auto_select_metric):** peaksiz (monoton/kenar) metrik eğri-yüksekliğiyle ~1.0 puanlanıp
+  gerçek-peak'li metriği yeniyordu → peaksiz=0.0 (güvenilirlik==prominence). Blast-radius küçük
+  (yalnız v1-GUI opt-in "auto-select" toggle'ı; B-095 default path'i değil — doğrulandı). 1 test.
+- [x] **B-112 (observe cell_count):** `segment_cell_phase` binary+keep-largest olduğu için count
+  yapısal 0/1'di (çok-hücre → AI'ya "1 hücre"). Doğrulandı GERÇEK (uncertain haklıymış). Fix: observe
+  kendi threshold+connected-component label'ı (speck-filtresiyle) → gerçek sayı; dry mass tüm hücreler
+  üzerinden. 1 test (mevcut testi ==2'ye güçlendirdim).
+- **Sonuç: `flag_for_decision`'ın 5 maddesi de kapandı** (B-108/109 + B-110/111/112). Sessiz-fix yok —
+  hepsi verify-önce (B-111 blast-radius, B-112 "gerçekten binary mi").
+
+---
+
+## ui3 gerçek-ekran UX turu — 2026-07-10 (kullanıcı: "arayüzde çok hata var")
+
+Kullanıcının gerçek oturumunu screenshot'layarak teşhis (offscreen'de görünmüyorlardı — bug'lar
+RESTORE edilmiş state + native render + tab davranışındaydı). İmleçle interaktif doğrulandı.
+
+- [x] **B-113** — 8 panel scroll-area'da değildi (içerik kırpılıyordu) + dialog'lar konumsuz açılıyordu
+  (üst-üste). Fix: QScrollArea wrap + `present_centered` (parent'a ortalı + cascade).
+- [x] **B-114** — hologram yükleme sonrası ReconPanel "(no hologram loaded)" kalıyordu → `_load_path`
+  panel label'ını refresh ediyor.
+- [x] **B-115** — `restoreState` bayat/uyumsuz dock-layout'unu geri yükleyip dock'ları merkezi grid'in
+  üstüne yüzdürüyordu → `_LAYOUT_VERSION` damgası (uyuşmazsa layout atlanır, temiz düzen).
+- [x] **B-116** — float edilen dock'u geri koymanın yolu yoktu ("çıkardım kaldı öyle") → "Reset panel
+  layout" komutu (View menü + ⇧⌘0 + palette): un-float + eve dock.
+- [x] **B-117** — 8 dock tek gruba tabify + mode'un sadece setVisible'ı → Qt tab-bar'ı bozuluyor
+  (Analyse'da sadece Autofocus render, qpi/depth/ai ulaşılamaz "arkada"). Fix: mode-geçişinde görünen
+  dock'ları tek temiz tab grubuna YENİDEN tabify + tab bar üste (North). Canlı doğrulandı: Analyse'da
+  "Autofocus|QPI|Depth|AI copilot" tab bar'ı, tıkla-geç çalışıyor.
+- İki şey kullanıcının kasıtlı eylemiydi (bug değil): sarı tema (high_contrast — geri alındı) ve dock'u
+  incelemek için float etmesi (çıkış-yolu B-116 ile eklendi).
+- **Ana ders (lessons.md):** offscreen test, RESTORE edilmiş kullanıcı state'ini ve native render'ı
+  kanıtlamaz; state/tema/tab-bağımlı UI bug'ları için gerçek oturumu gör. Ve kullanıcı-ayarını "bug"
+  sanıp izinsiz değiştirme.
+
+---
+
+## ui3 görsel polish — 2026-07-10 (kullanıcı: "testleri yap, arayüzü toparla iğrenç olmasın")
+
+- [x] **Testler** — full suite 1253 passed / 11 skipped / 0 fail; ui3 spine 12/12; yeni B-118 testi geçiyor.
+- [x] **B-118** — QSpinBox/QDoubleSpinBox/QComboBox okları boş açık-gri kare olarak render ediliyordu
+  (parametre panellerini ucuz/bitmemiş gösteren görsel gürültü). Kök neden: QSS'te web CSS
+  border-üçgen hilesi (width:0 + border renkleri) kullanılıyordu — Qt bunu üçgen olarak ÇİZMEZ, native
+  bloğu çizer. İzole bir widget harness'inde ampirik doğrulandı: (a) border-hilesi kare çiziyor,
+  (b) `image:url(data:...)` HİÇBİR ŞEY render etmiyor (Qt URL'yi dosya yolu sanıyor), (c) gerçek PNG
+  dosyası net üçgen çiziyor. Fix: `design._ensure_arrow_icons()` paletin muted renginde up/down/chevron
+  PNG'leri çiziyor (Retina için 2x logical boyutta), renk+şekil-versiyonuna göre
+  `~/.dhm-reconstruction/icons` altında cache'liyor; `build_qss` bunları `image:url()` ile referanslıyor.
+  Sadece QApplication varken çalışır; headless (test) width:0 oka düşer, asla boş kareye değil.
+  Doğrulandı: offscreen (dark + high_contrast) + 2x DPR (Retina) → net üçgenler.
+- Kullanıcının canlı app'ı ESKİ stylesheet'te (disk state'inin ilerisinde in-memory workflow_mode=Analyse)
+  → oturumunu bozmamak için izinsiz restart etmedim; tema/param'lar persist ediyor, polish bir sonraki
+  açılışta gelecek.
+- **Kapsam-dışı, raporlandı (fix yok):** her panel adı 3 kez görünüyor (tab → dock title bar → panel
+  içi büyük başlık). Panel'ler hem dock hem standalone dialog olarak kullanılıyor (`as_dock` flag) —
+  başlığı kaldırmak dialog modunu bozar; bu bir tasarım refactor'ü, polish kapsamı değil.
+
+### Çok-ajanlı polish denetimi (ultracode) — 2026-07-10
+
+Arayüzün TÜM yüzeyleri offscreen render edildi (4 mod, 9 dock, 4 dialog, 4 tema),
+sonra 10 paralel ajan (5 görsel + 5 kod) her yüzeyi taradı; her bulgu adversaryel
+DOĞRULAMADAN geçti (default-reject + "sarı tema kullanıcının kasıtlı seçimi, bug değil"
+guard'ı). 56 ham → 38 doğrulanmış (8 medium, 30 low). find→verify→sentez.
+
+**Düzeltilenler (görünür, doğrulandı):**
+- **B-119** — Advanced grubu: (1) collapsed'ken boş çerçeve çiziyordu (her açılışta orphan
+  frame), (2) HC temada checkbox indicator'ı görünmüyordu (QGroupBox::indicator stillenmemiş).
+  Fix: `[collapsed]` property + repolish → çerçevesiz disclosure satırı; QGroupBox::indicator
+  QSS'i (tüm temalarda görünür). Dark+HC doğrulandı.
+- **B-120** — QPI batch tabloları (dock + dialog) Stretch ile başlıkları ortadan kırpıyordu
+  ("DRY MASS"→"RY MASS", "OPD"→"IPD"). Fix: ResizeToContents + stretchLastSection. Başlıklar tam.
+- **B-121** — recon/qpi/report hata toast'ları `toast(msg,"danger")` çağırıyordu ama ToastHost
+  level'ları info/ok/warn/error; "danger" tanınmayıp mavi 'accent'e düşüyordu → hata toast'ları
+  KIRMIZI değil maviydi. 6 çağrı "error"a çevrildi (denetim sadece report'u bulmuştu; grep ile
+  recon+qpi de bulundu).
+- **B-122** — AI health pill hep muted gri; connected/unavailable/checking renk ayırt etmiyordu.
+  Fix: QLabel[role=ok|warn|danger] + `_set_health(text,role)` repolish helper'ı.
+- **B-123** (batch) — dosya adı iki kez (header caption kaldırıldı, panelin "Hologram" grubu tek
+  kaynak), "Timelapse"/"Time-lapse" → "Time-lapse", 📎 emoji kaldırıldı, QSplitter::handle stillendi
+  (grid ayraçları), camera Stop → danger rolü, busy_label → muted rolü.
+- **#5** — light temada beyaz "500 µm" ölçek yazısı okunmuyordu (beyaz-üstüne-açık) → koyu backing
+  pill (viewport.py); her temada okunur.
+- **#7** — Reconstruct kontrol dock'u scroll-wrap edilmemişti (uzun panel kısa pencerede alt
+  butonları kırpıyordu, B-113 feature dock'ları için yapmıştı ama bunu atlamıştı) → QScrollArea.
+- **#8** — surface_viewer GL arka planı hardcoded (20,20,20); 2D viewport'lar palette.view_bg
+  kullanıyor → ctx.palette.view_bg (tema-duyarlı, fallback koyu).
+
+**Reddedilen (doğrulamada elendi / ben doğruladım):**
+- **#2** (spinbox okları recon'da "kopuk") — YANLIŞ POZİTİF. recon alanları qpi ile yapısal olarak
+  aynı (düz QDoubleSpinBox + aynı global QSS); pikselleri kendim inceledim, oklar entegre. Ajan
+  divider çizgisini "boşluk" sanmış. Reddedildi.
+
+**Kapsam-dışı, RAPORLANDI (bilinçli ertelendi):**
+- Heading redundancy (#10/#17/#21, LOW): dock title bar + panel içi büyük H1 aynı adı tekrarlıyor.
+  MİMARİ: panel'ler hem dock hem standalone dialog olarak kullanılıyor (`as_dock`), dialog modunda
+  H1 tek başlık. Global kaldırmak dialog'ları bozar; dock-modu-özel bir heading-gizle seam'i gerek.
+  Kullanıcı kararı gereken bir tasarım tercihi — polish kapsamında tek taraflı yapmadım.
+- Token/tutarlılık mikro-item'ları (#24 min-height 22vs20, #25 eyebrow 3 farklı, #26/#31 margin=10,
+  #28 form spacing, #34 label hizası, #35 pointSize): görünür etkisi ~sıfır, layout-shift riski var.
+  Ayrı bir kod-tutarlılık turu için erteledim.
+- #12 (form label L/R hizası), #13 (enum "LAPLACIAN_VARIANCE" ham gösterim), #15 (AI endpoint alanı
+  URL'yi soldan kırpıyor), #19 (device Open/closed büyük-küçük), #20 (Z-ekseni boş grid hücresi),
+  #32 (device section pattern): minör/subjektif/orta-risk, ertelendi.
+- #14 (toast köşede kırpık): offscreen animasyon artefaktı (grab animasyon ortasını yakaladı), gerçek değil.
+
+**Testler:** full suite 1260 passed / 11 skipped / 0 fail. 6 yeni polish testi (B-119..123) + B-118.
+Registry 118→123.
+
+### Ertelenen 2 follow-up tamamlandı — 2026-07-11
+
+Kullanıcı iki task-chip prompt'unu yapıştırdı → ikisini de bu oturumda yaptım (ayrı session değil).
+
+- **B-125 — panel adı tekrarı (dedup):** her feature panel adını 3 kez gösteriyordu (tab + dock
+  title bar + büyük H1 heading). Araştırma: HİÇBİR panel as_dock=False mount edilmiyor, `_panel_action`
+  docked panelleri dock olarak açıyor → hepsinin dock title bar'ı var. Fix: `mount_panel` +
+  `_build_control_dock` → `_hide_panel_heading(widget)` (tek role="heading" label'ı gizler). Title
+  bar/tab tek etiket; panel başına ~40px dikey alan geri kazanıldı. Standalone QDialog'lar
+  (surface/qpi_batch/audit) mount_panel'den geçmediği için başlıklarını KORUYOR. Test + doğrulandı
+  (recon/ai/qpi dock'ta heading yok; qpi_batch dialog'ta "QPI batch…" duruyor).
+- **B-126 — magic-number tokenizasyonu:** (a) input min-height 22 / button 20 → ikisi Space.xl (24);
+  (b) viewport başlık `setPointSize(10)` → ölçtüm (10pt==13px) → `setPixelSize(Type.label)` (boyut
+  korundu); (c) camera/focus root margin 10 → Space.md (12, recon konvansiyonu); (d) camera/focus
+  form label sağ-hizası override'ı kaldırıldı → hepsi platform-default (mac+offscreen tutarlı).
+  **Alınmayan 2 madde (gerekçeyle):** #28 (form spacing 6→8) uzun kontrol panelini ~50px büyütüp
+  B-124 fit işini bozardı; #25 (3 farklı "eyebrow" QSS'i birleştir) — üç kullanım padding/border/weight
+  olarak ayrışıyor, ortak kural fayda getirmeden dolaylılık ekler.
+- Not: iki task-chip "started" işaretli olduğu için dismiss edilemedi (prompt'u buraya yapıştırmak
+  başlatmış sayılıyor) — iş burada tamamlandı, ayrı session'a gerek yok.

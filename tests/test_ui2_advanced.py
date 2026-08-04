@@ -1,13 +1,13 @@
 """Tests for v2.0.5 polish work: advanced pre-processing, error
 drawer bounded log, maximize-panel state, migration v5→v6.
+
+DPG/DhmApp tests removed 2026-07-06 with the ui2 frontend retirement; driver/state tests kept.
 """
 from __future__ import annotations
 
 import json
 import sys
-import types
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -15,62 +15,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-
-# ---------------------------------------------------------------------------
-# Dear PyGui stub (kept local so the file runs in isolation)
-# ---------------------------------------------------------------------------
-
-def _install_dpg_stub():
-    if "dearpygui" in sys.modules:
-        return
-    dpg = types.ModuleType("dearpygui.dearpygui")
-    for k in ["mvKey_O","mvKey_R","mvKey_K","mvKey_Slash","mvKey_Escape",
-              "mvKey_LShift","mvKey_RShift","mvKey_LControl","mvKey_RControl",
-              "mvKey_LSuper","mvKey_RSuper","mvKey_0","mvKey_1","mvKey_2",
-              "mvKey_3","mvKey_4","mvXAxis","mvYAxis","mvAll",
-              "mvThemeCol_WindowBg"]:
-        setattr(dpg, k, 0)
-    for name in [
-        "create_context","create_viewport","setup_dearpygui","show_viewport",
-        "set_primary_window","is_dearpygui_running","render_dearpygui_frame",
-        "destroy_context","stop_dearpygui","add_dynamic_texture","set_value",
-        "get_value","configure_item","delete_item","add_menu_item","add_text",
-        "add_button","add_combo","add_input_text","add_input_float",
-        "add_input_int","add_checkbox","add_spacer","add_separator",
-        "add_plot_axis","add_image_series","add_file_extension","bind_theme",
-        "add_theme_color","add_theme_style","focus_item","show_item",
-        "fit_axis_data","get_item_parent","get_item_label",
-        "get_viewport_client_width","get_viewport_client_height",
-        "set_viewport_drop_callback","set_viewport_resize_callback",
-        "add_key_press_handler","add_item_clicked_handler",
-        "bind_item_handler_registry","is_key_down","add_line_series",
-    ]:
-        setattr(dpg, name, MagicMock(return_value=None))
-    dpg.does_item_exist = MagicMock(return_value=False)
-
-    class _CM:
-        def __enter__(self): return 0
-        def __exit__(self, *a): return False
-    dummy_cm = MagicMock(return_value=_CM())
-    for name in ["theme","theme_component","texture_registry","window",
-                 "child_window","group","menu","file_dialog",
-                 "handler_registry","item_handler_registry",
-                 "viewport_menu_bar","plot","tooltip","plot_axis",
-                 "collapsing_header"]:
-        setattr(dpg, name, dummy_cm)
-    dpg.last_item = MagicMock(return_value="last")
-
-    parent = types.ModuleType("dearpygui")
-    parent.dearpygui = dpg
-    sys.modules["dearpygui"] = parent
-    sys.modules["dearpygui.dearpygui"] = dpg
-
-
-_install_dpg_stub()
-
 from core.settings_schema import SCHEMA_VERSION, AppSettings  # noqa: E402
 from ui2 import state_store  # noqa: E402
-from ui2.app import DhmApp  # noqa: E402
 from ui2.reconstruction import ReconParams  # noqa: E402
 
 
@@ -125,68 +71,6 @@ def test_roundtrip_preserves_advanced_fields(tmp_state):
 
 
 # ---------------------------------------------------------------------------
-# Error drawer bounded log
-# ---------------------------------------------------------------------------
-
-def _fake_app() -> DhmApp:
-    app = DhmApp.__new__(DhmApp)
-    app._error_log = []
-    app._ERROR_LOG_CAP = DhmApp._ERROR_LOG_CAP
-    return app
-
-
-def test_error_log_appends_entries():
-    app = _fake_app()
-    app._append_error("warn", "minor hiccup")
-    app._append_error("danger", "segfault")
-    assert len(app._error_log) == 2
-    # Entry shape: (timestamp_str, level, message)
-    assert app._error_log[0][1] == "warn"
-    assert app._error_log[1][2] == "segfault"
-
-
-def test_error_log_cap_holds_most_recent():
-    app = _fake_app()
-    app._ERROR_LOG_CAP = 5
-    for i in range(20):
-        app._append_error("warn", f"msg {i}")
-    assert len(app._error_log) == 5
-    messages = [e[2] for e in app._error_log]
-    # Most recent should be kept; first 15 evicted.
-    assert messages[0] == "msg 15"
-    assert messages[-1] == "msg 19"
-
-
-def test_error_log_clear_wipes():
-    app = _fake_app()
-    app._append_error("warn", "a")
-    app._append_error("warn", "b")
-    # _refresh_error_drawer is dpg-backed; stub no-ops so clear path
-    # just needs ``does_item_exist`` → False to short-circuit.
-    app._clear_error_log()
-    assert app._error_log == []
-
-
-# ---------------------------------------------------------------------------
-# _to_uint8 utility used by batch export
-# ---------------------------------------------------------------------------
-
-def test_to_uint8_normalises_range():
-    arr = np.linspace(-1.0, 3.5, 100, dtype=np.float32).reshape(10, 10)
-    u8 = DhmApp._to_uint8(arr)
-    assert u8.dtype == np.uint8
-    assert u8.min() == 0
-    assert u8.max() == 255
-
-
-def test_to_uint8_handles_constant_array():
-    """Constant input mustn't divide by zero — result is all zeros."""
-    arr = np.full((8, 8), 0.7, dtype=np.float32)
-    u8 = DhmApp._to_uint8(arr)
-    assert (u8 == 0).all()
-
-
-# ---------------------------------------------------------------------------
 # Advanced pre-processing — hann_window and subtract_mean flow through
 # ---------------------------------------------------------------------------
 
@@ -218,38 +102,3 @@ def test_hann_window_dims_match_array():
     # Corners should be ~0 (Hann boundary), centre should be ~1.
     assert arr[0, 0] == pytest.approx(0.0, abs=1e-3)
     assert arr[arr.shape[0] // 2, arr.shape[1] // 2] > 0.9
-
-
-# ---------------------------------------------------------------------------
-# Maximize panel state — tag list points at expected panels
-# ---------------------------------------------------------------------------
-
-def test_panel_tags_emit_four_entries():
-    """_panel_tags returns exactly four entries (Input/Amp/Phase/Info)
-    so Ctrl+1-4 maps 1:1 to panel index 0-3."""
-    app = DhmApp.__new__(DhmApp)
-    # Minimal panel objects with container_tag populated.
-    app.panel_input = MagicMock(container_tag="panelbox_a")
-    app.panel_amp = MagicMock(container_tag="panelbox_b")
-    app.panel_phase = MagicMock(container_tag="panelbox_c")
-    tags = app._panel_tags()
-    assert len(tags) == 4
-    assert tags[0] == "panelbox_a"
-    assert tags[1] == "panelbox_b"
-    assert tags[2] == "panelbox_c"
-    assert tags[3] == "info_panel"  # hardcoded container tag
-
-
-def test_maximize_out_of_range_is_noop():
-    app = DhmApp.__new__(DhmApp)
-    app.panel_input = MagicMock(container_tag="a")
-    app.panel_amp = MagicMock(container_tag="b")
-    app.panel_phase = MagicMock(container_tag="c")
-    app._preview_size = 400
-    app._maximized_panel = None
-    app._toasts = MagicMock()
-    app._set_status = MagicMock()
-    # Out-of-range should return without crashing or toasting.
-    app._maximize_panel(99)
-    assert app._maximized_panel is None
-    app._set_status.assert_not_called()

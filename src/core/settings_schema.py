@@ -33,7 +33,11 @@ from typing import Any
 # physics for microscope setups. Backfill old dumps with M=1, pixel
 # assumed effective (matches v2.0.1 behaviour on existing state files).
 # v11 → v12: add AIDefaults — local-LLM assistant configuration.
-SCHEMA_VERSION = 12
+# v12 → v13: add reference_mode + reffree_bg_method/order/n_terms/cnn
+# to Ui2State (Phase 3, AI_VISION_MCP_PLAN.md). No-op stamp — every
+# new field has a default that reproduces pre-Phase-3 behaviour, so
+# the migrator only bumps the version number.
+SCHEMA_VERSION = 13
 
 
 @dataclass
@@ -164,7 +168,9 @@ class Ui2State:
     af_z_max_mm: float = 25.0
     af_n_steps: int = 40
     # v2.0.8: autofocus algorithm — adaptive search restored from v1.
-    af_algorithm: str = "zscan"
+    # 2026-07-06: default pinned to "robust" on the real-lab benchmark
+    # (see ReconParams.af_algorithm comment / docs/AUTOFOCUS_ADAPTIVE.md).
+    af_algorithm: str = "robust"
     # v2.0.9: display-only image flips. 180° default (both axes
     # True) matches the lab camera + DPG axis-inversion empirical
     # result. Persisted here so the operator's preference survives
@@ -196,6 +202,16 @@ class Ui2State:
     optical_mode: str = "transmission"
     # Display polish — percentile contrast stretch on amplitude.
     auto_contrast_amplitude: bool = True
+    # v13 (Phase 3, AI_VISION_MCP_PLAN.md): three-way reference mode +
+    # reference-free background-fit knobs. Default "off" + the
+    # subtract_reference flag above are reconciled by
+    # ``ReconParams.effective_reference_mode()`` so state files written
+    # before this field existed keep behaving exactly as they did.
+    reference_mode: str = "off"
+    reffree_bg_method: str = "zernike"
+    reffree_bg_order: int = 4
+    reffree_n_terms: int = 15
+    reffree_cnn: bool = False
 
 
 @dataclass

@@ -269,22 +269,56 @@ veriyi gözden geçir.
 
 ## Kayıt akışı
 
-`scripts/ai_training_examples.py` şu an **20 seed örnek** üretiyor. Lab-spesifik
-verini eklemenin en hızlı yolu:
+`scripts/ai_training_examples.py` 2026-04-28 itibarıyla **100 training + 15 holdout
+örnek** üretiyor (lab profili: HeNe 632.8 nm + 50× obj + USAF/RBC/E.coli/Bacillus).
+Stage tool'ları (8) ve device tool'ları (9) motorize hardware bağlanana kadar
+training schema'sından dışlanıyor; aktif tool sayısı **11**.
 
-1. `data/ai/training_examples.jsonl` üret (script çalıştır).
-2. Aynı dosyaya kendi örneklerini **yeni satır olarak append** et.
-3. Veya `scripts/ai_training_examples.py:build_examples` fonksiyonuna
-   yeni örnek tuple'ları ekle ve registry'den tool schema'yı bedavadan
-   embed ettir.
+Lab-spesifik veri eklemenin en temiz yolu:
 
-İkinci yol daha temiz çünkü tool registry değişirse senin örneklerin de
-otomatik sync olur (yeniden çalıştırınca güncel schema'yla yazılır).
+1. `python scripts/ai_training_examples.py` ile JSONL'i üret (training + holdout).
+2. `build_examples` çağırdığı 9 kategori fonksiyonundan birine yeni örnek ekle
+   — `_chain_examples`, `_lab_specific_examples`, vb. Her fonksiyon kendi başına
+   liste döndürür, dağılım kolayca dengelenir.
+3. Tool registry değişirse (yeni tool eklenir / silinir / yeniden adlandırılır),
+   otomatik sync olur — schema'lar canlı `build_tool_registry()` çağrısından
+   embed ediliyor.
+
+Hardware geri açma:
+```bash
+# Motorize stage takıldığında:
+python scripts/ai_training_examples.py --include-stage
+# Device hardware (shutter, LED, acquire_grid) bağlandığında:
+python scripts/ai_training_examples.py --include-stage --include-devices
+```
 
 ---
 
+## Mevcut dağılım (2026-04-28 baseline)
+
+| Kategori | Hedef | Mevcut | Notlar |
+|---|---|---|---|
+| 1. Tool selection | 15 | **15** | 11 aktif tool tek-call eşleme + set/run ayrımı |
+| 2. Argument formatting | 10 | **10** | λ=632.8, M=50, n_sample/n_medium per sample |
+| 3. Multi-tool chains | 25 | **25** | RBC, E. coli, Bacillus, USAF, bead full pipeline'lar |
+| 4. Self-correction | 8 | **8** | range swap, enum case, prerequisite recovery |
+| 5. Refusal & safety | 5 | **5** | path-traversal, internet, settings reset, stage |
+| 6. Domain language | 15 | **15** | TR ↔ EN: dalga boyu, AF, kuru kütle, eritrosit, kok |
+| 7. Conversational style | 12 | **12** | kısa + sayılı + sonraki adım önerili |
+| 8. Negative | 5 | **5** | Cellpose, colormap, Excel, FastAPI, pyplot |
+| 9. Lab-spesifik | 5 | **5** | USAF kalibrasyon, RBC dry mass, E. coli, bead, Bacillus |
+| **Holdout (eval)** | 15 | **15** | ayrı dosya: `eval_holdout.jsonl` |
+| **Toplam** | **115** | **115** | |
+
+Stage hardware bağlanınca planlanan ek 15-20 örnek (`stage_focus_search`,
+`map_sample_grid`, `goto_cell`, `record_timelapse` zincirleri) — hardware
+gelene kadar askıda.
+
 ## İlgili dosyalar
 
-- [scripts/ai_training_examples.py](../scripts/ai_training_examples.py) — JSONL üretici (20 seed örnek)
-- [docs/AI_FINETUNE.md](AI_FINETUNE.md) — Pipeline (Modelfile / LoRA) kurulumu
+- [scripts/ai_training_examples.py](../scripts/ai_training_examples.py) — JSONL üretici, 9 kategori fonksiyonu + holdout
+- [scripts/finetune_lora.py](../scripts/finetune_lora.py) — Pipeline B (LoRA) eğitim script'i
+- [Modelfile.dhm-copilot](../Modelfile.dhm-copilot) — Pipeline A (Ollama Modelfile)
+- [tests/test_ai_finetune_eval.py](../tests/test_ai_finetune_eval.py) — holdout eval framework, 4 metrik
+- [docs/AI_FINETUNE.md](AI_FINETUNE.md) — Pipeline kurulumu (A: Modelfile, B: LoRA)
 - [src/core/ai/tool_impls.py](../src/core/ai/tool_impls.py) — tool schema'larının kaynağı

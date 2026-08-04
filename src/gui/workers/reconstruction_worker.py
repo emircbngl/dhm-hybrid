@@ -235,10 +235,8 @@ class ReconstructionWorker(QThread):
         ref_complex = job.get("reference_complex")
         if ref_complex is None:
             return recon_complex
-        ref_abs = np.abs(ref_complex)
-        safe_ref = np.where(ref_abs > 1e-10, ref_complex,
-                            np.ones_like(ref_complex))
-        out = recon_complex / safe_ref
+        from core.reconstruction import safe_reference_divide
+        out = safe_reference_divide(recon_complex, ref_complex)
         log.info("[RECON]  ref_sub:    %.3fs", time.perf_counter() - t0)
         return out
 

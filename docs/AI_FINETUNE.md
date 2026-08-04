@@ -19,7 +19,9 @@ Fine-tune'u şu durumlarda düşün:
 
 ```bash
 python scripts/ai_training_examples.py
-# yazılan: data/ai/training_examples.jsonl  (12 örnek, 14 tool schema embed)
+# yazılan:
+#   data/ai/training_examples.jsonl   (100 örnek, 11 aktif tool)
+#   data/ai/eval_holdout.jsonl        ( 15 örnek, holdout — ASLA train'a koyma)
 ```
 
 Üretilen dosya OpenAI fine-tune formatında — her satır bir konuşma:
@@ -30,13 +32,37 @@ python scripts/ai_training_examples.py
  "tools":[{"type":"function","function":{"name":"...","parameters":{...}}}, ...]}
 ```
 
-**Lab-spesifik genişletme** için: `scripts/ai_training_examples.py:build_examples`
-fonksiyonuna kendi senaryolarını ekle. Her örnek base'in zayıf olduğu yerleri
-hedefle (yanlış z aralığı seçen, yanlış metric kullanan, Türkçe terim kullanan
-prompt'ları yakala).
+### Lab profili (2026-Q2 baseline)
+
+Training örnekleri şu konfigürasyona göre kalibre — değişirse
+`scripts/ai_training_examples.py:LAB_PROFILE` sabitini güncelle ve regenerate et:
+
+| Parametre | Değer |
+|---|---|
+| Işık kaynağı | HeNe λ=632.8 nm |
+| Objektif | 50× air immersion (NA ~0.55–0.80) |
+| Pixel pitch | 3.45 µm (Basler-class sensor) |
+| Tipik z propagation | 0–15 mm |
+| Sample inventory | USAF 1951, polystyrene bead, RBC, E. coli, Bacillus, Staph, Pseudo, Lacto |
+| Operatör dili | Türkçe prose + İngilizce/sayısal tool args |
+
+### Stage / device hardware askıda
+
+Motorize stage + programlı shutter/LED henüz bağlı değil. Training
+schema'sından **17 hardware tool'u dışlandı** (8 stage + 9 device).
+Aktif tool sayısı **11**. Hardware geldikçe:
+
+```bash
+python scripts/ai_training_examples.py --include-stage              # motor takıldı
+python scripts/ai_training_examples.py --include-stage --include-devices  # shutter/LED de
+```
+
+Lab-spesifik genişletme için `build_examples`'in çağırdığı 9 kategori
+fonksiyonundan birine örnek ekle — dağılım hedefleri için
+[AI_FINETUNE_DATA.md](AI_FINETUNE_DATA.md) §"8 Veri Kategorisi"'ye bak.
 
 Hedef sayı: **50–200 örnek**. Daha az → underfit. Daha çok → over-narrow,
-modelin genel yeteneği düşer.
+modelin genel yeteneği düşer. Mevcut: **100 train + 15 holdout = 115**.
 
 ---
 
@@ -45,31 +71,29 @@ modelin genel yeteneği düşer.
 Base model'in üzerine **system prompt + few-shot örnekler** koyar; gerçek
 weight güncelleme olmaz. 30 saniyede uygulanır, lab'da hemen test edilir.
 
+Hazır Modelfile [Modelfile.dhm-copilot](../Modelfile.dhm-copilot)'da — lab profili
+(HeNe 632.8 + 50× + sample inventory) zaten gömülü:
+
 ```bash
-# 1. Modelfile yaz (örnek)
-cat > Modelfile <<'EOF'
-FROM qwen2.5:7b-instruct
+# 1. Base model'i indir (bir kez, ~4.7 GB)
+ollama pull qwen2.5:7b-instruct
 
-SYSTEM """You are the AI co-pilot for the Lindqvist Lab DHM platform. You
-prefer Turkish replies but tool arguments stay in English/numeric. You know
-the lab uses 532 nm and 10× / 40× objectives by default."""
+# 2. dhm-copilot tag'ini yarat
+ollama create dhm-copilot -f Modelfile.dhm-copilot
 
-PARAMETER temperature 0.2
-PARAMETER num_ctx 8192
+# 3. AI panel ayarlarında model_name → "dhm-copilot"; endpoint aynı.
 
-# Kısa, ölçülmüş örnekler (Modelfile MESSAGE direktifleri)
-MESSAGE user "Günlük kontrol başlat"
-MESSAGE assistant "Anladım — sırasıyla load, AF, recon ve QPI çalıştırıyorum."
-EOF
-
-# 2. Yerel modeli yarat
-ollama create dhm-copilot -f Modelfile
-
-# 3. AI panel ayarlarında modeli "dhm-copilot" yap; endpoint aynı kalır.
+# Geri al:
+ollama rm dhm-copilot
 ```
 
-**Avantajı**: 30 saniye, GPU yok, geri alma trivial (`ollama rm dhm-copilot`).
+**Avantajı**: 30 saniye, GPU yok, geri alma trivial.
 **Dezavantajı**: Yeni davranış değil — sadece prompt-time bias.
+
+[Modelfile.dhm-copilot](../Modelfile.dhm-copilot) içeriği:
+- SYSTEM prompt: lab profili + sample n_sample/n_medium tablosu + Türkçe yanıt kuralı
+- 5 MESSAGE few-shot anchor: USAF kalibrasyon, RBC QPI, stage refusal, Cellpose refusal, range swap self-correction
+- PARAMETER: `temperature=0.2`, `num_ctx=8192`, `top_p=0.9`
 
 ---
 
@@ -81,53 +105,29 @@ Apple Silicon'da çalışır (Mac Studio M2 Ultra: 50 örnek için ~15 dk).
 ### Kurulum
 
 ```bash
-pip install transformers>=4.46 trl>=0.12 peft>=0.13 datasets>=3.0 accelerate
+pip install -r requirements_finetune.txt
 ```
 
-### Eğitim script'i (`scripts/finetune_lora.py`)
+İçeriği: `transformers>=4.46`, `trl>=0.12`, `peft>=0.13`, `datasets>=3.0`,
+`accelerate>=1.0`. Detay: [requirements_finetune.txt](../requirements_finetune.txt).
 
-```python
-from datasets import load_dataset
-from peft import LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import SFTConfig, SFTTrainer
+### Eğitimi koş
 
-MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-DATA_PATH = "data/ai/training_examples.jsonl"
+Hazır script [scripts/finetune_lora.py](../scripts/finetune_lora.py)'de —
+lab profili sabitleri + auto-detected backend (CUDA / MPS / CPU):
 
-tok = AutoTokenizer.from_pretrained(MODEL_ID)
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
-
-# Apple Silicon: device_map={"": "mps"} ekle. CUDA: "auto" yeter.
-ds = load_dataset("json", data_files=DATA_PATH, split="train")
-
-trainer = SFTTrainer(
-    model=model,
-    tokenizer=tok,
-    train_dataset=ds,
-    args=SFTConfig(
-        output_dir="out/dhm-copilot-lora",
-        num_train_epochs=3,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
-        learning_rate=2e-4,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.1,
-        logging_steps=5,
-        save_strategy="epoch",
-        bf16=True,           # MPS için "fp16=True" yap
-        dataset_text_field=None,   # SFTTrainer messages'ı otomatik render eder
-        max_seq_length=4096,
-    ),
-    peft_config=LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05,
-        target_modules=["q_proj","k_proj","v_proj","o_proj"],
-        bias="none", task_type="CAUSAL_LM",
-    ),
-)
-trainer.train()
-trainer.save_model("out/dhm-copilot-lora/final")
+```bash
+python scripts/finetune_lora.py
+# → out/dhm-copilot-lora/final/  (LoRA adapter weights)
 ```
+
+Default hyperparameter'lar (script'in başında belge edilmiş):
+- LoRA `r=16`, `alpha=32`, `dropout=0.05`, target `q/k/v/o_proj`
+- 3 epochs, batch=1, grad_accum=8, `lr=2e-4` cosine + 10% warmup
+- `max_seq_length=4096`, MPS'de fp16 / CUDA'da bf16
+
+Override etmek için CLI flag'ler: `--epochs`, `--lr`, `--lora-r`,
+`--device`, `--out`. Tam liste için `--help`.
 
 ### Ollama'ya import et
 
@@ -155,29 +155,38 @@ AI panel ayarlarında `model_name` → `dhm-copilot-tuned`. Endpoint aynı.
 
 ## Eval — fine-tune'un işe yarayıp yaramadığını ölç
 
-`tests/test_ai_finetune_eval.py` (henüz yok, eğitim yapacaksak yazarız) için
-basit pattern:
+[tests/test_ai_finetune_eval.py](../tests/test_ai_finetune_eval.py) hazır —
+holdout'tan 15 senaryoyu okur, modelden cevap ister, 4 metrik ölçer:
 
-```python
-HOLDOUT = [
-    ("Hologramı yükle ve odakla -25 ile +25 mm arasında",
-     [("load_hologram",), ("find_focus_candidates",)]),
-    ("Sample.tif'i aç recon at sonra QPI çıkar",
-     [("load_hologram",), ("run_reconstruction",), ("run_qpi",)]),
-    # 20-30 senaryo
-]
+| Metrik | Eşik | Test fonksiyonu |
+|---|---|---|
+| Tool selection accuracy | ≥ 95 % | `test_tool_selection_accuracy` |
+| Argument schema validity | ≥ 95 % * | `test_argument_schema_validity` |
+| Refusal correctness | = 100 % | `test_refusal_correctness` |
+| Chain-end has summary | ≥ 80 % | `test_chain_end_has_summary` |
 
-def test_finetuned_calls_expected_tools(client):
-    for prompt, expected_chain in HOLDOUT:
-        events = list(agent.run(prompt, ...))
-        called = [e.payload["call"].name for e in events
-                  if e.kind == "tool_call_start"]
-        for (expected,) in expected_chain:
-            assert expected in called
+\* AI_FINETUNE_DATA.md'de %98 yazıyor; biz holdout'a bilinçli olarak
+self-correction case'leri (lowercase enum → server reject → düzeltme)
+koyduğumuz için %95 daha realistic.
+
+```bash
+# Smoke (FakeLLMClient — referans cevabı replay eder; harness wiring testi)
+pytest tests/test_ai_finetune_eval.py -v
+
+# Real eval (lokal Ollama'ya karşı)
+DHM_EVAL_LLM_ENDPOINT=http://localhost:11434 \
+DHM_EVAL_LLM_MODEL=dhm-copilot \
+pytest tests/test_ai_finetune_eval.py -v
+
+# Yazdırılabilir rapor (pytest dışında)
+DHM_EVAL_LLM_ENDPOINT=http://localhost:11434 \
+DHM_EVAL_LLM_MODEL=dhm-copilot-tuned \
+python tests/test_ai_finetune_eval.py
 ```
 
-**Başarı eşiği**: holdout'ta tool zinciri %95+ doğru. Bu altına düşerse
-fine-tune verisini gözden geçir, üzerine çıkarsa ship.
+**Başarı eşiği**: dört metriğin hepsi yeşil. Biri düşerse fine-tune verisini
+gözden geçir; arg validity %90'ın altına düşerse training data'da yapısal
+bir hata var demektir (yanlış enum kullanan örnekler vs).
 
 ---
 

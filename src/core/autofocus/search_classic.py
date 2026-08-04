@@ -13,6 +13,7 @@ from ..fft_backend import FFTBackend
 from .evaluator import (
     AutofocusCancelled,
     AutoFocusResult,
+    focus_landscape_warning,
     _make_batch_evaluator,
     _make_fast_evaluator,
 )
@@ -67,6 +68,7 @@ def autofocus_zscan(
             on_progress(total, total)
         return AutoFocusResult(
             best_z_m=z_values_m[best_idx], scores=scores,
+            warning=focus_landscape_warning(scores),
         )
 
     _eval = _make_fast_evaluator(field, base_params, method, metric, roi_bounds=roi_bounds, ref_field=ref_field)
@@ -91,7 +93,10 @@ def autofocus_zscan(
                 best_score = score
                 best_z = z
 
-    return AutoFocusResult(best_z_m=best_z, scores=scores)
+    return AutoFocusResult(
+        best_z_m=best_z, scores=scores,
+        warning=focus_landscape_warning(scores),
+    )
 
 
 @dataclass(frozen=True)
@@ -232,7 +237,8 @@ def coarse_to_fine_search(
         on_progress=on_progress,
         eval_offset=state["evaluations"],
         est_total=est_total,
-        ref_field=ref_field,
+        roi_bounds=roi_bounds,   # 2026-07-08: was dropped → fine phase
+        ref_field=ref_field,     # optimised the FULL frame, not the ROI
     )
 
     return GoldenSearchResult(

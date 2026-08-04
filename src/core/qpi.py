@@ -116,6 +116,10 @@ def opd_to_refractive_index(
 #   General cell:  0.18  (default, protein-dominated)
 DEFAULT_ALPHA = 0.18e-6  # m³/kg  (= 0.18 mL/g in SI)
 
+# HeNe — the lab's default illumination. Only used as a fallback when a
+# caller computes phase-from-OPD without passing the true wavelength.
+DEFAULT_WAVELENGTH_M = 632.8e-9
+
 
 def compute_dry_mass_density(
     opd_m: np.ndarray,
@@ -325,6 +329,7 @@ def compute_cell_morphology(
     n_sample: float = 1.38,
     n_medium: float = 1.337,
     alpha: float = DEFAULT_ALPHA,
+    wavelength_m: float = DEFAULT_WAVELENGTH_M,
 ) -> CellMorphology:
     """
     Compute full cell morphology from OPD + binary mask.
@@ -337,6 +342,8 @@ def compute_cell_morphology(
     n_sample : average cell refractive index (default 1.38 for mammalian cells)
     n_medium : medium refractive index (default 1.337 for culture medium)
     alpha : specific refractive increment
+    wavelength_m : illumination wavelength — needed to convert OPD back to
+                   phase for the mean_phase_rad / phase_std_rad fields.
 
     Returns: CellMorphology dataclass with all parameters.
     """
@@ -355,14 +362,14 @@ def compute_cell_morphology(
     # Area
     area_um2 = n_pixels * px_area_um2
 
-    # Height
-    dn = n_sample - n_medium
-    if abs(dn) > 1e-12:
-        h_m = opd_cell / dn
-        h_nm = h_m * 1e9
-    else:
-        h_nm = opd_cell * 1e9 / 0.043  # fallback dn~0.043
-        h_m = h_nm * 1e-9
+    # Height — needs a real refractive-index contrast. Route through the
+    # guarded sibling opd_to_height (single source of truth) which RAISES
+    # for Δn≈0 rather than inventing height/volume from a hardcoded
+    # Δn=0.043. When n_sample==n_medium the caller is signalling "contrast
+    # unknown", and fabricating one silently produced fake max/mean height +
+    # volume presented as physically real (2026-07-08 review, B-108).
+    h_m = opd_to_height(opd_cell, n_sample=n_sample, n_medium=n_medium)
+    h_nm = h_m * 1e9
 
     max_height_nm = float(np.max(h_nm))
     mean_height_nm = float(np.mean(h_nm))
@@ -414,8 +421,11 @@ def compute_cell_morphology(
         aspect_ratio = 1.0
         eccentricity = 0.0
 
-    # Phase statistics
-    phase_cell = opd_m[cell_mask] * (2 * np.pi)  # back to radians approx
+    # Phase statistics — OPD → phase is φ = 2π·OPD/λ (inverse of
+    # phase_to_opd). The old code multiplied by 2π only, dropping the /λ,
+    # which made mean_phase_rad / phase_std_rad ~1e6× too small and
+    # dimensionally wrong (2026-07-05 review).
+    phase_cell = opd_cell * (2 * np.pi / wavelength_m)
     mean_phase = float(np.mean(phase_cell))
     phase_std = float(np.std(phase_cell))
 
@@ -667,11 +677,8 @@ def subtract_reference_wave(
 
     Returns: corrected complex field.
     """
-    ref_abs = np.abs(reference_field)
-    # Avoid division by zero in low-signal regions
-    safe_ref = np.where(ref_abs > 1e-10, reference_field,
-                        np.ones_like(reference_field))
-    return complex_field / safe_ref
+    from core.reconstruction import safe_reference_divide
+    return safe_reference_divide(complex_field, reference_field)
 
 
 def correct_background_phase(
@@ -1003,11 +1010,20 @@ def compute_qpi(
             mask = segment_cell_phase(opd_m, threshold_factor=cell_threshold)
             result.cell_mask = mask
             result.cell_morph = compute_cell_morphology(
-                opd_m, pixel_size_m, mask, n_sample, n_medium, alpha
+                opd_m, pixel_size_m, mask, n_sample, n_medium, alpha,
+                wavelength_m=wavelength_m,
             )
             result.total_dry_mass_pg = result.cell_morph.dry_mass_pg
-        except Exception:
-            # Segmentation may fail on non-cell samples
+        except Exception as exc:
+            # Segmentation may legitimately fail on non-cell samples, and
+            # morphology now RAISES when the refractive-index contrast is
+            # unknown (Δn≈0). Dry mass doesn't need contrast, so fall back to
+            # the whole-field integral — but LOG the reason so a real crash
+            # or a missing-contrast run isn't indistinguishable from a normal
+            # cell measurement (2026-07-08 review; was a silent bare except).
+            logger.warning("cell morphology unavailable (%s: %s) — dry mass "
+                           "computed from the whole-field integral instead",
+                           type(exc).__name__, exc)
             result.total_dry_mass_pg = compute_dry_mass_total(
                 opd_m, pixel_size_m, alpha
             ) * 1e15

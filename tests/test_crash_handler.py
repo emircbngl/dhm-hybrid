@@ -54,6 +54,13 @@ def crash_dir(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_install_writes_dump_for_main_thread(crash_dir, restore_hooks):
+    # Pin a benign prior hook: the handler correctly CHAINS to whatever was
+    # installed before it, and under this test runner that is pytest-qt's
+    # exception capture (active since pytest-qt entered the env with ui3),
+    # which turns the chained call into a false "Exceptions caught in Qt
+    # event loop" failure. Chaining itself is covered by
+    # test_install_chains_to_previous_hook (2026-07-06, B-084).
+    sys.excepthook = lambda *exc: None
     crash_handler.install_crash_handler()
     try:
         raise RuntimeError("boom from main")
@@ -107,6 +114,11 @@ def test_keyboard_interrupt_not_persisted(crash_dir, restore_hooks):
 # ---------------------------------------------------------------------------
 
 def test_threading_hook_captures_worker_crash(crash_dir, restore_hooks):
+    # Pin benign prior hooks — see test_install_writes_dump_for_main_thread.
+    # The threading chain otherwise lands in pytest's threadexception
+    # capture and false-fails the test (2026-07-06, B-084).
+    sys.excepthook = lambda *exc: None
+    threading.excepthook = lambda args: None
     crash_handler.install_crash_handler()
     crash_handler.install_threading_excepthook()
 
@@ -152,6 +164,9 @@ def test_crash_also_emits_audit_record(crash_dir, restore_hooks,
     monkeypatch.setattr(audit_mod, "_AUDIT_DIR", audit_dir)
     monkeypatch.setattr(audit_mod, "_SINGLETON", None)
 
+    # Pin a benign prior hook — see test_install_writes_dump_for_main_thread
+    # (2026-07-06, B-084).
+    sys.excepthook = lambda *exc: None
     crash_handler.install_crash_handler()
     try:
         raise RuntimeError("auditable crash")

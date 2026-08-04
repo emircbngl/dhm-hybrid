@@ -160,6 +160,50 @@ class BatchRenderDialog(QDialog):
         out_box.addWidget(self.save_imag)
         layout.addWidget(outputs_group)
 
+        # ─── Reference Pairing ───
+        # Lab convention: each sample <name>.<ext> ships with <name>_ref.<ext>
+        # (or ref_<name>.<ext>) acquired without the sample. When this is
+        # ticked the renderer auto-discovers the sibling for every job and
+        # uses it for reference division. Off by default-on so a user who
+        # didn't intend the convention isn't surprised by side files getting
+        # picked up — but it's just a checkbox flip away.
+        ref_group = QGroupBox("Reference Hologram")
+        ref_layout = QVBoxLayout(ref_group)
+        self.auto_pair_ref = QCheckBox(
+            "Auto-load paired reference (\"<name>_ref\" or \"ref_<name>\" sibling)"
+        )
+        self.auto_pair_ref.setChecked(True)
+        self.auto_pair_ref.setToolTip(
+            "When enabled, the renderer looks for a sibling reference next to "
+            "each sample (case-insensitive ‘ref’ prefix or suffix, '_' or '-' "
+            "separator) and uses it for reference division. Reference files in "
+            "the input directory are skipped from the job list. Disable if "
+            "your filenames coincidentally contain ‘ref’."
+        )
+        ref_layout.addWidget(self.auto_pair_ref)
+        layout.addWidget(ref_group)
+
+        # ─── Resume / Skip ───
+        # Re-running a batch over a directory that's been partially
+        # processed before should be cheap. When this is ticked the
+        # renderer skips any job whose expected output files already
+        # exist — saves wall-clock when the user cancelled mid-batch and
+        # resumed, or when the input dir grew and they just want the
+        # new files processed.
+        resume_group = QGroupBox("Resume Behaviour")
+        resume_layout = QVBoxLayout(resume_group)
+        self.skip_existing = QCheckBox(
+            "Skip files whose outputs already exist"
+        )
+        self.skip_existing.setChecked(False)
+        self.skip_existing.setToolTip(
+            "When enabled, jobs whose amplitude/phase TIFFs already sit "
+            "in the output folder are skipped. Use to resume a "
+            "cancelled batch without redoing finished frames."
+        )
+        resume_layout.addWidget(self.skip_existing)
+        layout.addWidget(resume_group)
+
         # ─── Controls ───
         ctrl_layout = QVBoxLayout()
         
@@ -241,6 +285,8 @@ class BatchRenderDialog(QDialog):
             "save_unwrapped_pha": self.save_unwrapped_pha.isChecked(),
             "save_real": self.save_real.isChecked(),
             "save_imag": self.save_imag.isChecked(),
+            "auto_pair_reference": self.auto_pair_ref.isChecked(),
+            "skip_existing": self.skip_existing.isChecked(),
             "active_state": active_state
         }
         self.start_batch_requested.emit(cfg)

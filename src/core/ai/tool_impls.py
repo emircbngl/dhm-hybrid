@@ -13,8 +13,9 @@ Stage tools talk to ``ctx.stage`` (a :class:`MockStage` in v1).
 
 The ``build_tool_registry`` factory at the bottom registers all 19
 canonical tools (10 pipeline + 4 stage + 5 sprint-2 workflows) plus
-the v2.1.z device family (shutter / led / orchestrator) when the
-panel supplies the corresponding ``ctx.shutter`` / ``ctx.led`` /
+5 observation/vision tools (Phase 1b, core.observe wiring) plus the
+v2.1.z device family (shutter / led / orchestrator) when the panel
+supplies the corresponding ``ctx.shutter`` / ``ctx.led`` /
 ``ctx.orchestrator`` hooks. Call it from the panel to build the
 registry the agent will use; pass ``include_devices=False`` to
 opt out of the device tools entirely.
@@ -22,7 +23,11 @@ opt out of the device tools entirely.
 from __future__ import annotations
 
 import logging
+import re
 import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -672,6 +677,14 @@ def _tool_map_sample_grid(ctx: ToolContext, args: dict) -> dict:
         return {"error": "step_mm must be positive"}
 
     sample_id = str(args.get("sample_id", "")) or "sample"
+    # sample_id becomes a filename in persist_sample_map
+    # (state_dir/{sample_id}.json). It comes straight from the LLM, so reject
+    # anything outside a safe stem — otherwise '../../..' escapes the state
+    # dir and can overwrite arbitrary user-writable JSON. Mirrors the
+    # validate_path guard the load path already enforces (2026-07-08 review).
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", sample_id) or sample_id in (".", ".."):
+        return {"error": "invalid sample_id",
+                "details": "use 1-64 chars from [A-Za-z0-9._-], no path separators"}
     skip_recon = bool(args.get("skip_recon", False))
 
     xs = np.arange(x0, x1 + 1e-9, step).tolist()
@@ -1372,17 +1385,240 @@ def _tool_stage_stop(ctx: ToolContext, args: dict) -> dict:
 
 
 # ===========================================================================
+# 29–33. Observation / "vision" tools — thin wrappers over core.observe
+# ===========================================================================
+#
+# These delegate all the actual number-crunching to the Qt-free
+# ``core.observe`` module (see docs/AI_VISION_MCP_PLAN.md, Phase 1).
+# The handlers here only: pull the right array off
+# ``ctx.get_last_field``, pull physical params off the state snapshot,
+# and shape the result into the dispatch-friendly ``{"error": ...}``
+# pattern the rest of this file uses. ``ctx.get_last_field`` /
+# ``ctx.set_reference_mode`` are optional hooks — ``None`` means the
+# hosting frontend hasn't wired observation support, which is reported
+# as a normal tool error rather than a crash.
+
+_INSPECT_RECONSTRUCTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target": {
+            "type": "string",
+            "enum": ["recon_complex"],
+            "description": "Which cached field to inspect. Only "
+                           "'recon_complex' (the latest reconstructed "
+                           "complex field) is supported.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def _tool_inspect_reconstruction(ctx: ToolContext, args: dict) -> dict:
+    if ctx.get_last_field is None:
+        return {"error": "observation hooks not wired in this frontend"}
+    target = str(args.get("target", "recon_complex"))
+    field = ctx.get_last_field(target)
+    if field is None:
+        return {"error": f"no {target!r} available yet — run a "
+                          "reconstruction first"}
+    from core import observe
+    return observe.inspect_reconstruction(field)
+
+
+_INSPECT_PHASE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "segment": {"type": "boolean",
+                    "description": "Run cell segmentation + dry-mass "
+                                   "(default true)."},
+        "n_sample": {"type": "number", "minimum": 1.0, "maximum": 2.0},
+        "n_medium": {"type": "number", "minimum": 1.0, "maximum": 2.0},
+    },
+    "additionalProperties": False,
+}
+
+
+def _tool_inspect_phase(ctx: ToolContext, args: dict) -> dict:
+    if ctx.get_last_field is None:
+        return {"error": "observation hooks not wired in this frontend"}
+    field = ctx.get_last_field("phase_unwrapped")
+    if field is None:
+        return {"error": "no phase_unwrapped available yet — run "
+                          "reconstruction + unwrap first"}
+
+    # Physical params come from the current recon_params snapshot —
+    # the same values the sidebar shows — converted to SI. We
+    # deliberately don't re-derive an "effective pixel size" here
+    # (magnification handling is the recon pipeline's job); whatever
+    # the snapshot reports is what we use, and args can override.
+    snap = ctx.state()
+    recon_params = getattr(snap, "recon_params", {}) or {}
+    kwargs: dict = {}
+    wavelength_nm = recon_params.get("wavelength_nm")
+    if wavelength_nm is not None:
+        kwargs["wavelength_m"] = float(wavelength_nm) * 1e-9
+    pixel_um = recon_params.get("pixel_um")
+    if pixel_um is not None:
+        kwargs["pixel_size_m"] = float(pixel_um) * 1e-6
+    if "n_sample" in args:
+        kwargs["n_sample"] = clamp("n_sample", args["n_sample"])
+    if "n_medium" in args:
+        kwargs["n_medium"] = clamp("n_medium", args["n_medium"])
+    kwargs["segment"] = bool(args.get("segment", True))
+
+    from core import observe
+    return observe.inspect_phase_map(field, **kwargs)
+
+
+_INSPECT_FIELD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target": {
+            "type": "string",
+            "enum": ["recon_complex", "raw"],
+            "description": "Which cached field to histogram. Default "
+                           "'recon_complex'.",
+        },
+        "bins": {"type": "integer", "minimum": 8, "maximum": 64},
+    },
+    "additionalProperties": False,
+}
+
+
+def _tool_inspect_field(ctx: ToolContext, args: dict) -> dict:
+    if ctx.get_last_field is None:
+        return {"error": "observation hooks not wired in this frontend"}
+    target = str(args.get("target", "recon_complex"))
+    field = ctx.get_last_field(target)
+    if field is None:
+        return {"error": f"no {target!r} available yet"}
+    # "bins" has no NUMERIC_BOUNDS entry — the JSON schema's 8..64
+    # min/max already gates it before the handler runs.
+    bins = int(args.get("bins", 16))
+    from core import observe
+    return observe.inspect_field(field, bins=bins)
+
+
+_RENDER_VIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["amplitude", "phase", "spectrum", "depth", "raw"],
+        },
+        "target": {
+            "type": "string",
+            "enum": ["recon_complex", "phase_unwrapped", "raw", "depth"],
+            "description": "Which cached array to render. Defaults to "
+                           "a sensible target for `kind` (depth→'depth', "
+                           "phase→'recon_complex' unless phase_unwrapped "
+                           "is requested explicitly, else 'recon_complex').",
+        },
+    },
+    "required": ["kind"],
+    "additionalProperties": False,
+}
+
+# Renders are written here rather than returned as base64 — the local
+# 8k-context copilot model would choke on an inline image payload.
+# Module-level so tests can monkeypatch it to a tmp_path.
+_RENDER_DIR = Path.home() / ".dhm-reconstruction" / "renders"
+
+
+def _tool_render_view(ctx: ToolContext, args: dict) -> dict:
+    if ctx.get_last_field is None:
+        return {"error": "observation hooks not wired in this frontend"}
+    kind = str(args["kind"])
+    default_target = "depth" if kind == "depth" else "recon_complex"
+    target = str(args.get("target", default_target))
+
+    field = ctx.get_last_field(target)
+    if field is None:
+        return {"error": f"no {target!r} available yet"}
+
+    snap = ctx.state()
+    recon_params = getattr(snap, "recon_params", {}) or {}
+    pixel_size_um = recon_params.get("pixel_um")
+
+    from core import observe
+    try:
+        png_bytes = observe.render_view(
+            field, kind,
+            pixel_size_um=float(pixel_size_um) if pixel_size_um else None,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    _RENDER_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    # uuid suffix: two renders in the same microsecond must not
+    # silently overwrite each other.
+    out_path = _RENDER_DIR / f"{ts}_{uuid.uuid4().hex[:6]}_{kind}.png"
+    out_path.write_bytes(png_bytes)
+
+    shape = list(np.asarray(field).shape[:2])
+    return {"ok": True, "path": str(out_path), "kind": kind, "shape": shape}
+
+
+_SET_RECONSTRUCTION_MODE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["off", "reference", "reference_free"],
+        },
+        "bg_method": {
+            "type": "string",
+            "enum": ["zernike", "polynomial"],
+        },
+        "bg_order": {"type": "integer", "minimum": 1, "maximum": 20},
+        # Optional path to a reference hologram. Required to arm "reference"
+        # mode on a headless/MCP session (no file dialog); in-app frontends
+        # may instead pre-load one via their own UI and omit this.
+        "reference_path": {"type": "string"},
+    },
+    "required": ["mode"],
+    "additionalProperties": False,
+}
+
+
+def _tool_set_reconstruction_mode(ctx: ToolContext, args: dict) -> dict:
+    if ctx.set_reference_mode is None:
+        return {"error": "reference mode control not wired in this frontend"}
+    payload: dict = {"mode": str(args["mode"])}
+    if "bg_method" in args:
+        payload["bg_method"] = str(args["bg_method"])
+    if "bg_order" in args:
+        # "bg_order" has no NUMERIC_BOUNDS entry — the JSON schema's
+        # 1..20 min/max already gates it before the handler runs.
+        payload["bg_order"] = int(args["bg_order"])
+    if "reference_path" in args:
+        # Same validation gate as load_hologram: existing, allowed image
+        # extension, and (by default) confined to the user's home tree.
+        restrict = bool(getattr(ctx.settings, "restrict_to_home", True))
+        ref = validate_path(
+            args["reference_path"],
+            must_exist=True,
+            allowed_extensions=ALLOWED_HOLOGRAM_EXTENSIONS,
+            restrict_to_home=restrict,
+        )
+        payload["reference_path"] = str(ref)
+    return ctx.set_reference_mode(payload)
+
+
+# ===========================================================================
 # Registry factory
 # ===========================================================================
 
 def build_tool_registry(*, include_devices: bool = True) -> ToolRegistry:
     """Construct a :class:`ToolRegistry` with the DHM tools.
 
-    Default registers 19 canonical tools (10 pipeline + 4 stage + 5
-    sprint-2) plus the v2.1.z device family (shutter / led /
-    list_devices / acquire_grid) → 23 total. Pass
-    ``include_devices=False`` to skip the device tools when the
-    panel hasn't wired ``ctx.shutter`` / ``ctx.led`` / ``ctx.orchestrator``.
+    Default registers 24 canonical tools (10 pipeline + 4 stage + 5
+    sprint-2 + 5 observation/vision) plus the v2.1.z+ device family
+    (list_devices, shutter ×3, led ×4, acquire_grid, APT-style stage
+    ×7 = 16 tools) → 40 total. Pass ``include_devices=False`` to skip
+    the device tools when the panel hasn't wired ``ctx.shutter`` /
+    ``ctx.led`` / ``ctx.orchestrator``.
 
     Called once per panel construction. Re-registration is rejected by
     the registry so each call returns a fresh instance.
@@ -1547,6 +1783,59 @@ def build_tool_registry(*, include_devices: bool = True) -> ToolRegistry:
                     "drift across the recording.",
         parameters=_RECORD_TIMELAPSE_SCHEMA,
         handler=_tool_record_timelapse,
+    ))
+
+    # ---- Observation / vision (Phase 1b, core.observe wiring) ----------
+    reg.register(ToolSpec(
+        name="inspect_reconstruction",
+        description="Structured readout of the latest reconstructed complex "
+                    "field: focus scores (Laplacian variance, Tenengrad), "
+                    "amplitude contrast, phase-gradient RMS, and a plain-"
+                    "language verdict. Use this to judge 'is this recon any "
+                    "good?' without looking at a picture.",
+        parameters=_INSPECT_RECONSTRUCTION_SCHEMA,
+        handler=_tool_inspect_reconstruction,
+    ))
+    reg.register(ToolSpec(
+        name="inspect_phase",
+        description="Structured readout of the latest unwrapped phase map: "
+                    "phase/OPD statistics (min/max/mean/percentiles), peak-to-"
+                    "valley, and (optionally) cell segmentation count + total "
+                    "dry mass. Uses the current sidebar wavelength/pixel size "
+                    "unless overridden.",
+        parameters=_INSPECT_PHASE_SCHEMA,
+        handler=_tool_inspect_phase,
+    ))
+    reg.register(ToolSpec(
+        name="inspect_field",
+        description="Coarse amplitude/phase histograms and dynamic range of "
+                    "a cached field ('recon_complex' or 'raw'). Use this to "
+                    "spot bimodal amplitude (object vs background) or a "
+                    "clipped phase distribution.",
+        parameters=_INSPECT_FIELD_SCHEMA,
+        handler=_tool_inspect_field,
+    ))
+    reg.register(ToolSpec(
+        name="render_view",
+        description="Render a cached array (amplitude/phase/spectrum/depth/"
+                    "raw) to a PNG file on disk and return its path. Does "
+                    "NOT return image bytes/base64 — the local copilot model "
+                    "can't see images and a large payload would blow its "
+                    "context; a vision-capable MCP client can open the file "
+                    "at the returned path.",
+        parameters=_RENDER_VIEW_SCHEMA,
+        handler=_tool_render_view,
+    ))
+    reg.register(ToolSpec(
+        name="set_reconstruction_mode",
+        description="Switch how reconstruction handles the reference: "
+                    "'off' (no reference), 'reference' (subtract the loaded "
+                    "reference hologram), or 'reference_free' (background-"
+                    "fit subtraction via bg_method/bg_order, no reference "
+                    "hologram needed). Not every frontend supports every "
+                    "mode — check the returned error if one is rejected.",
+        parameters=_SET_RECONSTRUCTION_MODE_SCHEMA,
+        handler=_tool_set_reconstruction_mode,
     ))
 
     if include_devices:

@@ -166,6 +166,19 @@ class ToolContext:
     shutter: Any = None
     led: Any = None
     orchestrator: Optional[Callable[[dict], dict]] = None
+    # Observation / vision hooks (2026-07-05, core.observe tools).
+    # ``get_last_field(target)`` returns the latest numpy array for
+    # target ∈ {"recon_complex", "phase_unwrapped", "raw", "depth"} or
+    # None when that result doesn't exist yet. Implementations return
+    # the whole-array reference the GUI thread last assigned (arrays are
+    # replaced wholesale, never mutated in place, so a cross-thread read
+    # of the reference is safe). ``None`` → observe tools report
+    # "not available in this frontend".
+    get_last_field: Optional[Callable[[str], Any]] = None
+    # ``set_reference_mode({"mode": "off"|"reference"|"reference_free",
+    # ...bg params})`` switches how reconstruction handles the reference.
+    # Frontends that don't support a mode return {"error": ...}.
+    set_reference_mode: Optional[Callable[[dict], dict]] = None
 
 
 # ---------------------------------------------------------------------------
