@@ -8,8 +8,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-__version__ = "1.0.0"
-__build_date__ = "2026-04-20"
+__version__ = "2.0.0"
+__build_date__ = "2026-08-05"
 __app_name__ = "DHM Reconstruction"
 __vendor__ = "Hybrid Optics"
 
@@ -32,7 +32,7 @@ __git_sha__ = _read_git_sha()
 
 
 def version_string() -> str:
-    """Human-readable one-liner, e.g. 'DHM Reconstruction 1.0.0 (a1b2c3d, 2026-04-20)'."""
+    """Human-readable one-liner, e.g. 'DHM Reconstruction 2.0.0 (a1b2c3d, 2026-08-05)'."""
     return f"{__app_name__} {__version__} ({__git_sha__}, {__build_date__})"
 
 

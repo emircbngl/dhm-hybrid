@@ -3,7 +3,7 @@
 All notable changes to DHM Reconstruction are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), semver.
 
-## [Unreleased] — 2026-07-06: ui3 becomes the v2 frontend; ui2 (Dear PyGui) retired
+## [2.0.0] — 2026-08-05: ui3 becomes the v2 frontend; ui2 (Dear PyGui) retired
 
 ### Changed
 - **ui3 (PySide6 + pyqtgraph) is now the canonical v2 frontend** — built
@@ -30,7 +30,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), semver.
   day (ui3 wiring/ownership, MCP parity, observe scalebar/spectrum,
   moved-venv artefacts, relocation regressions). Suite green throughout.
 
-## [Unreleased] — Track C: reference-free reconstruction (hybrid CNN)
+### Track C — reference-free reconstruction (hybrid CNN)
 
 End-to-end pipeline that removes the need for a reference hologram at
 inference time. A small residual U-Net learns the reproducible
@@ -38,7 +38,7 @@ illumination + sensor + carrier-residual aberration the off-axis
 demodulation pipeline can't fully cancel. See
 [`docs/REFFREE_HYBRID.md`](docs/REFFREE_HYBRID.md).
 
-### Added
+#### Added
 - `scripts/build_synthetic_refs.py` — temporal-median synthetic
   reference per session (handles bacteria-contaminated saved refs).
 - `scripts/build_track_c_dataset.py` — generate `(phi_classical,
@@ -57,7 +57,7 @@ demodulation pipeline can't fully cancel. See
 - `tasks/track_b_pure_dl_notes.md` — what would be needed to graduate
   to a pure end-to-end DL approach (data, architecture, validation).
 
-### Findings (recorded in tasks/lessons.md)
+#### Findings (recorded in tasks/lessons.md)
 - Saved per-session "reference" frames contain bacteria; using them as
   GT pollutes training. Solution: temporal median across all frames in
   a session synthesizes a clean reference (moving bacteria average out).

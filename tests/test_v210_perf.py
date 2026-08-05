@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -87,6 +88,16 @@ def test_default_backend_has_batched_fallback():
     arr = np.random.randn(3, 16, 16).astype(np.complex64)
     out = backend.fft2_batched(arr)
     assert out.shape == arr.shape
+
+
+def test_auto_backend_never_initializes_mlx():
+    """An optional MLX runtime must not make the default CPU path fatal."""
+    with patch("core.fft_backend.PyFFTWBackend", side_effect=ImportError), \
+         patch("core.fft_backend.MLXFFTBackend") as mlx_backend:
+        backend = get_best_fft_backend()
+
+    assert backend.name in {FFTBackendName.SCIPY, FFTBackendName.NUMPY}
+    mlx_backend.assert_not_called()
 
 
 def test_default_backend_supports_batched_false():

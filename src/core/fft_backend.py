@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from functools import lru_cache
+import subprocess
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
@@ -148,6 +151,12 @@ class PyFFTWBackend(FFTBackend):
 class MLXFFTBackend(FFTBackend):
     def __init__(self) -> None:
         super().__init__(name=FFTBackendName.MLX)
+        # ``mlx.core`` can abort the whole interpreter while initialising
+        # Metal (rather than raising an ImportError) on a machine with an
+        # unusable Metal device.  Check it in a child process first so an
+        # unavailable MLX runtime is a recoverable backend-selection error.
+        if not _mlx_runtime_available():
+            raise RuntimeError("MLX/Metal runtime is unavailable")
         import mlx.core as mx
 
         self._mx = mx
@@ -179,6 +188,30 @@ class MLXFFTBackend(FFTBackend):
 
     def from_numpy(self, x: np.ndarray) -> Any:
         return self._mx.array(x)
+
+
+@lru_cache(maxsize=1)
+def _mlx_runtime_available() -> bool:
+    """Return whether this Python environment can initialise MLX safely.
+
+    Importing ``mlx.core`` itself may terminate Python with SIGABRT, which a
+    normal ``try``/``except`` cannot contain.  The explicit MLX backend is
+    therefore probed once in a child process; an abort or timeout simply makes
+    the backend unavailable to the parent process.
+    """
+    probe = "import mlx.core as mx; mx.random.key(0)"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 class TorchFFTBackend(FFTBackend):
@@ -309,19 +342,11 @@ def get_best_fft_backend(prefer: Optional[FFTBackendName] = None) -> FFTBackend:
             except Exception:
                 return NumpyFFTBackend()
 
-    # Default fallback: PyFFTW -> MLX -> Scipy -> NumPy. Torch is
-    # NOT in the default chain because (a) it's an optional heavy
-    # dep and (b) initialising MPS / CUDA at every call site costs
-    # more than running on PyFFTW for typical sub-1024² inputs.
-    # Callers explicitly opt-in via prefer=FFTBackendName.TORCH or
-    # by constructing TorchFFTBackend() directly.
+    # Default fallback: PyFFTW -> Scipy -> NumPy.  MLX and Torch are explicit
+    # opt-ins: both initialise native GPU runtimes, and MLX can terminate the
+    # interpreter while probing an unusable Metal device.
     try:
         return PyFFTWBackend()
-    except Exception:
-        pass
-
-    try:
-        return MLXFFTBackend()
     except Exception:
         pass
 

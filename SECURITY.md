@@ -1,7 +1,7 @@
 # Security Statement — DHM Reconstruction
 
-**Version:** 1.0.0
-**Last updated:** 2026-04-20
+**Version:** 2.0.0
+**Last updated:** 2026-08-05
 **Vendor:** Hybrid Optics
 
 This document describes the security posture of the DHM Reconstruction
@@ -96,9 +96,11 @@ here and will be covered in that audit.
 
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities by email to:
+Please report suspected vulnerabilities through [GitHub Private Vulnerability
+Reporting](https://github.com/emircbngl/dhm-hybrid/security/advisories/new).
 
-**security@hybrid-optics.example**
+Reports are private to repository maintainers. This repository must keep Private
+Vulnerability Reporting enabled in its GitHub security settings.
 
 Include:
 - Affected version (`About` dialog → version + git SHA)
@@ -121,8 +123,8 @@ during use.
 
 ## Code signing / notarization
 
-macOS code signing and Apple notarization are **planned for the v1.1
-release build**. The current v1.0 distribution is unsigned and intended
+macOS code signing and Apple notarization are planned for a post-2.0
+release build. The current v2.0.0 distribution is unsigned and intended
 for internal / lab use. Enterprise deployment and signed distribution
 are tracked separately.
 

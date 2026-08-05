@@ -4,7 +4,7 @@
 
 Point it at an off-axis hologram and it gives you back quantitative phase: the demodulation, the propagation, the focus search, the background fit, and the unwrapping. It runs on Apple Silicon GPUs, and it does the part most tools skip — **reconstruction without a reference hologram**, using a hybrid classical + CNN pipeline.
 
-> **Status:** research software, actively developed. The v1.0.0 core is stable and test-covered; the v2 frontend (`ui3`) and the reference-free pipeline (Track C) are the current work. See [`CHANGELOG.md`](CHANGELOG.md).
+> **Status:** research software, actively developed. Version 2.0.0 ships the `ui3` frontend and the reference-free Track C pipeline; see [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
