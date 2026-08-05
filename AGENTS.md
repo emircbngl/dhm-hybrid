@@ -66,6 +66,28 @@ with SIGABRT on a machine whose Metal device is unusable, and an abort cannot be
 caught. Ask for them by name (`fft_backend: "mlx"` / `"torch"`) — each falls
 back to NumPy if its runtime does not initialise.
 
+## What MLX actually buys (measured, M4)
+
+Complex64 `fft2`, median of 7 runs after warm-up, milliseconds:
+
+| size | numpy | scipy | pyfftw | MLX |
+|---|---|---|---|---|
+| 512 | 1.9 | 0.5 | 0.7 | 0.8 |
+| 1024 | 9.3 | 2.4 | 3.8 | **1.8** |
+| 2048 | 45.0 | 12.9 | 18.4 | **4.8** |
+| 4096 | 238.5 | 77.3 | 81.4 | **16.5** |
+
+MLX is numerically equivalent to numpy to 1e-6 relative (float32), verified by
+round-trip and direct comparison. It **loses below ~1024** — transfer overhead
+dominates — and wins 2.1x at 1024, 3.8x at 2048, 4.9x at 4096. So `mlx` is worth
+opting into for large-frame work and is pointless for small frames.
+
+Two caveats before quoting these numbers:
+- One machine, one run. Reproduce before relying on them.
+- **scipy beat pyfftw at every size here**, yet `auto` tries pyfftw first. That
+  ordering may be wrong on this hardware, or pyfftw may simply not be reusing
+  FFTW plans. Unmeasured either way — worth a look, not yet a change.
+
 ## Drift estimation
 
 `estimate_drift` uses partial phase normalisation (`phase_exponent`, default
