@@ -6,6 +6,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), semver.
 ## [2.0.0] — 2026-08-05: ui3 becomes the v2 frontend; ui2 (Dear PyGui) retired
 
 ### Changed
+- **BREAKING (performance, not API): MLX is no longer selected automatically.**
+  The `fft_backend: "auto"` chain is now PyFFTW -> Scipy -> NumPy. MLX and
+  Torch became explicit opt-ins because importing `mlx.core` can abort the
+  interpreter with SIGABRT on a machine with an unusable Metal device, which a
+  `try`/`except` cannot contain — an optional accelerator must not be able to
+  kill the app on startup. Apple Silicon users who were relying on the MLX FFT
+  path will silently fall back to PyFFTW unless they set `fft_backend: "mlx"`
+  in settings. Nothing about results changes; only which backend computes them.
 - **ui3 (PySide6 + pyqtgraph) is now the canonical v2 frontend** — built
   from scratch at 1:1 feature parity (`docs/UI3_DESIGN.md` coverage
   matrix), entry `run_ui3.py`.

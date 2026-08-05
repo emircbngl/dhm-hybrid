@@ -39,11 +39,12 @@ The residual between Track A and ground truth turned out to be *structured* stri
 | **Batch** | Batch rendering with reference auto-pairing, skip-existing, and byte-parity-tested output naming |
 | **Reporting** | PDF and HTML report export, JSONL audit log, calibration and metadata tracking |
 | **AI / agents** | `dhm_mcp` — a headless **MCP (Model Context Protocol) server** exposing the tool registry, so Claude or any MCP client can run reconstructions without the GUI |
-| **Platform** | Apple Silicon acceleration via **MLX** and Metal; `pyfftw` FFT backend; PySide6 + pyqtgraph desktop UI |
+| **Platform** | `pyfftw` FFT backend by default; **MLX/Metal** Apple Silicon acceleration as an opt-in (`fft_backend: "mlx"`); PySide6 + pyqtgraph desktop UI |
 
 ## Requirements
 
-- **macOS on Apple Silicon** (M1/M2/M3/M4) — the MLX and Metal paths assume it
+- **macOS on Apple Silicon** (M1/M2/M3/M4) — the MLX and Metal paths assume it.
+  They are opt-in, not automatic — see [FFT backend](#fft-backend)
 - **Python 3.10+** (developed against 3.13)
 
 The core reconstruction math is plain NumPy/SciPy and is not Apple-specific, but the GPU acceleration and the packaged launchers are.
@@ -82,6 +83,26 @@ python -m pytest tests/ -q
 ```
 
 Test dependencies are kept out of `requirements.txt` on purpose — a lab install should not pull a test runner. CI installs both files.
+
+## FFT backend
+
+Reconstruction picks its FFT implementation from the `fft_backend` setting.
+The default, `auto`, tries **PyFFTW -> Scipy -> NumPy**.
+
+MLX and Torch are deliberately *not* in that chain. Importing `mlx.core` can
+abort the interpreter with SIGABRT on a machine whose Metal device is
+unusable, and an abort cannot be caught by `try`/`except` — so an optional
+accelerator would be able to kill the application at startup. They are
+selected only when you ask for them by name:
+
+| `fft_backend` | Effect |
+|---|---|
+| `auto` (default) | PyFFTW -> Scipy -> NumPy |
+| `mlx` | MLX/Metal on Apple Silicon; falls back to NumPy if the runtime does not initialise |
+| `torch` | Torch; falls back to NumPy |
+| `pyfftw` / `scipy` / `numpy` | Force that one |
+
+If you were running 2.x on Apple Silicon and expected MLX, set it explicitly.
 
 ## Bring your own data
 

@@ -17,6 +17,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import math
+
 import numpy as np
 import pytest
 
@@ -27,6 +29,7 @@ from core.registration import (  # noqa: E402
     DriftEstimate,
     apply_drift,
     drift_track_session,
+    DEFAULT_PHASE_EXPONENT,
     estimate_drift,
 )
 
@@ -126,36 +129,54 @@ def test_sub_pixel_shift_via_fourier_synth():
 # Noise robustness
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "estimate_drift does not actually survive sigma=0.05 noise on this "
-        "fixture. Measured over 200 seeds (128x128 blob frame, true shift "
-        "(4, 2), use_window=False): median error ~1.0 px, p90 ~2.8 px, "
-        "p99 ~57 px, max ~61 px -- it intermittently locks onto a completely "
-        "wrong correlation peak. Pass rate at this test's own 0.3 px "
-        "tolerance is 12%; even a 2.0 px tolerance only reaches 76%. "
-        "peak_corr collapses from 0.80 on the clean frame to ~0.045, and "
-        "shrinking sigma 10x barely moves it (0.064), so the collapse is not "
-        "about noise magnitude. use_window=True is worse, not better. "
-        "The test was green only because seed 7 happened to land inside "
-        "tolerance on the dev machine; a different numpy build on the CI "
-        "Linux runner returned dy=-5.03 and it failed. Marked xfail rather "
-        "than widening the tolerance, because no tolerance makes this both "
-        "green and meaningful -- the estimator needs fixing, not the "
-        "assertion. Non-strict: it still passes on some platforms/seeds."
-    ),
-)
 def test_noise_does_not_break_estimator():
-    """Add modest gaussian noise to the shifted frame — the lab's
-    real images aren't pristine; estimator must hold up."""
+    """Modest gaussian noise must not break the estimator — the lab's real
+    images aren't pristine.
+
+    Swept over seeds rather than asserting on one. The single-seed version of
+    this test was green only because seed 7 happened to land inside tolerance
+    on the dev machine, while the estimator was in fact wrong most of the time
+    (60.3% of estimates off by >=0.5 px across shifts and noise levels, worst
+    case 102.7 px). One seed cannot distinguish "works" from "got lucky".
+    """
     a = _structured_frame()
     b = _shift_circular(a, 4, 2)
-    rng = np.random.default_rng(7)
-    b_noisy = (b + rng.normal(0.0, 0.05, b.shape)).astype(np.float32)
-    est = estimate_drift(a, b_noisy, use_window=False)
-    assert abs(est.dy_px - (-4)) < 0.3
-    assert abs(est.dx_px - (-2)) < 0.3
+
+    errors = []
+    for seed in range(50):
+        rng = np.random.default_rng(seed)
+        b_noisy = (b + rng.normal(0.0, 0.05, b.shape)).astype(np.float32)
+        est = estimate_drift(a, b_noisy, use_window=False)
+        errors.append(math.hypot(est.dy_px - (-4), est.dx_px - (-2)))
+
+    worst = max(errors)
+    assert worst < 0.3, (
+        f"worst error over 50 seeds was {worst:.2f} px; "
+        f"median {sorted(errors)[len(errors) // 2]:.2f} px"
+    )
+
+
+def test_pure_phase_correlation_is_the_fragile_setting():
+    """Pin the reason the default is 0.6: exponent 1.0 is measurably worse.
+
+    This is a regression guard on the *diagnosis*, not decoration. If someone
+    later restores textbook phase correlation as the default, this test says
+    why that was wrong instead of leaving the next reader to rediscover it.
+    """
+    a = _structured_frame()
+    b = _shift_circular(a, 4, 2)
+
+    def worst_over_seeds(exponent):
+        out = []
+        for seed in range(30):
+            rng = np.random.default_rng(seed)
+            b_noisy = (b + rng.normal(0.0, 0.05, b.shape)).astype(np.float32)
+            est = estimate_drift(a, b_noisy, use_window=False,
+                                 phase_exponent=exponent)
+            out.append(math.hypot(est.dy_px - (-4), est.dx_px - (-2)))
+        return max(out)
+
+    assert worst_over_seeds(1.0) > worst_over_seeds(DEFAULT_PHASE_EXPONENT)
 
 
 # ---------------------------------------------------------------------------

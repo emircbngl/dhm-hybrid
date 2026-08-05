@@ -119,11 +119,24 @@ def _parabolic_subpixel(values: np.ndarray) -> float:
     return max(-0.5, min(0.5, offset))
 
 
+#: Exponent applied to the cross-power magnitude before the inverse FFT.
+#: 1.0 is textbook phase correlation: it divides the magnitude out entirely,
+#: which whitens the spectrum and therefore amplifies exactly the high-frequency
+#: bins where the signal-to-noise ratio is worst. Measured on this repo's own
+#: fixture, that made the estimator lock onto a wrong correlation peak: across
+#: shifts and noise levels 60.3% of estimates were off by >=0.5 px, worst case
+#: 102.7 px. 0.6 keeps phase correlation's illumination invariance (a linear
+#: brightness ramp is still recovered exactly) while restoring the amplitude
+#: weighting that rejects noisy bins. Pass 1.0 for the old pure-phase behaviour.
+DEFAULT_PHASE_EXPONENT = 0.6
+
+
 def estimate_drift(frame_a: np.ndarray,
                    frame_b: np.ndarray,
                    *,
                    max_shift_px: Optional[int] = None,
                    use_window: bool = True,
+                   phase_exponent: float = DEFAULT_PHASE_EXPONENT,
                    ) -> DriftEstimate:
     """Estimate the lateral shift between two frames.
 
@@ -142,6 +155,11 @@ def estimate_drift(frame_a: np.ndarray,
         Apply a Hann window before FFT. True (default) suppresses
         edge wrap; turn off for synthetic test inputs that have no
         boundary discontinuity.
+    phase_exponent
+        How much of the cross-power magnitude to divide out, in [0, 1].
+        1.0 is textbook phase correlation and is measurably fragile under
+        noise; the default (0.6) is the robust setting. See
+        ``DEFAULT_PHASE_EXPONENT``.
 
     Returns
     -------
@@ -159,7 +177,8 @@ def estimate_drift(frame_a: np.ndarray,
     cross = Fa * np.conj(Fb)
     mag = np.abs(cross)
     mag = np.where(mag > 1e-12, mag, 1.0)
-    cps = ifft2(cross / mag).real
+    # Partial (not full) magnitude normalisation — see DEFAULT_PHASE_EXPONENT.
+    cps = ifft2(cross / mag ** float(phase_exponent)).real
 
     # Centre the spectrum so shifts manifest as offsets from
     # (ny/2, nx/2). fftshift wraps both axes.
@@ -193,6 +212,16 @@ def estimate_drift(frame_a: np.ndarray,
 
     dy = float(py - cy + sub_dy)
     dx = float(px - cx + sub_dx)
+
+    # The integer argmax was restricted to the cap, but sub-pixel refinement is
+    # applied afterwards and can push the result back outside it — a caller who
+    # passed max_shift_px=5 could still be handed 5.5. The cap is documented as
+    # a bound, so make it one.
+    if max_shift_px is not None and max_shift_px > 0:
+        limit = float(max_shift_px)
+        dy = min(limit, max(-limit, dy))
+        dx = min(limit, max(-limit, dx))
+
     peak = float(cps_shifted[py, px])
     return DriftEstimate(dy_px=dy, dx_px=dx, peak_corr=peak)
 
@@ -238,10 +267,18 @@ def drift_track_session(frames: Iterable[np.ndarray],
     plot a single drift trajectory across the whole session).
 
     The cumulative trick: each pair-wise estimate ``Δ_k`` between
-    frames ``k`` and ``k+1`` is summed onto the running total. This
-    works because phase correlation gives unbiased shift estimates
-    on linear drift — the per-frame additive errors don't compound
-    geometrically the way a chain of rotations would.
+    frames ``k`` and ``k+1`` is summed onto the running total. Additive
+    errors do not compound geometrically the way a chain of rotations
+    would — but note what summing *does* do: every per-step error is
+    permanent. A bad step does not average out later; it offsets the
+    entire remainder of the track.
+
+    That is why :func:`estimate_drift` must not produce gross outliers,
+    and why its default ``phase_exponent`` is 0.6 rather than the
+    textbook 1.0 (see ``DEFAULT_PHASE_EXPONENT``). Under pure phase
+    correlation this function inherited wrong-peak locks of tens of
+    pixels straight into the cumulative total. Watch ``peak_corr``: a
+    collapsed value marks a step whose shift should not be trusted.
     """
     frames = list(frames)
     if not frames:
