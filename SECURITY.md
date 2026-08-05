@@ -16,10 +16,16 @@ The application makes **zero outbound network connections** for its core
 off-file analysis workflow (ingestion, reconstruction, autofocus, QPI,
 masking, profile management, reporting, audit logging).
 
-Verified by source inspection of `src/core/` and `src/gui/`: no imports
-of `socket`, `urllib`, `http`, `requests`, `httpx`, `aiohttp`, or
-`websockets`. The PySide6 dependency provides `QtNetwork`, but no part
-of the application imports or uses it.
+Verified by source inspection of the optical pipeline: no imports of `socket`,
+`urllib`, `http`, `requests`, `httpx`, `aiohttp`, or `websockets`. The PySide6
+dependency provides `QtNetwork`, but no part of the optical pipeline imports
+or uses it.
+
+The optional **AI assistant** is outside that offline claim. When a user
+explicitly enables it and starts a health check or chat, `src/core/ai/client.py`
+uses `requests` to contact the endpoint configured in AI Settings (Ollama and
+LM Studio default to `localhost`; a user may deliberately configure another
+reachable host). No request is made merely by importing or opening the app.
 
 Caveats where we cannot guarantee "zero":
 

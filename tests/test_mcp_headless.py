@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from core.ai.protocol import ToolCall  # noqa: E402
+from core.ai import tool_impls  # noqa: E402
 from core.ai.tool_impls import build_tool_registry  # noqa: E402
 from core.ai.tools import ToolSpec  # noqa: E402
 from core.audit import AuditLog  # noqa: E402
@@ -87,7 +88,11 @@ def _call(name: str, **args) -> ToolCall:
 # (a) import dhm_mcp.headless works with no mcp installed
 # ---------------------------------------------------------------------------
 
-def test_import_headless_without_mcp_installed():
+def test_import_headless_without_mcp_installed(monkeypatch):
+    # The normal development environment may deliberately have the optional
+    # ``mcp`` extra installed.  Simulate its absence at the import boundary
+    # rather than making this test suite's outcome depend on global packages.
+    monkeypatch.setitem(sys.modules, "mcp", None)
     with pytest.raises(ModuleNotFoundError):
         import mcp  # noqa: F401
     import dhm_mcp.headless  # noqa: F401 - the point is this import succeeds
@@ -97,7 +102,12 @@ def test_import_headless_without_mcp_installed():
 # (b) end-to-end pipeline through the real registry dispatch
 # ---------------------------------------------------------------------------
 
-def test_e2e_load_recon_inspect_render_qpi(tmp_path, holo_path):
+def test_e2e_load_recon_inspect_render_qpi(tmp_path, holo_path, monkeypatch):
+    # Keep the render artifact inside pytest's isolated directory.  Besides
+    # avoiding a real user's home directory, this makes the test pass under
+    # restricted runners where ``~/.dhm-reconstruction`` is intentionally
+    # unwritable.
+    monkeypatch.setattr(tool_impls, "_RENDER_DIR", tmp_path / "_renders")
     sess = _session(tmp_path)
     reg = build_tool_registry(include_devices=False)
     ctx = sess.build_context()
@@ -204,16 +214,18 @@ def test_irreversible_tool_allowed_via_env_override(tmp_path, monkeypatch):
 # (d) server.main() SystemExits cleanly when mcp isn't installed
 # ---------------------------------------------------------------------------
 
-def test_server_main_exits_without_mcp():
+def test_server_main_exits_without_mcp(monkeypatch):
     from dhm_mcp import server
 
+    monkeypatch.setitem(sys.modules, "mcp", None)
     with pytest.raises(SystemExit) as excinfo:
         server.main()
     assert "mcp" in str(excinfo.value).lower()
 
 
-def test_build_mcp_server_raises_import_error_without_mcp():
+def test_build_mcp_server_raises_import_error_without_mcp(monkeypatch):
     from dhm_mcp import server
 
+    monkeypatch.setitem(sys.modules, "mcp", None)
     with pytest.raises(ImportError):
         server.build_mcp_server()

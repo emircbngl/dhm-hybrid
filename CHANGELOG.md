@@ -40,8 +40,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), semver.
 
 ### Track C — reference-free reconstruction (hybrid CNN)
 
-End-to-end pipeline that removes the need for a reference hologram at
-inference time. A small residual U-Net learns the reproducible
+Training-and-inference pipeline for reference-free reconstruction. It removes
+the need for a reference hologram at inference time **after the operator has
+trained or supplied a compatible checkpoint**; no trained weights ship in this
+repository. A small residual U-Net learns the reproducible
 illumination + sensor + carrier-residual aberration the off-axis
 demodulation pipeline can't fully cancel. See
 [`docs/REFFREE_HYBRID.md`](docs/REFFREE_HYBRID.md).

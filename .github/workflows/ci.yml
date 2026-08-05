@@ -1,6 +1,7 @@
 # DHM Reconstruction — CI matrix
 #
-# v2.1.0: pin Linux + macOS test runs. Windows added in v2.1.x when
+# v2.0.0: pin Linux + macOS test runs. Windows will be added in a later
+# 2.1.x release when
 # the camera backend work lands (Pylon/IDS/Thorlabs SDKs are
 # Windows-first). Torch tests run on Linux only — macOS + arm
 # torch is fine but the venv on the dev box doesn't have it,
@@ -70,6 +71,9 @@ jobs:
       - name: Bug regression
         run: |
           python scripts/check_bugs.py --no-color
+      - name: Release metadata consistency
+        run: |
+          python tools/check_release_consistency.py
 
   bench:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_bench }}

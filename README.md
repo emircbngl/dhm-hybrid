@@ -21,7 +21,7 @@ Track C exists because the alternatives were measured and lost:
 
 | Approach | Median RMSE | Verdict |
 |---|---|---|
-| Track A — pure classical (Zernike/poly fit) | ~3.9 rad | 26× target, insufficient |
+| Track A — pure classical (Zernike/poly fit, centre crop) | ~2.2 rad | 15× target, insufficient |
 | Track B — pure end-to-end deep learning | — | 63 frames is far too few; needs 5,000+ |
 | **Track C — classical + small CNN residual** | see report | **the chosen path** |
 
