@@ -38,3 +38,4 @@ Worktree/
 
 # macOS
 .DS_Store
+.jobs/
