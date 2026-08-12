@@ -6,6 +6,17 @@ Point it at an off-axis hologram and it gives you back quantitative phase: the d
 
 > **Status:** research software, actively developed. Version 2.0.0 ships the `ui3` frontend and the reference-free Track C pipeline; see [`CHANGELOG.md`](CHANGELOG.md).
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/img/hero-synthetic-light.png">
+    <img src="docs/img/hero-synthetic-dark.png" width="100%" alt="Four panels: an off-axis hologram with a zoomed fringe inset, its angular spectrum with the +1 order circled, the recovered quantitative phase showing four cell-like objects, and the error against ground truth">
+  </picture>
+</p>
+
+<p align="center"><em><b>The whole pipeline, on data with a known answer.</b> A synthetic 3.100 rad phase object is forward-modelled into a 12-bit, shot-noise-limited off-axis hologram, then read back by the same code you'd point at a real capture — recovering 3.095 rad at 0.062 rad RMSE. No lab data: run it yourself with <code>python examples/synthetic_demo.py</code>.</em></p>
+
+> This is a **self-consistency check**, not an accuracy claim for real samples — the same optical model that generates the hologram is inverted to read it back. It catches sign errors, carrier mis-detection, unwrapping failures and scaling bugs; it cannot catch an error shared by the forward and inverse models. The demo also prints an independent check: the carrier predicts the +1 order at (217.6, 192.0) and the detector finds it at (218, 192).
+
 ---
 
 ## Why this exists
