@@ -1,4 +1,4 @@
-"""Autofocus algorithm benchmark — 6 algorithms × 2 hologram sizes.
+"""Autofocus algorithm benchmark — 7 algorithms × 2 hologram sizes.
 
 Writes a markdown table to stdout, plus a JSON summary the
 ``test_autofocus_speed_baseline.py`` regression test can read.
@@ -7,9 +7,9 @@ Run::
 
     python scripts/bench_autofocus.py
 
-The 6 algorithms come from ``src/ui2/workers.py`` — ``zscan``,
+The 7 algorithms come from ``src/ui2/workers.py`` — ``zscan``,
 ``coarse_to_fine``, ``robust``, ``adaptive_gradient``,
-``adaptive_bracketing``, ``adaptive_distance``. Each is timed on a
+``gradient_descent``, ``adaptive_bracketing``, ``adaptive_distance``. Each is timed on a
 synthetic single-sphere hologram (the same ``build_hologram`` the
 validation suite uses) at 256×256 (fast sanity) and 512×512
 (realistic lab size). 40 steps / max_evaluations across the board
@@ -42,6 +42,7 @@ from core.autofocus.search_adaptive import (  # noqa: E402
     adaptive_bracketing_search,
     adaptive_distance_search,
     adaptive_gradient_search,
+    gradient_descent_search,
 )
 from core.autofocus.search_classic import (  # noqa: E402
     coarse_to_fine_search,
@@ -125,6 +126,13 @@ def _run_one_shape(shape: Tuple[int, int], n_steps: int = 40) -> List[Dict]:
             max_evaluations=n_steps,
         )
 
+    def _grad_descent():
+        return gradient_descent_search(
+            field, base, method, metric,
+            z_min_m=z_min_m, z_max_m=z_max_m,
+            max_evaluations=n_steps,
+        )
+
     def _adap_brack():
         return adaptive_bracketing_search(
             field, base, method, metric,
@@ -147,6 +155,7 @@ def _run_one_shape(shape: Tuple[int, int], n_steps: int = 40) -> List[Dict]:
         ("zscan",               _zscan),
         ("coarse_to_fine",      _coarse),
         ("robust",              _robust),
+        ("gradient_descent",    _grad_descent),
         ("adaptive_gradient",   _adap_grad),
         ("adaptive_bracketing", _adap_brack),
         ("adaptive_distance",   _adap_dist),

@@ -40,6 +40,9 @@ from fixtures.synthetic_hologram import (  # noqa: E402
 _CFG = HologramConfig(
     shape=(256, 256), pixel_m=2.5e-6, wavelength_m=632.8e-9,
     carrier_freq_m_inv=(50_000.0, 0.0),
+    # This module locks the historical segmentation regression fixture.
+    # Corrected benchmark/model tests opt into ``multiplane`` explicitly.
+    composition_mode="legacy_sum",
 )
 
 

@@ -24,6 +24,7 @@ from core.autofocus import (
     adaptive_ratio_search,
     adaptive_bracketing_search,
     adaptive_distance_search,
+    gradient_descent_search,
     downsample_complex_field,
     has_sufficient_contrast,
 )
@@ -297,6 +298,19 @@ class AutofocusWorker(QThread):
                 best_z = res.best_z_m
                 z_m_arr = np.array([best_z])
                 scores = np.array([res.best_score])
+
+            elif algo == FocusTab.ALGO_GRADIENT_DESCENT:
+                self.progress.emit("Running Gradient Descent...")
+                res = gradient_descent_search(
+                    field=fc, base_params=params, method=method, metric=metric,
+                    z_min_m=zmin, z_max_m=zmax,
+                    max_evaluations=steps,
+                    cancel_check=cc, on_progress=prog,
+                    roi_bounds=rb, ref_field=ref_fc,
+                )
+                best_z = res.best_z_m
+                z_m_arr = res.z_history
+                scores = res.score_history
 
             elif algo == FocusTab.ALGO_ADAPT_GRADIENT:
                 self.progress.emit("Running Adaptive Gradient...")

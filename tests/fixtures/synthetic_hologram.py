@@ -1,23 +1,17 @@
 """Synthetic hologram generator for pipeline stress tests.
 
-Models each dielectric sphere via **volume slicing (split-step)** — the
-same scheme the lab's MATLAB reference (`sample_vitural_hologram.m`)
-uses. The sphere volume is discretised into ``n_slices`` axial slabs;
-each slab contributes ``exp(i · k0 · Δn · dz · inside(x, y, z_slice))``
-to the cumulative object-plane field. At the centre this integrates
-to the closed-form OPL
-``φ_peak = 2π · 2r · (n_sphere − n_medium) / λ`` so a large sphere
-with many wrap cycles is modelled correctly — thin-phase approximation
-breaks down above ~2π radians and would give a misleading field.
+Models each dielectric sphere as a **projected thin phase screen**, matching
+the companion MATLAB simulator's projection approximation. ``n_slices`` is
+only a numerical integration of the sphere chord/optical path; there is no
+propagation between slices, so this must not be described as split-step or a
+volumetric multiple-scattering model.
 
 Pipeline composition:
 
-* Each sphere's object field is built at z=0 via volume slicing.
-* Propagated to the camera plane through :func:`core.reconstruction.propagate`
-  (same ASM kernel the app uses — so tests actually exercise production
-  code, not a parallel implementation).
-* Multiple spheres are summed (linear superposition is exact for the
-  scalar Helmholtz equation).
+* Each sphere is represented as a projected thin phase screen.
+* Screens at the same z are multiplied; distinct z planes are ordered from
+  farthest to nearest and separated by ASM propagation. This avoids the old
+  fixture bug that summed one copy of the incident plane wave per object.
 * Off-axis reference plane wave added, magnitude squared gives intensity.
 * Optional Gaussian camera read-noise.
 
@@ -65,11 +59,7 @@ class SphereSpec:
         Surrounding medium refractive index (default 1.33 — water /
         standard culture buffer).
     n_slices
-        Number of axial slabs used by the volume-slicing field builder.
-        32 is a safe default — the MATLAB reference uses 100 for
-        publication-grade fidelity at the cost of runtime. 32 keeps
-        round-trip accuracy inside test tolerance while finishing in a
-        few ms per sphere.
+        Number of axial samples used to integrate the projected chord.
     """
     radius_m: float
     z_m: float
@@ -93,6 +83,15 @@ class HologramConfig:
     reference_amplitude: float = 1.0
     # Gaussian read noise sigma as a fraction of peak intensity.
     noise_sigma: float = 0.0
+    # Object/reference balance. ``1/50`` mirrors the companion MATLAB
+    # simulator's 50x 4f amplitude scaling; legacy tests may keep 1.0.
+    object_amplitude: float = 1.0
+    # Optional camera ADC quantisation. None preserves continuous float data.
+    bit_depth: Optional[int] = None
+    # ``multiplane`` is the corrected phase-screen model. ``legacy_sum`` is
+    # retained only to reproduce historical fixture outputs when diagnosing a
+    # regression; it duplicates the incident background for every object.
+    composition_mode: str = "multiplane"
 
 
 # ---------------------------------------------------------------------------
@@ -110,16 +109,14 @@ def sphere_phase_field(
     n_medium: float = 1.33,
     n_slices: int = 32,
 ) -> np.ndarray:
-    """Return the complex object field for one sphere *at z = 0* using
-    volume slicing (split-step).
+    """Return the projected thin-phase field for one sphere at ``z=0``.
 
     The sphere is discretised into ``n_slices`` axial slabs from ``-r``
     to ``+r``. Each slab multiplies the running field by
     ``exp(i · k0 · Δn · dz · inside(x, y, z_slice))`` — the paraxial
-    phase-only scattering picture. Integrating across slabs recovers
-    the closed-form OPL ``2r · (n_s − n_m)`` at the centre, but unlike
-    the 2D thin-phase approximation the full wrap count is preserved
-    for large spheres (above a few µm at Δn = 0.1).
+    phase-screen picture. Integrating across slabs recovers the closed-form
+    OPL ``2r · (n_s − n_m)`` at the centre. Because the slabs are not
+    separated by propagation, this remains a 2-D projection approximation.
 
     The loop is short (``n_slices`` iterations of one boolean mask +
     complex multiply per slab), so even 32 slices run in under 10 ms
@@ -206,29 +203,98 @@ def compose_scene_field(
     spheres: Sequence[SphereSpec],
     config: HologramConfig,
 ) -> np.ndarray:
-    """Sum of each sphere's camera-plane complex field.
+    """Compose projected phase screens and propagate them to the camera.
 
-    Each sphere is built at z=0, propagated individually to the camera
-    plane by its own ``z_m``, and the results are summed. For objects
-    with different z, this is the correct linear-superposition picture
-    — different distances manifest as different Fresnel kernels.
+    ``multiplane`` groups objects by axial plane, multiplies their transmission
+    functions at that plane, and propagates the running field between planes.
+    It remains a scalar thin-screen approximation: refraction and multiple
+    scattering inside each sphere are out of scope.
     """
-    acc = np.zeros(config.shape, dtype=np.complex64)
-    for s in spheres:
-        sf = sphere_phase_field(
+    if config.composition_mode not in {"multiplane", "legacy_sum"}:
+        raise ValueError(
+            "composition_mode must be 'multiplane' or 'legacy_sum'"
+        )
+
+    def transmission(s: SphereSpec) -> np.ndarray:
+        return sphere_phase_field(
             config.shape, config.pixel_m, s.radius_m,
             config.wavelength_m,
             center_yx_m=s.center_yx_m,
             n_sphere=s.n_sphere, n_medium=s.n_medium,
             n_slices=s.n_slices,
         )
-        acc += propagate_sphere_to_camera(
-            sf, z_m=s.z_m,
+
+    if config.composition_mode == "legacy_sum":
+        acc = np.zeros(config.shape, dtype=np.complex64)
+        for s in spheres:
+            acc += propagate_sphere_to_camera(
+                transmission(s), z_m=s.z_m,
+                pixel_m=config.pixel_m,
+                wavelength_m=config.wavelength_m,
+                n_medium=s.n_medium,
+            )
+        return acc
+
+    if not spheres:
+        return np.ones(config.shape, dtype=np.complex64)
+
+    planes: dict[float, list[SphereSpec]] = {}
+    for sphere in spheres:
+        planes.setdefault(float(sphere.z_m), []).append(sphere)
+
+    field = np.ones(config.shape, dtype=np.complex64)
+    ordered_z = sorted(planes, reverse=True)
+    current_z = ordered_z[0]
+    medium_n = float(spheres[0].n_medium)
+    for plane_z in ordered_z:
+        if current_z > plane_z:
+            field = propagate_sphere_to_camera(
+                field, z_m=current_z - plane_z,
+                pixel_m=config.pixel_m,
+                wavelength_m=config.wavelength_m,
+                n_medium=medium_n,
+            )
+        plane_transmission = np.ones(config.shape, dtype=np.complex64)
+        for sphere in planes[plane_z]:
+            plane_transmission *= transmission(sphere)
+        field *= plane_transmission
+        current_z = plane_z
+
+    if current_z != 0.0:
+        field = propagate_sphere_to_camera(
+            field, z_m=current_z,
             pixel_m=config.pixel_m,
             wavelength_m=config.wavelength_m,
-            n_medium=s.n_medium,
+            n_medium=medium_n,
         )
-    return acc
+    return field
+
+
+def carrier_offset_px(config: HologramConfig) -> float:
+    """Radial FFT-bin distance between DC and the configured carrier."""
+    ny, nx = config.shape
+    fy, fx = config.carrier_freq_m_inv
+    return float(np.hypot(fy * ny * config.pixel_m,
+                          fx * nx * config.pixel_m))
+
+
+def validate_offaxis_sampling(
+    config: HologramConfig,
+    mask_radius_px: float,
+    *,
+    guard_px: float = 0.0,
+) -> None:
+    """Reject carrier/mask geometry that overlaps the DC order."""
+    nyquist = 1.0 / (2.0 * config.pixel_m)
+    if any(abs(freq) >= nyquist for freq in config.carrier_freq_m_inv):
+        raise ValueError("off-axis carrier component reaches Nyquist")
+    offset = carrier_offset_px(config)
+    if offset <= float(mask_radius_px) + float(guard_px):
+        raise ValueError(
+            "off-axis +1-order mask overlaps DC: "
+            f"carrier offset={offset:.2f}px, radius+guard="
+            f"{float(mask_radius_px) + float(guard_px):.2f}px"
+        )
 
 
 def build_hologram(
@@ -243,7 +309,7 @@ def build_hologram(
     :func:`core.offaxis.extract_complex_field_offaxis`.
     """
     cfg = config or HologramConfig()
-    obj = compose_scene_field(spheres, cfg)
+    obj = cfg.object_amplitude * compose_scene_field(spheres, cfg)
     ref = reference_plane_wave(
         cfg.shape, cfg.pixel_m, cfg.carrier_freq_m_inv,
         amplitude=cfg.reference_amplitude,
@@ -258,6 +324,16 @@ def build_hologram(
             0.0, cfg.noise_sigma * peak, size=intensity.shape,
         ).astype(np.float32)
         intensity = np.clip(intensity + noise, 0.0, None)
+
+    if cfg.bit_depth is not None:
+        if int(cfg.bit_depth) < 1:
+            raise ValueError("bit_depth must be at least 1")
+        levels = float(2 ** int(cfg.bit_depth) - 1)
+        lo = float(np.min(intensity))
+        span = float(np.max(intensity) - lo)
+        if span > 0.0:
+            normalized = (intensity - lo) / span
+            intensity = (np.rint(normalized * levels) / levels).astype(np.float32)
 
     return intensity
 
@@ -291,6 +367,8 @@ __all__ = [
     "propagate_sphere_to_camera",
     "reference_plane_wave",
     "compose_scene_field",
+    "carrier_offset_px",
+    "validate_offaxis_sampling",
     "build_hologram",
     "single_sphere_hologram",
 ]

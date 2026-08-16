@@ -103,6 +103,7 @@ class ReconParams:
     # Options: "zscan" (linear sweep, v2.0.2 default),
     # "coarse_to_fine" (Golden-Section refinement of coarse pass),
     # "robust" (coarse scan + Gaussian-smoothed fine), or
+    # "gradient_descent" (projected finite-difference descent),
     # "adaptive_gradient" (gradient-driven adaptive step size),
     # "adaptive_bracketing" (nested bracketing with refinement).
     #

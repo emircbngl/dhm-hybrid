@@ -7,7 +7,7 @@ concerns:
 - `metrics`          : FocusMetric enum, `_calc_metric`, direction helpers.
 - `evaluator`        : Fast evaluator closure + complex-field downsampling.
 - `search_classic`   : Linear sweep, Golden Section, Coarse-to-Fine, Robust C2F.
-- `search_adaptive`  : Gradient / Ratio / Bracketing / Distance + `AdaptiveFocusState`.
+- `search_adaptive`  : Gradient descent / adaptive searches + `AdaptiveFocusState`.
 - `analysis`         : Auto-select metric, landscape scan, benchmark.
 """
 from .metrics import (
@@ -25,6 +25,7 @@ from .evaluator import (
     AutofocusCancelled,
     _make_batch_evaluator,
     _make_fast_evaluator,
+    _make_multi_metric_evaluator,
     _make_roi_fast_evaluator,
     downsample_complex_field,
 )
@@ -44,6 +45,7 @@ from .search_adaptive import (
     adaptive_distance_search,
     adaptive_gradient_search,
     adaptive_ratio_search,
+    gradient_descent_search,
 )
 from .analysis import (
     AutofocusBenchmarkResult,
@@ -70,6 +72,7 @@ __all__ = [
     "AutoFocusResult",
     "AutofocusCancelled",
     "_make_fast_evaluator",
+    "_make_multi_metric_evaluator",
     "_make_batch_evaluator",
     "_make_roi_fast_evaluator",
     "downsample_complex_field",
@@ -88,6 +91,7 @@ __all__ = [
     "adaptive_distance_search",
     "adaptive_gradient_search",
     "adaptive_ratio_search",
+    "gradient_descent_search",
     # analysis
     "AutofocusBenchmarkResult",
     "BenchmarkEntry",

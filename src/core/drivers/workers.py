@@ -25,6 +25,7 @@ from core.autofocus.search_adaptive import (
     adaptive_bracketing_search,
     adaptive_distance_search,
     adaptive_gradient_search,
+    gradient_descent_search,
 )
 from core.autofocus.evaluator import focus_landscape_warning
 from core.autofocus.search_classic import (
@@ -84,6 +85,7 @@ _AUTOFOCUS_ALGORITHMS: list[str] = [
     "zscan",               # fixed-step linear sweep — simplest, baseline
     "coarse_to_fine",      # coarse grid → Golden-Section refinement
     "robust",              # coarse scan + Gaussian-smoothed fine refine
+    "gradient_descent",    # projected numerical gradient descent
     "adaptive_gradient",   # variable step driven by metric derivative
     "adaptive_bracketing", # nested bracketing + divisions refinement
     "adaptive_distance",   # auto-discovers the z-range from scratch
@@ -127,6 +129,19 @@ _AF_ALGO_PROFILES: dict[str, dict] = {
             "+ 8× refine pass. Real-data benchmark: DEFAULT — the "
             "only top performer on both metrics (78%/67% hit, "
             "0.07/0.15 mm median error)."
+        ),
+    },
+    "gradient_descent": {
+        "uses_z_range": True,
+        "uses_steps": True,
+        "steps_label": "max evals",
+        "steps_tip": (
+            "Propagation budget: first a global coarse scan selects "
+            "an interior focus basin using Laplacian prominence, "
+            "then projected gradient descent "
+            "refines it with finite differences. "
+            "Every coarse sample and derivative probe counts against "
+            "this cap. Experimental: validate on your own holograms."
         ),
     },
     "adaptive_gradient": {
@@ -887,6 +902,13 @@ class ScienceDriver:
                 )
             elif algo == "adaptive_gradient":
                 core_result = adaptive_gradient_search(
+                    field, base, method, chosen_metric,
+                    z_min_m=z_min_m, z_max_m=z_max_m,
+                    max_evaluations=n_steps,
+                    cancel_check=cancel,
+                )
+            elif algo == "gradient_descent":
+                core_result = gradient_descent_search(
                     field, base, method, chosen_metric,
                     z_min_m=z_min_m, z_max_m=z_max_m,
                     max_evaluations=n_steps,

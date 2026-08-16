@@ -184,6 +184,67 @@ def _make_fast_evaluator(
     return evaluate
 
 
+def _make_multi_metric_evaluator(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    metrics: Sequence[FocusMetric],
+    roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
+) -> Callable[[float], tuple[float, ...]]:
+    """Build one-propagation evaluator for several focus metrics.
+
+    Basin discovery benefits from agreement between metrics, but evaluating
+    each metric through a separate ``_make_fast_evaluator`` would repeat the
+    expensive IFFT at every z. This closure reconstructs once and computes all
+    requested metrics from the same ROI. Evaluation budgets therefore continue
+    to count physical propagation positions, not cheap scalar metric calls.
+    """
+    metric_tuple = tuple(metrics)
+    if not metric_tuple:
+        raise ValueError("metrics must not be empty")
+
+    fft = get_best_fft_backend()
+    recon = CachedReconstructor(field.shape, method, fft)
+    inp = field.astype(np.complex64, copy=False)
+    field_spectrum = fft.fft2(inp)
+    if field_spectrum.dtype != np.complex64:
+        field_spectrum = field_spectrum.astype(np.complex64)
+
+    use_ref = ref_field is not None
+    ref_spectrum = None
+    if use_ref:
+        ref_inp = ref_field.astype(np.complex64, copy=False)
+        ref_spectrum = fft.fft2(ref_inp)
+        if ref_spectrum.dtype != np.complex64:
+            ref_spectrum = ref_spectrum.astype(np.complex64)
+
+    ny, nx = field.shape
+    if roi_bounds is not None:
+        ry0 = max(0, int(roi_bounds.y0))
+        rx0 = max(0, int(roi_bounds.x0))
+        ry1 = min(ny, int(roi_bounds.y1))
+        rx1 = min(nx, int(roi_bounds.x1))
+    else:
+        ry0, rx0, ry1, rx1 = 0, 0, ny, nx
+
+    def evaluate(z: float) -> tuple[float, ...]:
+        params = ReconstructionParams(
+            wavelength_m=base_params.wavelength_m,
+            pixel_size_m=base_params.pixel_size_m,
+            z_m=z,
+            n=base_params.n,
+        )
+        result = recon.reconstruct_from_spectrum(field_spectrum, params)
+        if use_ref and ref_spectrum is not None:
+            ref_result = recon.reconstruct_from_spectrum(ref_spectrum, params)
+            result = safe_reference_divide(result, ref_result)
+        roi = result[ry0:ry1, rx0:rx1]
+        return tuple(float(_calc_metric(roi, item)) for item in metric_tuple)
+
+    return evaluate
+
+
 def _build_H_stack(field_shape: tuple,
                    base_params: ReconstructionParams,
                    method: ReconstructionMethod,

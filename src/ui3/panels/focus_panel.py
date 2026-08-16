@@ -86,7 +86,8 @@ _LOG = logging.getLogger(__name__)
 # to decide whether the "Adaptive" sub-section is shown — the actual
 # dispatch lives entirely in ScienceDriver.run_autofocus.
 _ADAPTIVE_ALGORITHMS = {
-    "adaptive_gradient", "adaptive_bracketing", "adaptive_distance",
+    "gradient_descent", "adaptive_gradient", "adaptive_bracketing",
+    "adaptive_distance",
 }
 
 # Default focus metric for this panel — PHASE_VARIANCE per the ui3
@@ -309,6 +310,13 @@ class FocusPanel(QWidget):
         the actual behaviour tied to the fields that DO exist
         (``af_algorithm``, ``af_n_steps``)."""
         algo = str(algo or "").lower()
+        if algo == "gradient_descent":
+            return (
+                "Global coarse discovery uses Laplacian prominence to "
+                "bracket an interior focus basin; gradient "
+                "descent then refines it with finite differences and "
+                "backtracking. \"steps\" caps all propagations."
+            )
         if algo == "adaptive_gradient":
             return (
                 "Gradient-driven adaptive step size: large steps in "

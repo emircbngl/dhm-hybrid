@@ -72,3 +72,46 @@ them on **real lab data** and pinned defaults from the evidence.
   `benchmark_af_real.py` after logging their parameters if needed.
 
 Regression pins: `tests/test_af_settlement.py` (B-095).
+
+## Numerical gradient descent (added after settlement)
+
+`gradient_descent` is a separate, experimental autofocus option; it is not the
+older `adaptive_gradient` step walker. It first spends part of its budget on a
+global coarse Laplacian-variance landscape, smooths that curve, rejects
+range-edge extrema, and brackets the most prominent interior basin. The
+caller's selected metric is computed from the same propagated field without
+repeating FFT work. Inside that basin it
+minimizes a loss derived from the selected focus metric, estimates
+`d(loss)/dz` with central finite differences (bounded secants at the basin
+limits), and performs projected gradient-descent updates with backtracking.
+All coarse, derivative, and line-search propagations count toward
+`af_n_steps`.
+
+This method was not part of the 2026-07-06 nine-scene benchmark above, so
+`robust` remains the evidence-backed default until the same harness is rerun.
+
+For repeatable synthetic stress testing, run
+`python scripts/benchmark_af_synthetic_stress.py --quick`. The factorial mode
+uses five independent axes with five levels each: peak-relative Gaussian noise,
+absolute distance, object count, object/objectlet radius scale, and axial plane
+separation. `--factorial` materialises all 5^5 = 3125 combinations;
+`--shard-count N --shard-index I` partitions the same deterministically seeded
+matrix without changing a scene's camera noise.
+
+## Object-local multi-focus
+
+`core.depth_map.find_object_focus_planes` is the spatial counterpart to the
+whole-frame focus landscape. It reconstructs a z stack once, computes a local
+focus volume, detects connected masks from the z-invariant maximum response,
+and reduces a separate focus curve inside each mask. `PHASE_VARIANCE` is the
+wrap-safe phase/complex-field mode; `LAPLACIAN_VARIANCE` and `TENENGRAD` are
+amplitude/visual alternatives. Frame-edge components are rejected as FFT
+artefacts, and a three-point parabola refines each interior peak below the scan
+step. The benchmark's `object_local` algorithm reports every detected object z,
+per-ground-truth-plane error, and plane recall.
+
+The corrected stress generator uses non-overlapping carrier/DC geometry,
+explicit +1-order extraction, 12-bit quantisation, and multiplies same-plane
+phase screens instead of summing a new incident background per object. It is
+still a projected scalar phase-screen fixture—not a volumetric scattering or
+physical-metrology reference.

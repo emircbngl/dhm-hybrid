@@ -46,9 +46,9 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import gaussian_filter1d, uniform_filter
 
-from .autofocus import FocusMetric
+from .autofocus.metrics import FocusMetric
 from .fft_backend import get_best_fft_backend
 from .reconstruction import (
     ReconstructionMethod,
@@ -86,6 +86,26 @@ class DepthMapResult:
     z_values_m: np.ndarray
     metric: FocusMetric
     window_size: int
+
+
+@dataclass(frozen=True)
+class ObjectFocusPlane:
+    """Focus estimate for one spatially isolated object/region.
+
+    The mask is discovered from the maximum local-focus response over the
+    complete z stack, so an object does not need to be visible at the same
+    plane as the dominant object. ``metric=PHASE_VARIANCE`` is the phase/
+    complex-field detector; Laplacian variance and Tenengrad are amplitude
+    (visual) alternatives.
+    """
+    object_id: int
+    centroid_yx: tuple[float, float]
+    bbox_yx: tuple[int, int, int, int]
+    area_px: int
+    z_m: float
+    prominence: float
+    mean_confidence: float
+    metric: FocusMetric
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +394,153 @@ def _refine_subpixel_z(
 
     z_map = z_values[idx].astype(np.float64) + step * delta
     return z_map.astype(np.float32)
+
+
+def find_object_focus_planes(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    z_min_m: float,
+    z_max_m: float,
+    *,
+    n_steps: int = 60,
+    window_size: int = 7,
+    metric: FocusMetric = FocusMetric.PHASE_VARIANCE,
+    confidence_percentile: float = 97.0,
+    min_area_px: int = 12,
+    mask_dilation_px: int = 2,
+    smooth_sigma: float = 1.0,
+    min_prominence: float = 0.03,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> list[ObjectFocusPlane]:
+    """Detect spatial objects and estimate a separate focus plane per object.
+
+    Unlike :func:`compute_depth_map`, this routine does not report a noisy z
+    value for every background pixel. It builds the local-focus volume once,
+    forms a z-invariant detection image with ``max_z(metric)``, extracts
+    connected object masks, and reduces the focus volume independently inside
+    every mask. This prevents a large/high-contrast object from hiding a small
+    objectlet at another depth in one whole-frame score.
+
+    ``PHASE_VARIANCE`` is wrap-safe and responds to transparent phase objects.
+    ``LAPLACIAN_VARIANCE`` or ``TENENGRAD`` use amplitude and provide the
+    requested visual alternative. Boundary optima are rejected because they
+    indicate an unbracketed focus rather than a measured local maximum.
+    """
+    if z_max_m <= z_min_m:
+        raise ValueError("z_max_m must exceed z_min_m")
+    if n_steps < 3:
+        raise ValueError("n_steps must be >= 3")
+    if window_size < 3:
+        raise ValueError("window_size must be >= 3")
+    if not (0.0 < confidence_percentile < 100.0):
+        raise ValueError("confidence_percentile must be in (0, 100)")
+    if min_area_px < 1 or mask_dilation_px < 0:
+        raise ValueError("min_area_px must be >= 1 and dilation non-negative")
+    try:
+        local_kernel = _LOCAL_KERNELS[metric]
+    except KeyError as exc:
+        raise ValueError(
+            f"metric {metric!r} has no local object form; supported: "
+            f"{sorted(k.name for k in _LOCAL_KERNELS)}"
+        ) from exc
+
+    from scipy.ndimage import (
+        binary_closing,
+        binary_dilation,
+        binary_fill_holes,
+        binary_opening,
+        find_objects,
+        label,
+    )
+    from scipy.signal import find_peaks
+
+    fft = get_best_fft_backend()
+    z_values = np.linspace(z_min_m, z_max_m, n_steps)
+    h, w = field.shape[-2:]
+    stack = np.empty((n_steps, h, w), dtype=np.float32)
+    for i, z in enumerate(z_values):
+        if cancel_check and cancel_check():
+            from .autofocus.evaluator import AutofocusCancelled
+            raise AutofocusCancelled()
+        params = ReconstructionParams(
+            wavelength_m=base_params.wavelength_m,
+            pixel_size_m=base_params.pixel_size_m,
+            z_m=float(z),
+            n=base_params.n,
+        )
+        recon = propagate(field, params, method, fft=fft, force_python=True)
+        stack[i] = local_kernel(recon, window_size)
+
+    confidence = np.max(stack, axis=0)
+    finite = confidence[np.isfinite(confidence)]
+    if finite.size == 0 or float(np.max(finite)) <= 0.0:
+        return []
+    threshold = float(np.percentile(finite, confidence_percentile))
+    mask = confidence >= threshold
+    structure = np.ones((3, 3), dtype=bool)
+    mask = binary_opening(mask, structure=structure)
+    mask = binary_closing(mask, structure=structure, iterations=2)
+    mask = binary_fill_holes(mask)
+    if mask_dilation_px:
+        mask = binary_dilation(
+            mask, structure=structure, iterations=mask_dilation_px)
+
+    labelled, count = label(mask)
+    slices = find_objects(labelled)
+    results: list[ObjectFocusPlane] = []
+    step = float(z_values[1] - z_values[0])
+    for label_id in range(1, count + 1):
+        selected = labelled == label_id
+        area = int(np.count_nonzero(selected))
+        if area < min_area_px:
+            continue
+        curve = np.mean(stack[:, selected], axis=1, dtype=np.float64)
+        cmin, cmax = float(curve.min()), float(curve.max())
+        if not np.isfinite(cmin + cmax) or cmax - cmin <= 1e-15:
+            continue
+        norm = (curve - cmin) / (cmax - cmin)
+        smoothed = gaussian_filter1d(norm, sigma=smooth_sigma)
+        peaks, props = find_peaks(smoothed, prominence=min_prominence)
+        if peaks.size == 0:
+            continue
+        prominences = props["prominences"]
+        peak_slot = int(np.argmax(prominences))
+        idx = int(peaks[peak_slot])
+        if idx == 0 or idx == n_steps - 1:
+            continue
+
+        denom = smoothed[idx - 1] - 2.0 * smoothed[idx] + smoothed[idx + 1]
+        delta = 0.0
+        if abs(float(denom)) > 1e-12 and denom < 0.0:
+            delta = 0.5 * float(
+                (smoothed[idx - 1] - smoothed[idx + 1]) / denom)
+            delta = float(np.clip(delta, -1.0, 1.0))
+
+        ys, xs = np.where(selected)
+        obj_slice = slices[label_id - 1]
+        assert obj_slice is not None
+        # FFT/propagation border energy is not a physical object. Components
+        # touching the frame are therefore excluded from object-local output.
+        if (obj_slice[0].start == 0 or obj_slice[1].start == 0
+                or obj_slice[0].stop == h or obj_slice[1].stop == w):
+            continue
+        results.append(ObjectFocusPlane(
+            object_id=label_id,
+            centroid_yx=(float(ys.mean()), float(xs.mean())),
+            bbox_yx=(
+                int(obj_slice[0].start), int(obj_slice[1].start),
+                int(obj_slice[0].stop), int(obj_slice[1].stop),
+            ),
+            area_px=area,
+            z_m=float(z_values[idx] + delta * step),
+            prominence=float(prominences[peak_slot]),
+            mean_confidence=float(np.mean(confidence[selected])),
+            metric=metric,
+        ))
+
+    results.sort(key=lambda item: (-item.prominence, -item.area_px))
+    return results
 
 
 @dataclass(frozen=True)
@@ -707,8 +874,10 @@ def write_tomography_bundle(
 
 __all__ = [
     "DepthMapResult",
+    "ObjectFocusPlane",
     "ClusterHeight",
     "compute_depth_map",
+    "find_object_focus_planes",
     "segment_depth_clusters",
     "mask_low_confidence",
     "write_depth_map_npz",

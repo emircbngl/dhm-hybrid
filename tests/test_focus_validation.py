@@ -66,6 +66,7 @@ _CFG = HologramConfig(
     pixel_m=2.5e-6,
     wavelength_m=632.8e-9,
     carrier_freq_m_inv=(50_000.0, 0.0),
+    composition_mode="legacy_sum",
 )
 _OFFAXIS = OffAxisParams(radius=40)
 _METHOD = ReconstructionMethod.ASM

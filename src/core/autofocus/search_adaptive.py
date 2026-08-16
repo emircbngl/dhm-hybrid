@@ -11,9 +11,14 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
 
 from ..reconstruction import ReconstructionMethod, ReconstructionParams
-from .evaluator import AutofocusCancelled, _make_fast_evaluator
+from .evaluator import (
+    AutofocusCancelled,
+    _make_fast_evaluator,
+    _make_multi_metric_evaluator,
+)
 from .metrics import FocusMetric, _is_minimize
 from .search_classic import (
     autofocus_zscan,
@@ -31,6 +36,10 @@ class AdaptiveStepResult:
     score_history: np.ndarray
     step_history: np.ndarray
     method_name: str
+    coarse_z: Optional[np.ndarray] = None
+    coarse_scores: Optional[np.ndarray] = None
+    basin_bounds_m: Optional[Tuple[float, float]] = None
+    selected_peak_z_m: Optional[float] = None
 
 
 def adaptive_gradient_search(
@@ -185,6 +194,289 @@ def adaptive_gradient_search(
         best_z_m=best_z, best_score=best_f, evaluations=evaluations,
         z_history=np.array(z_hist), score_history=np.array(f_hist),
         step_history=np.array(s_hist), method_name="Gradient-Based Adaptive",
+    )
+
+
+def gradient_descent_search(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    metric: FocusMetric,
+    z_min_m: float,
+    z_max_m: float,
+    max_evaluations: int = 100,
+    n_starts: Optional[int] = None,
+    finite_difference_step_m: Optional[float] = None,
+    learning_rate: Optional[float] = None,
+    backtrack_factor: float = 0.5,
+    gradient_tolerance: float = 1e-6,
+    coarse_fraction: float = 0.6,
+    smooth_sigma: float = 1.0,
+    min_prominence: float = 0.03,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    roi_bounds=None,
+    ref_field: Optional[np.ndarray] = None,
+) -> AdaptiveStepResult:
+    """Global discovery -> basin bracketing -> numerical gradient descent.
+
+    DHM focus metrics are black-box functions of propagation distance: most are
+    not analytically differentiable and their numeric scale varies by orders of
+    magnitude.  This implementation therefore:
+
+    1. spends a fixed fraction of the evaluation budget on a full-range coarse
+       scan and smooths the resulting focus landscape;
+    2. uses Laplacian variance for basin discovery, rejects range-edge extrema,
+       and brackets the most prominent interior peak between its valleys;
+    3. converts maximizing metrics to a normalized loss;
+    4. estimates ``d(loss)/dz`` with bounded finite differences inside only the
+       selected basin;
+    5. applies ``z <- clip(z - learning_rate * gradient)`` with backtracking.
+
+    ``learning_rate`` has units of m² because the normalized gradient has units
+    of 1/m.  When omitted it is derived from the scout spacing, which makes the
+    default independent of the user's z units and the metric's raw magnitude.
+    Every propagation, including derivative probes, counts against
+    ``max_evaluations``.  The returned best z is always an actually evaluated
+    point, never an interpolated estimate.  ``n_starts`` can override the
+    automatically allocated coarse-scan count for experiments; despite its
+    legacy name it now controls global discovery density.
+    """
+    if not np.isfinite(z_min_m) or not np.isfinite(z_max_m):
+        raise ValueError("z bounds must be finite")
+    if z_max_m <= z_min_m:
+        raise ValueError("z_max_m must be greater than z_min_m")
+    if max_evaluations < 3:
+        raise ValueError("gradient descent requires at least 3 evaluations")
+    if n_starts is not None and n_starts < 1:
+        raise ValueError("n_starts must be at least 1")
+    if not 0.0 < backtrack_factor < 1.0:
+        raise ValueError("backtrack_factor must be between 0 and 1")
+    if (finite_difference_step_m is not None
+            and (not np.isfinite(finite_difference_step_m)
+                 or finite_difference_step_m <= 0.0)):
+        raise ValueError("finite_difference_step_m must be positive and finite")
+    if (learning_rate is not None
+            and (not np.isfinite(learning_rate) or learning_rate <= 0.0)):
+        raise ValueError("learning_rate must be positive and finite")
+    if not 0.0 < coarse_fraction <= 1.0:
+        raise ValueError("coarse_fraction must be between 0 and 1")
+    if smooth_sigma < 0.0 or not np.isfinite(smooth_sigma):
+        raise ValueError("smooth_sigma must be finite and non-negative")
+    if min_prominence < 0.0 or not np.isfinite(min_prominence):
+        raise ValueError("min_prominence must be finite and non-negative")
+
+    discovery_metric = FocusMetric.LAPLACIAN_VARIANCE
+    _eval = _make_multi_metric_evaluator(
+        field, base_params, method, (metric, discovery_metric),
+        roi_bounds=roi_bounds, ref_field=ref_field,
+    )
+    minimize = _is_minimize(metric)
+    full_range = float(z_max_m - z_min_m)
+    evaluations = 0
+    cache: dict[float, float] = {}
+    discovery_cache: dict[float, float] = {}
+    z_hist: List[float] = []
+    f_hist: List[float] = []
+    s_hist: List[float] = []
+
+    def evaluate(z: float, step_value: float) -> float:
+        nonlocal evaluations
+        z = float(np.clip(z, z_min_m, z_max_m))
+        if z in cache:
+            return cache[z]
+        if evaluations >= max_evaluations:
+            raise RuntimeError("autofocus evaluation budget exhausted")
+        if cancel_check and cancel_check():
+            raise AutofocusCancelled()
+        f, discovery_f = _eval(z)
+        f = float(f)
+        evaluations += 1
+        cache[z] = f
+        discovery_cache[z] = float(discovery_f)
+        z_hist.append(z)
+        f_hist.append(f)
+        s_hist.append(float(abs(step_value)))
+        if on_progress:
+            on_progress(evaluations, max_evaluations)
+        return f
+
+    # Phase 1 — global discovery. Reserve at least three evaluations for local
+    # refinement when the budget permits it. The default gives discovery 60%
+    # of a 40-evaluation budget, capped at 24 positions. Extra budget refines
+    # the selected basin instead of changing discovery resolution and thereby
+    # selecting a different basin for the same frame.
+    if n_starts is None:
+        requested_scouts = min(24, max(7, int(max_evaluations * coarse_fraction)))
+    else:
+        requested_scouts = int(n_starts)
+    max_scouts = max_evaluations if max_evaluations < 6 else max_evaluations - 3
+    scout_count = min(max_scouts, requested_scouts, 41)
+    scout_count = max(1, scout_count)
+    if scout_count == 1:
+        scout_z = np.array([(z_min_m + z_max_m) / 2.0])
+    else:
+        scout_z = np.linspace(z_min_m, z_max_m, scout_count)
+    scout_f = np.array([evaluate(float(z), 0.0) for z in scout_z])
+    discovery_f = np.array([discovery_cache[float(z)] for z in scout_z])
+    scout_loss = scout_f if minimize else -scout_f
+    # Wide-range synthetic validation showed that entropy and several other
+    # metrics have stronger non-physical extrema at z=0 or the range edge.
+    # Laplacian variance is therefore the fixed *basin locator*. The caller's
+    # selected metric still drives finite-difference refinement inside it.
+    utility = np.asarray(discovery_f, dtype=np.float64)
+    loss_scale = max(float(np.ptp(scout_loss)),
+                     float(np.max(np.abs(scout_loss))) * 1e-9,
+                     np.finfo(float).eps)
+
+    scout_spacing = full_range / max(scout_count - 1, 1)
+    if scout_count >= 3 and float(np.ptp(utility)) > np.finfo(float).eps:
+        utility_norm = (utility - float(np.min(utility))) / float(np.ptp(utility))
+        effective_sigma = min(float(smooth_sigma), scout_count / 6.0)
+        utility_smooth = (
+            gaussian_filter1d(utility_norm, sigma=effective_sigma, mode="nearest")
+            if effective_sigma > 0.0 else utility_norm.copy()
+        )
+        peaks, properties = find_peaks(
+            utility_smooth,
+            prominence=float(min_prominence),
+        )
+        if len(peaks):
+            keep = (peaks >= 3) & (peaks <= scout_count - 4)
+            if np.any(keep):
+                peaks = peaks[keep]
+                properties = {
+                    key: np.asarray(value)[keep]
+                    for key, value in properties.items()
+                }
+    else:
+        utility_smooth = np.asarray(utility, dtype=np.float64)
+        peaks = np.array([], dtype=int)
+        properties = {}
+
+    if len(peaks):
+        prominences = np.asarray(properties["prominences"], dtype=np.float64)
+        # Prominence identifies a distinct basin; the small height term breaks
+        # ties in favour of the stronger focus response without allowing a
+        # high range-edge artefact to win (find_peaks excludes both edges).
+        rank_score = prominences + 0.15 * utility_smooth[peaks]
+        selected_number = int(np.argmax(rank_score))
+        peak_idx = int(peaks[selected_number])
+        left_idx = int(properties["left_bases"][selected_number])
+        right_idx = int(properties["right_bases"][selected_number])
+    elif scout_count >= 3:
+        # No prominent peak: still avoid the two range edges, which frequently
+        # dominate DHM metrics because propagation artefacts grow at the scan
+        # limits. This is a deterministic low-confidence fallback.
+        peak_idx = 1 + int(np.argmax(utility_smooth[1:-1]))
+        left_idx = peak_idx - 1
+        right_idx = peak_idx + 1
+    else:
+        peak_idx = int(np.argmax(utility_smooth))
+        left_idx = max(0, peak_idx - 1)
+        right_idx = min(scout_count - 1, peak_idx + 1)
+
+    left_idx = max(0, min(left_idx, peak_idx - 1)) if peak_idx > 0 else 0
+    right_idx = (
+        min(scout_count - 1, max(right_idx, peak_idx + 1))
+        if peak_idx < scout_count - 1 else scout_count - 1
+    )
+    basin_min = float(scout_z[left_idx])
+    basin_max = float(scout_z[right_idx])
+    if basin_max <= basin_min:
+        basin_min = max(float(z_min_m), float(scout_z[peak_idx]) - scout_spacing)
+        basin_max = min(float(z_max_m), float(scout_z[peak_idx]) + scout_spacing)
+    basin_span = max(basin_max - basin_min, scout_spacing)
+
+    fd_step = (float(finite_difference_step_m)
+               if finite_difference_step_m is not None
+               else min(full_range / max(2 * max_evaluations, 40),
+                        basin_span / 12.0))
+    fd_step = min(fd_step, scout_spacing, basin_span / 4.0)
+
+    initial_lr = (float(learning_rate) if learning_rate is not None
+                  else scout_spacing ** 2)
+    max_lr = max(initial_lr, scout_spacing ** 2)
+    min_lr = max(np.finfo(float).eps, initial_lr * 1e-8)
+    z_tolerance = max(full_range * 1e-9, np.finfo(float).eps)
+
+    # Seed only inside the chosen basin. The coarse peak and its immediate
+    # neighbours provide numerical resilience without jumping to another basin.
+    local_lo = max(left_idx, peak_idx - 2)
+    local_hi = min(right_idx, peak_idx + 2)
+    local_indices = np.arange(local_lo, local_hi + 1, dtype=int)
+    order = local_indices[np.argsort(scout_loss[local_indices])]
+    local_starts = min(3, len(order))
+    for start_number, idx in enumerate(order[:local_starts]):
+        if evaluations >= max_evaluations:
+            break
+        z = float(scout_z[int(idx)])
+        f = float(scout_f[int(idx)])
+        loss = (f if minimize else -f) / loss_scale
+        lr = initial_lr
+
+        # Reserve a fair slice for each remaining start instead of allowing the
+        # first local basin to consume the entire propagation budget.
+        starts_left = local_starts - start_number
+        local_limit = evaluations + max(1, (max_evaluations - evaluations) // starts_left)
+        while evaluations < min(local_limit, max_evaluations):
+            left = max(basin_min, z - fd_step)
+            right = min(basin_max, z + fd_step)
+            if right - left <= z_tolerance:
+                break
+
+            # Two probes give a central difference in the interior and the
+            # corresponding bounded secant at either z-range edge.
+            needed = int(left not in cache) + int(right not in cache)
+            if evaluations + needed > min(local_limit, max_evaluations):
+                break
+            f_left = evaluate(left, fd_step)
+            f_right = evaluate(right, fd_step)
+            loss_left = (f_left if minimize else -f_left) / loss_scale
+            loss_right = (f_right if minimize else -f_right) / loss_scale
+            gradient = (loss_right - loss_left) / (right - left)
+            if not np.isfinite(gradient) or abs(gradient) <= gradient_tolerance:
+                break
+
+            accepted = False
+            trial_lr = lr
+            while trial_lr >= min_lr and evaluations < min(local_limit, max_evaluations):
+                delta = float(np.clip(-trial_lr * gradient,
+                                      -scout_spacing, scout_spacing))
+                candidate = float(np.clip(z + delta, basin_min, basin_max))
+                if abs(candidate - z) <= z_tolerance:
+                    break
+                candidate_f = evaluate(candidate, abs(candidate - z))
+                candidate_loss = (candidate_f if minimize else -candidate_f) / loss_scale
+                if candidate_loss < loss:
+                    z, f, loss = candidate, candidate_f, candidate_loss
+                    lr = min(trial_lr * 1.5, max_lr)
+                    accepted = True
+                    break
+                trial_lr *= backtrack_factor
+
+            if not accepted:
+                break
+
+    basin_points = [(z, f) for z, f in cache.items()
+                    if basin_min <= z <= basin_max]
+    assert basin_points
+    if minimize:
+        best_z, best_f = min(basin_points, key=lambda item: item[1])
+    else:
+        best_z, best_f = max(basin_points, key=lambda item: item[1])
+    return AdaptiveStepResult(
+        best_z_m=best_z,
+        best_score=float(best_f),
+        evaluations=evaluations,
+        z_history=np.array(z_hist),
+        score_history=np.array(f_hist),
+        step_history=np.array(s_hist),
+        method_name="Global-Bracketed Gradient Descent",
+        coarse_z=np.asarray(scout_z, dtype=np.float64),
+        coarse_scores=np.asarray(scout_f, dtype=np.float64),
+        basin_bounds_m=(basin_min, basin_max),
+        selected_peak_z_m=float(scout_z[peak_idx]),
     )
 
 
@@ -702,6 +994,18 @@ class AdaptiveFocusState:
                 z_max_m=zmax,
                 coarse_steps=self.steps,
                 fine_tolerance_m=1e-6,
+            )
+            self.current_z_m = res.best_z_m
+
+        elif "Gradient Descent" in self.algorithm:
+            res = gradient_descent_search(
+                field=field,
+                base_params=base_params,
+                method=method,
+                metric=self.metric,
+                z_min_m=zmin,
+                z_max_m=zmax,
+                max_evaluations=self.steps,
             )
             self.current_z_m = res.best_z_m
 

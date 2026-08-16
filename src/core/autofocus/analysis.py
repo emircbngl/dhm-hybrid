@@ -35,6 +35,7 @@ from .search_adaptive import (
     adaptive_bracketing_search,
     adaptive_gradient_search,
     adaptive_ratio_search,
+    gradient_descent_search,
 )
 from .search_classic import (
     autofocus_zscan,
@@ -404,6 +405,11 @@ def autofocus_benchmark(
 
         _run_and_record("Adaptive Gradient",
             lambda f=fm: adaptive_gradient_search(
+                field, base_params, method, f, z_min_m, z_max_m,
+                max_evaluations=steps), fm)
+
+        _run_and_record("Gradient Descent (Finite Difference)",
+            lambda f=fm: gradient_descent_search(
                 field, base_params, method, f, z_min_m, z_max_m,
                 max_evaluations=steps), fm)
 

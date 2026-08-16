@@ -35,6 +35,7 @@ class FocusTab(QWidget):
     ALGO_ROBUST = "Robust Coarse-to-Fine"
     ALGO_GOLDEN = "Coarse-to-Fine (Golden Section)"
     ALGO_LINEAR = "Linear Sweep (Exhaustive)"
+    ALGO_GRADIENT_DESCENT = "Gradient Descent (Finite Difference)"
     ALGO_ADAPT_GRADIENT = "Adaptive Step: Gradient"
     ALGO_ADAPT_RATIO = "Adaptive Step: Ratio"
     ALGO_ADAPT_BRACKET = "Adaptive Step: Bracketing"
@@ -72,6 +73,7 @@ class FocusTab(QWidget):
         self.algo_combo.addItem(self.ALGO_ROBUST)
         self.algo_combo.addItem(self.ALGO_GOLDEN)
         self.algo_combo.addItem(self.ALGO_LINEAR)
+        self.algo_combo.addItem(self.ALGO_GRADIENT_DESCENT)
         fg.addWidget(QLabel("Algorithm"), row, 0)
         fg.addWidget(self.algo_combo, row, 1); row += 1
 

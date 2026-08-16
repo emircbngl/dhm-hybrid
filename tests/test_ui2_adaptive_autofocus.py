@@ -236,6 +236,7 @@ def test_algorithm_list_shape():
     assert "zscan" in algos
     assert "coarse_to_fine" in algos
     assert "robust" in algos
+    assert "gradient_descent" in algos
     assert "adaptive_gradient" in algos
     assert "adaptive_bracketing" in algos
     assert "adaptive_distance" in algos
@@ -278,3 +279,10 @@ def test_adaptive_gradient_profile_relabels_steps_to_budget():
     from ui2.workers import af_algorithm_input_profile
     prof = af_algorithm_input_profile("adaptive_gradient")
     assert prof["steps_label"] == "max evals"
+
+
+def test_gradient_descent_profile_relabels_steps_to_budget():
+    from ui2.workers import af_algorithm_input_profile
+    prof = af_algorithm_input_profile("gradient_descent")
+    assert prof["steps_label"] == "max evals"
+    assert "finite differences" in prof["steps_tip"]

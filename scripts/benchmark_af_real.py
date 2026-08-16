@@ -46,6 +46,7 @@ from core.autofocus.search_adaptive import (  # noqa: E402
     adaptive_bracketing_search,
     adaptive_distance_search,
     adaptive_gradient_search,
+    gradient_descent_search,
 )
 from core.autofocus.search_classic import (  # noqa: E402
     coarse_to_fine_search,
@@ -144,6 +145,11 @@ def _algorithms(field, base, metric) -> List[Tuple[str, Callable[[], Any]]]:
             field, base, m, metric, z_min_m=Z_MIN_M, z_max_m=Z_MAX_M,
             max_evaluations=BUDGET)
 
+    def _grad_descent():
+        return gradient_descent_search(
+            field, base, m, metric, z_min_m=Z_MIN_M, z_max_m=Z_MAX_M,
+            max_evaluations=BUDGET)
+
     def _brack():
         return adaptive_bracketing_search(
             field, base, m, metric, z_min_m=Z_MIN_M, z_max_m=Z_MAX_M,
@@ -161,6 +167,7 @@ def _algorithms(field, base, metric) -> List[Tuple[str, Callable[[], Any]]]:
         ("zscan", _zscan),
         ("coarse_to_fine", _coarse),
         ("robust", _robust),
+        ("gradient_descent", _grad_descent),
         ("adaptive_gradient", _grad),
         ("adaptive_bracketing", _brack),
         ("adaptive_distance", _dist),
@@ -236,7 +243,8 @@ def main() -> None:
     for metric_name in METRICS:
         for name in [a for a, _ in _algorithms(np.zeros((4, 4)), None, None)] \
                 if False else ["zscan", "coarse_to_fine", "robust",
-                               "adaptive_gradient", "adaptive_bracketing",
+                               "gradient_descent", "adaptive_gradient",
+                               "adaptive_bracketing",
                                "adaptive_distance"]:
             rows = [r for r in results
                     if r.get("algorithm") == name
