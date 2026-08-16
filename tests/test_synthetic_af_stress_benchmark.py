@@ -8,6 +8,7 @@ from scripts.benchmark_af_synthetic_stress import (
     FACTOR_LEVELS,
     StressScenario,
     _build_field,
+    _collapse_nearby_z,
     _plane_detection_scores,
     _sphere,
     factorial_scenarios,
@@ -16,7 +17,11 @@ from scripts.benchmark_af_synthetic_stress import (
     scenario_catalog,
 )
 from core.autofocus import FocusMetric
-from core.depth_map import find_object_focus_planes
+from core.depth_map import (
+    find_object_focus_planes,
+    find_object_focus_planes_3d,
+    find_object_focus_planes_hybrid,
+)
 from core.reconstruction import ReconstructionMethod
 from fixtures.synthetic_hologram import (
     HologramConfig,
@@ -80,6 +85,13 @@ def test_plane_scores_are_one_to_one_and_penalize_false_positives():
     assert precision == 0.5  # two correct among four detections
     assert recall == 1.0     # each truth can be consumed only once
     assert f1 == pytest.approx(2.0 / 3.0)
+
+
+def test_same_depth_objects_collapse_to_one_focus_plane():
+    collapsed = _collapse_nearby_z(
+        (12.0e-3, 12.2e-3, 11.9e-3, 18.0e-3), 0.5e-3,
+    )
+    assert collapsed == pytest.approx((12.0e-3, 18.0e-3))
 
 
 def test_sampling_guard_rejects_old_dc_overlapping_geometry():
@@ -148,3 +160,61 @@ def test_phase_local_masks_recover_three_spatial_focus_planes():
         assert min(abs(z - expected) for z in found) < 0.5e-3
     assert all(0 < p.centroid_yx[0] < 255 for p in planes[:3])
     assert all(0 < p.centroid_yx[1] < 255 for p in planes[:3])
+
+
+def test_3d_persistence_recovers_clean_planes_without_max_projection_ghosts():
+    scenario = StressScenario(
+        name="three_3d_planes",
+        difficulty_axis="depth_separation",
+        spheres=(
+            _sphere(11, 6, -55, -45),
+            _sphere(11, 12, 50, 0),
+            _sphere(11, 20, -45, 55),
+        ),
+        expected_z_m=(6e-3, 12e-3, 20e-3), primary_z_m=None,
+    )
+    field, base = _build_field(scenario, (256, 256), seed=123)
+    planes = find_object_focus_planes_3d(
+        field, base, ReconstructionMethod.ASM, -5e-3, 45e-3, n_steps=60,
+    )
+    found = [plane.z_m for plane in planes]
+    assert len(found) == 3
+    for expected in scenario.expected_z_m:
+        assert min(abs(z - expected) for z in found) < 0.5e-3
+    assert all(plane.z_span_steps >= 2 for plane in planes)
+    assert all(plane.confidence >= 0.52 for plane in planes)
+
+
+def test_calibrated_hybrid_keeps_clean_planes_with_high_probability():
+    scenario = StressScenario(
+        name="three_hybrid_planes",
+        difficulty_axis="depth_separation",
+        spheres=(
+            _sphere(11, 6, -55, -45),
+            _sphere(11, 12, 50, 0),
+            _sphere(11, 20, -45, 55),
+        ),
+        expected_z_m=(6e-3, 12e-3, 20e-3), primary_z_m=None,
+    )
+    field, base = _build_field(scenario, (256, 256), seed=123)
+    planes = find_object_focus_planes_hybrid(
+        field, base, ReconstructionMethod.ASM, -5e-3, 45e-3, n_steps=60,
+    )
+    assert len(planes) == 3
+    assert all(plane.confidence >= 0.70 for plane in planes)
+    for expected in scenario.expected_z_m:
+        assert min(abs(plane.z_m - expected) for plane in planes) < 0.5e-3
+
+
+def test_calibrated_hybrid_can_abstain_instead_of_forcing_a_plane():
+    scenario = StressScenario(
+        name="unresolved_hybrid",
+        difficulty_axis="object_size",
+        spheres=(_sphere(4, 12),),
+        expected_z_m=(12e-3,), primary_z_m=12e-3,
+    )
+    field, base = _build_field(scenario, (128, 128), seed=321)
+    assert find_object_focus_planes_hybrid(
+        field, base, ReconstructionMethod.ASM, -5e-3, 45e-3,
+        n_steps=32, probability_threshold=0.999,
+    ) == []

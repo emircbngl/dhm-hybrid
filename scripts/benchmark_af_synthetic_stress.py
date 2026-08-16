@@ -56,7 +56,11 @@ from core.autofocus.search_adaptive import (  # noqa: E402
 from core.autofocus.search_classic import (  # noqa: E402
     robust_coarse_to_fine_search,
 )
-from core.depth_map import find_object_focus_planes  # noqa: E402
+from core.depth_map import (  # noqa: E402
+    find_object_focus_planes,
+    find_object_focus_planes_3d,
+    find_object_focus_planes_hybrid,
+)
 from core.offaxis import OffAxisParams, extract_complex_field_offaxis  # noqa: E402
 from core.reconstruction import (  # noqa: E402
     ReconstructionMethod,
@@ -320,11 +324,27 @@ def _algorithm_factories(
         best = planes[0].z_m if planes else float("nan")
         return _ObjectLocalResult(best, planes, budget)
 
+    def object_local_3d():
+        planes = tuple(find_object_focus_planes_3d(
+            field, base, method, z_min_m, z_max_m, n_steps=budget,
+        ))
+        best = planes[0].z_m if planes else float("nan")
+        return _ObjectLocalResult(best, planes, budget)
+
+    def object_local_hybrid():
+        planes = tuple(find_object_focus_planes_hybrid(
+            field, base, method, z_min_m, z_max_m, n_steps=budget,
+        ))
+        best = planes[0].z_m if planes else float("nan")
+        return _ObjectLocalResult(best, planes, budget)
+
     return {
         "gradient_descent": gradient_descent,
         "robust": robust,
         "zscan": zscan,
         "object_local": object_local,
+        "object_local_3d": object_local_3d,
+        "object_local_hybrid": object_local_hybrid,
     }
 
 
@@ -355,6 +375,22 @@ def _plane_detection_scores(
         if precision + recall > 0.0 else 0.0
     )
     return precision, recall, f1
+
+
+def _collapse_nearby_z(
+    values: Sequence[float], merge_tolerance_m: float,
+) -> tuple[float, ...]:
+    """Collapse several spatial objects sharing one axial focus plane."""
+    if not values:
+        return ()
+    ordered = sorted(float(value) for value in values)
+    groups: list[list[float]] = [[ordered[0]]]
+    for value in ordered[1:]:
+        if value - groups[-1][-1] <= merge_tolerance_m:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return tuple(float(np.median(group)) for group in groups)
 
 
 def run_benchmark(
@@ -396,16 +432,32 @@ def run_benchmark(
                 runtime_ms = (time.monotonic() - t0) * 1000.0
                 best_z_m = float(result.best_z_m)
                 object_planes = tuple(getattr(result, "object_planes", ()))
-                detected_z_m = tuple(float(item.z_m) for item in object_planes)
-                nearest_error_m = (
-                    min(abs(best_z_m - z) for z in scenario.expected_z_m)
-                    if np.isfinite(best_z_m) else float("inf")
-                )
-                primary_error_m = (
-                    abs(best_z_m - scenario.primary_z_m)
-                    if scenario.primary_z_m is not None
-                    and np.isfinite(best_z_m) else None
-                )
+                is_object_algorithm = hasattr(result, "object_planes")
+                detected_object_z_m = tuple(
+                    float(item.z_m) for item in object_planes)
+                detected_z_m = _collapse_nearby_z(
+                    detected_object_z_m, hit_tolerance_m)
+                if detected_z_m:
+                    nearest_error_m = min(
+                        abs(found - truth)
+                        for found in detected_z_m
+                        for truth in scenario.expected_z_m
+                    )
+                    primary_error_m = (
+                        min(abs(found - scenario.primary_z_m)
+                            for found in detected_z_m)
+                        if scenario.primary_z_m is not None else None
+                    )
+                else:
+                    nearest_error_m = (
+                        min(abs(best_z_m - z) for z in scenario.expected_z_m)
+                        if np.isfinite(best_z_m) else float("inf")
+                    )
+                    primary_error_m = (
+                        abs(best_z_m - scenario.primary_z_m)
+                        if scenario.primary_z_m is not None
+                        and np.isfinite(best_z_m) else None
+                    )
                 truth_errors = [
                     min((abs(found - truth) for found in detected_z_m),
                         default=float("inf"))
@@ -447,8 +499,31 @@ def run_benchmark(
                         scenario.z_bounds_m[1] * 1e3,
                     ],
                     "best_z_mm": best_z_m * 1e3,
-                    "detected_object_z_mm": [z * 1e3 for z in detected_z_m],
-                    "detected_object_count": len(detected_z_m),
+                    "detected_object_z_mm": [
+                        z * 1e3 for z in detected_object_z_m],
+                    "detected_object_count": len(detected_object_z_m),
+                    "detected_object_confidence": [
+                        float(getattr(item, "confidence", 0.0))
+                        for item in object_planes
+                    ],
+                    "detected_object_strength": [
+                        float(getattr(item, "mean_confidence", 0.0))
+                        for item in object_planes
+                    ],
+                    "detected_object_contrast_snr": [
+                        float(getattr(item, "contrast_snr", 0.0))
+                        for item in object_planes
+                    ],
+                    "detected_object_complex_coherence": [
+                        float(getattr(item, "complex_coherence", 0.0))
+                        for item in object_planes
+                    ],
+                    "detected_focus_plane_z_mm": [
+                        z * 1e3 for z in detected_z_m],
+                    "detected_focus_plane_count": len(detected_z_m),
+                    "abstained": is_object_algorithm and len(detected_z_m) == 0,
+                    "measurement_available": (
+                        not is_object_algorithm or len(detected_z_m) > 0),
                     "all_plane_mean_error_mm": (
                         float(np.mean(truth_errors)) * 1e3
                         if truth_errors else None
@@ -503,7 +578,10 @@ def _print_rows(rows: Sequence[dict[str, Any]]) -> None:
 
 def _print_aggregate(rows: Sequence[dict[str, Any]]) -> None:
     print("\naggregate by difficulty axis")
-    print(f"{'axis':20s} {'algorithm':18s} {'median err':>11s} {'hit rate':>9s}")
+    print(
+        f"{'axis':20s} {'algorithm':18s} {'median err':>11s} "
+        f"{'hit rate':>9s} {'coverage':>9s} {'precision':>9s}"
+    )
     keys = sorted({(r["difficulty_axis"], r["algorithm"]) for r in rows})
     for axis, algorithm in keys:
         selected = [r for r in rows
@@ -511,9 +589,13 @@ def _print_aggregate(rows: Sequence[dict[str, Any]]) -> None:
                     and r["algorithm"] == algorithm]
         errors = [r["nearest_plane_error_mm"] for r in selected]
         hit_rate = sum(bool(r["hit_any_plane"]) for r in selected) / len(selected)
+        coverage = sum(bool(r["measurement_available"])
+                       for r in selected) / len(selected)
+        precision = float(np.mean([r["plane_precision"] for r in selected]))
         print(
             f"{axis:20s} {algorithm:18s} "
-            f"{float(np.median(errors)):11.3f} {hit_rate:9.0%}"
+            f"{float(np.median(errors)):11.3f} {hit_rate:9.0%} "
+            f"{coverage:9.0%} {precision:9.0%}"
         )
 
 
@@ -539,7 +621,8 @@ def main() -> None:
     parser.add_argument(
         "--algorithms",
         default="gradient_descent,robust",
-        help="Comma-separated: gradient_descent, robust, zscan, object_local.",
+        help=("Comma-separated: gradient_descent, robust, zscan, "
+              "object_local, object_local_3d, object_local_hybrid."),
     )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()

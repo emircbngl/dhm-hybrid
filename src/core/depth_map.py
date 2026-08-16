@@ -42,7 +42,7 @@ Out of scope (deferred to v1.2-beta):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -106,6 +106,11 @@ class ObjectFocusPlane:
     prominence: float
     mean_confidence: float
     metric: FocusMetric
+    confidence: float = 1.0
+    z_span_steps: int = 1
+    channel_agreement: float = 1.0
+    contrast_snr: float = 0.0
+    complex_coherence: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +464,7 @@ def find_object_focus_planes(
     z_values = np.linspace(z_min_m, z_max_m, n_steps)
     h, w = field.shape[-2:]
     stack = np.empty((n_steps, h, w), dtype=np.float32)
+    reconstructions = np.empty((n_steps, h, w), dtype=np.complex64)
     for i, z in enumerate(z_values):
         if cancel_check and cancel_check():
             from .autofocus.evaluator import AutofocusCancelled
@@ -470,6 +476,7 @@ def find_object_focus_planes(
             n=base_params.n,
         )
         recon = propagate(field, params, method, fft=fft, force_python=True)
+        reconstructions[i] = recon
         stack[i] = local_kernel(recon, window_size)
 
     confidence = np.max(stack, axis=0)
@@ -525,6 +532,27 @@ def find_object_focus_planes(
         if (obj_slice[0].start == 0 or obj_slice[1].start == 0
                 or obj_slice[0].stop == h or obj_slice[1].stop == w):
             continue
+        expanded = binary_dilation(
+            selected, structure=np.ones((3, 3), dtype=bool),
+            iterations=max(2, window_size // 2),
+        )
+        ring = expanded & ~binary_dilation(
+            selected, structure=np.ones((3, 3), dtype=bool), iterations=1)
+        if np.count_nonzero(ring) < 8:
+            continue
+        focused = reconstructions[idx]
+        ring_values = focused[ring]
+        background = np.complex64(
+            np.median(ring_values.real) + 1j * np.median(ring_values.imag))
+        signal_values = focused[selected] - background
+        noise_values = ring_values - background
+        signal_rms = float(np.sqrt(np.mean(np.abs(signal_values) ** 2)))
+        noise_rms = float(np.sqrt(np.mean(np.abs(noise_values) ** 2)))
+        contrast_snr = signal_rms / max(noise_rms, np.finfo(float).eps)
+        coherence = float(
+            np.abs(np.mean(signal_values))
+            / max(signal_rms, np.finfo(float).eps)
+        )
         results.append(ObjectFocusPlane(
             object_id=label_id,
             centroid_yx=(float(ys.mean()), float(xs.mean())),
@@ -537,10 +565,354 @@ def find_object_focus_planes(
             prominence=float(prominences[peak_slot]),
             mean_confidence=float(np.mean(confidence[selected])),
             metric=metric,
+            confidence=float(prominences[peak_slot]),
+            contrast_snr=contrast_snr,
+            complex_coherence=coherence,
         ))
 
     results.sort(key=lambda item: (-item.prominence, -item.area_px))
     return results
+
+
+def find_object_focus_planes_3d(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    z_min_m: float,
+    z_max_m: float,
+    *,
+    n_steps: int = 60,
+    window_size: int = 7,
+    detection_percentile: float = 98.0,
+    min_area_px: int = 8,
+    min_persistence_steps: int = 2,
+    smooth_sigma_z: float = 1.0,
+    min_prominence: float = 0.08,
+    min_confidence: float = 0.35,
+    min_component_strength: float = 2.5,
+    min_contrast_snr: float = 1.0,
+    min_complex_coherence: float = 0.45,
+    max_area_fraction: float = 0.10,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> list[ObjectFocusPlane]:
+    """Multi-channel 3-D object persistence autofocus.
+
+    This experimental successor to :func:`find_object_focus_planes` labels
+    coherent components in ``(z, y, x)`` instead of thresholding a 2-D
+    ``max_z`` projection. A candidate must occupy multiple neighbouring z
+    planes, which suppresses impulsive noise. Phase/complex variance,
+    amplitude-Laplacian variance and Tenengrad are computed from the same
+    reconstruction and combined after robust plane-wise normalisation.
+
+    Returned candidates are confidence-gated. An empty list is an intentional
+    ``cannot measure`` result rather than a forced z estimate.
+    """
+    if z_max_m <= z_min_m:
+        raise ValueError("z_max_m must exceed z_min_m")
+    if n_steps < 5:
+        raise ValueError("n_steps must be >= 5")
+    if window_size < 3:
+        raise ValueError("window_size must be >= 3")
+    if not (90.0 <= detection_percentile < 100.0):
+        raise ValueError("detection_percentile must be in [90, 100)")
+    if min_area_px < 1 or min_persistence_steps < 2:
+        raise ValueError("area must be positive and persistence >= 2")
+    if not (0.0 <= min_confidence <= 1.0):
+        raise ValueError("min_confidence must be in [0, 1]")
+    if min_component_strength < 0.0:
+        raise ValueError("min_component_strength must be non-negative")
+    if min_contrast_snr < 0.0:
+        raise ValueError("min_contrast_snr must be non-negative")
+    if not (0.0 <= min_complex_coherence <= 1.0):
+        raise ValueError("min_complex_coherence must be in [0, 1]")
+    if not (0.0 < max_area_fraction <= 1.0):
+        raise ValueError("max_area_fraction must be in (0, 1]")
+
+    from scipy.ndimage import (
+        binary_closing,
+        binary_dilation,
+        binary_opening,
+        find_objects,
+        gaussian_filter1d,
+        label,
+        uniform_filter1d,
+    )
+    from scipy.signal import find_peaks
+
+    fft = get_best_fft_backend()
+    z_values = np.linspace(z_min_m, z_max_m, n_steps)
+    h, w = field.shape[-2:]
+    channel_metrics = (
+        FocusMetric.PHASE_VARIANCE,
+        FocusMetric.LAPLACIAN_VARIANCE,
+        FocusMetric.TENENGRAD,
+    )
+    channels = np.empty((3, n_steps, h, w), dtype=np.float32)
+    reconstructions = np.empty((n_steps, h, w), dtype=np.complex64)
+    for zi, z in enumerate(z_values):
+        if cancel_check and cancel_check():
+            from .autofocus.evaluator import AutofocusCancelled
+            raise AutofocusCancelled()
+        params = ReconstructionParams(
+            wavelength_m=base_params.wavelength_m,
+            pixel_size_m=base_params.pixel_size_m,
+            z_m=float(z), n=base_params.n,
+        )
+        recon = propagate(field, params, method, fft=fft, force_python=True)
+        reconstructions[zi] = recon
+        for ci, channel_metric in enumerate(channel_metrics):
+            channels[ci, zi] = _LOCAL_KERNELS[channel_metric](
+                recon, window_size)
+
+    # Robust plane-wise signal above background. Each channel and plane is
+    # put on a comparable non-negative scale without letting a single outlier
+    # set the range for the full z stack.
+    robust = np.empty_like(channels)
+    for ci in range(channels.shape[0]):
+        for zi in range(n_steps):
+            plane = channels[ci, zi]
+            med = float(np.median(plane))
+            mad = float(np.median(np.abs(plane - med)))
+            scale = max(1.4826 * mad, np.finfo(np.float32).eps)
+            robust[ci, zi] = np.clip((plane - med) / scale, 0.0, 25.0)
+
+    ensemble = (
+        0.60 * robust[0] + 0.25 * robust[1] + 0.15 * robust[2]
+    )
+    ensemble = gaussian_filter1d(
+        ensemble, sigma=smooth_sigma_z, axis=0, mode="nearest")
+    finite = ensemble[np.isfinite(ensemble)]
+    if finite.size == 0 or float(np.max(finite)) <= 0.0:
+        return []
+    threshold = float(np.percentile(finite, detection_percentile))
+    active = ensemble >= threshold
+    active = binary_opening(
+        active, structure=np.ones((1, 3, 3), dtype=bool))
+    active = binary_closing(
+        active, structure=np.ones((1, 3, 3), dtype=bool))
+    persistence = uniform_filter1d(
+        active.astype(np.float32),
+        size=min_persistence_steps,
+        axis=0,
+        mode="constant",
+    )
+    active &= persistence >= (1.0 - 1e-6)
+
+    labelled, count = label(
+        active, structure=np.ones((3, 3, 3), dtype=bool))
+    slices = find_objects(labelled)
+    step = float(z_values[1] - z_values[0])
+    results: list[ObjectFocusPlane] = []
+    for component_id in range(1, count + 1):
+        component = labelled == component_id
+        coords = np.where(component)
+        if coords[0].size == 0:
+            continue
+        z0, z1 = int(coords[0].min()), int(coords[0].max()) + 1
+        z_span = z1 - z0
+        spatial = np.any(component, axis=0)
+        area = int(np.count_nonzero(spatial))
+        if (z_span < min_persistence_steps or area < min_area_px
+                or area > int(max_area_fraction * h * w)):
+            continue
+        obj_slice = slices[component_id - 1]
+        assert obj_slice is not None
+        if (obj_slice[1].start == 0 or obj_slice[2].start == 0
+                or obj_slice[1].stop == h or obj_slice[2].stop == w):
+            continue
+
+        spatial = binary_dilation(
+            spatial, structure=np.ones((3, 3), dtype=bool), iterations=1)
+        curves = np.mean(channels[:, :, spatial], axis=2, dtype=np.float64)
+        norm_curves = np.zeros_like(curves)
+        channel_peaks: list[int] = []
+        for ci, curve in enumerate(curves):
+            lo, hi = float(curve.min()), float(curve.max())
+            if hi - lo > 1e-15:
+                norm_curves[ci] = (curve - lo) / (hi - lo)
+            norm_curves[ci] = gaussian_filter1d(
+                norm_curves[ci], sigma=smooth_sigma_z, mode="nearest")
+            channel_peaks.append(int(np.argmax(norm_curves[ci])))
+
+        curve = (
+            0.60 * norm_curves[0]
+            + 0.25 * norm_curves[1]
+            + 0.15 * norm_curves[2]
+        )
+        peaks, props = find_peaks(curve, prominence=min_prominence)
+        if peaks.size == 0:
+            continue
+        # Prefer a peak supported by the 3-D component; allow two samples for
+        # the Gaussian/persistence expansion around its measured z extent.
+        supported = np.flatnonzero((peaks >= max(1, z0 - 2))
+                                   & (peaks <= min(n_steps - 2, z1 + 1)))
+        if supported.size == 0:
+            continue
+        slot = int(supported[np.argmax(props["prominences"][supported])])
+        idx = int(peaks[slot])
+        prominence = float(props["prominences"][slot])
+
+        denom = curve[idx - 1] - 2.0 * curve[idx] + curve[idx + 1]
+        delta = 0.0
+        if abs(float(denom)) > 1e-12 and denom < 0.0:
+            delta = float(np.clip(
+                0.5 * (curve[idx - 1] - curve[idx + 1]) / denom,
+                -1.0, 1.0,
+            ))
+
+        peak_spread = float(np.std(channel_peaks))
+        agreement = float(np.exp(-peak_spread / max(1.0, n_steps * 0.08)))
+        persistence_score = min(1.0, z_span / max(3.0, n_steps * 0.12))
+        confidence = float(np.clip(
+            prominence * (0.65 + 0.20 * persistence_score
+                          + 0.15 * agreement),
+            0.0, 1.0,
+        ))
+        if confidence < min_confidence:
+            continue
+
+        ys, xs = np.where(spatial)
+        expanded = binary_dilation(
+            spatial, structure=np.ones((3, 3), dtype=bool),
+            iterations=max(2, window_size // 2),
+        )
+        ring = expanded & ~binary_dilation(
+            spatial, structure=np.ones((3, 3), dtype=bool), iterations=1)
+        if np.count_nonzero(ring) < 8:
+            continue
+        focused = reconstructions[idx]
+        ring_values = focused[ring]
+        background = np.complex64(
+            np.median(ring_values.real) + 1j * np.median(ring_values.imag))
+        signal_values = focused[spatial] - background
+        noise_values = ring_values - background
+        signal_rms = float(np.sqrt(np.mean(np.abs(signal_values) ** 2)))
+        noise_rms = float(np.sqrt(np.mean(np.abs(noise_values) ** 2)))
+        contrast_snr = signal_rms / max(noise_rms, np.finfo(float).eps)
+        coherence = float(
+            np.abs(np.mean(signal_values))
+            / max(signal_rms, np.finfo(float).eps)
+        )
+        component_strength = float(np.mean(ensemble[component]))
+        if component_strength < min_component_strength:
+            continue
+        if (contrast_snr < min_contrast_snr
+                or coherence < min_complex_coherence):
+            continue
+        results.append(ObjectFocusPlane(
+            object_id=component_id,
+            centroid_yx=(float(ys.mean()), float(xs.mean())),
+            bbox_yx=(int(ys.min()), int(xs.min()),
+                     int(ys.max()) + 1, int(xs.max()) + 1),
+            area_px=int(np.count_nonzero(spatial)),
+            z_m=float(z_values[idx] + delta * step),
+            prominence=prominence,
+            mean_confidence=component_strength,
+            metric=FocusMetric.PHASE_VARIANCE,
+            confidence=confidence,
+            z_span_steps=z_span,
+            channel_agreement=agreement,
+            contrast_snr=contrast_snr,
+            complex_coherence=coherence,
+        ))
+
+    # Merge duplicate 3-D components that point to the same lateral object and
+    # nearly the same axial peak. Keep the higher-confidence representative.
+    results.sort(key=lambda item: -item.confidence)
+    merged: list[ObjectFocusPlane] = []
+    merge_z = max(2.0 * step, 0.5e-3)
+    for candidate in results:
+        duplicate = False
+        for kept in merged:
+            dy = candidate.centroid_yx[0] - kept.centroid_yx[0]
+            dx = candidate.centroid_yx[1] - kept.centroid_yx[1]
+            lateral_limit = max(
+                4.0,
+                0.5 * (np.sqrt(candidate.area_px) + np.sqrt(kept.area_px)),
+            )
+            if (np.hypot(dy, dx) <= lateral_limit
+                    and abs(candidate.z_m - kept.z_m) <= merge_z):
+                duplicate = True
+                break
+        if not duplicate:
+            merged.append(candidate)
+    return merged
+
+
+def _candidate_focus_probability(candidate: ObjectFocusPlane) -> float:
+    """Synthetic-v1 probability calibration for object-local candidates.
+
+    The fixed coefficients were fitted on 125 deterministic factorial scenes
+    at 256×256/60 planes and evaluated on a disjoint 125-scene split. They are
+    an empirical ranking model, not an optical law. Keeping the five-feature
+    logistic transform here avoids a runtime machine-learning dependency and
+    makes the exact calibration reproducible/auditable.
+    """
+    prominence = float(candidate.prominence)
+    log_contrast = float(np.log(max(candidate.contrast_snr, 1e-6)))
+    coherence = float(candidate.complex_coherence)
+    features = np.array([
+        prominence,
+        log_contrast,
+        coherence,
+        prominence * coherence,
+        prominence * log_contrast,
+    ], dtype=np.float64)
+    mean = np.array([
+        0.48755918, 0.53855197, 0.31358995, 0.15360092, 0.27474844,
+    ])
+    scale = np.array([
+        0.12014674, 0.28378370, 0.16066671, 0.09435946, 0.19868974,
+    ])
+    weights = np.array([
+        0.53889135, -0.52766161, 0.01463786, 0.43066093, 1.36643135,
+    ])
+    logit = -2.27120575 + float(np.dot(weights, (features - mean) / scale))
+    # Stable scalar sigmoid.
+    if logit >= 0.0:
+        return float(1.0 / (1.0 + np.exp(-logit)))
+    exp_logit = float(np.exp(logit))
+    return exp_logit / (1.0 + exp_logit)
+
+
+def find_object_focus_planes_hybrid(
+    field: np.ndarray,
+    base_params: ReconstructionParams,
+    method: ReconstructionMethod,
+    z_min_m: float,
+    z_max_m: float,
+    *,
+    n_steps: int = 60,
+    probability_threshold: float = 0.70,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> list[ObjectFocusPlane]:
+    """High-recall local masks followed by calibrated objectness gating.
+
+    The 2-D z-maximum detector retains substantially more true objects than
+    the strict 3-D persistence path at 256×256/60. Each candidate is then
+    scored jointly by focus-curve prominence, ROI-to-ring complex contrast,
+    complex coherence, and their interactions. Candidates below the requested
+    probability are rejected; if none remain the method abstains.
+
+    ``probability_threshold=0.70`` is the synthetic-v1 operating point. It must
+    be recalibrated on stage-labelled real holograms before clinical/scientific
+    measurement claims are made.
+    """
+    if not (0.0 <= probability_threshold <= 1.0):
+        raise ValueError("probability_threshold must be in [0, 1]")
+    candidates = find_object_focus_planes(
+        field, base_params, method, z_min_m, z_max_m,
+        n_steps=n_steps,
+        metric=FocusMetric.PHASE_VARIANCE,
+        cancel_check=cancel_check,
+    )
+    accepted: list[ObjectFocusPlane] = []
+    for candidate in candidates:
+        probability = _candidate_focus_probability(candidate)
+        if probability >= probability_threshold:
+            accepted.append(replace(candidate, confidence=probability))
+    accepted.sort(key=lambda item: (-item.confidence, -item.prominence))
+    return accepted
 
 
 @dataclass(frozen=True)
@@ -878,6 +1250,8 @@ __all__ = [
     "ClusterHeight",
     "compute_depth_map",
     "find_object_focus_planes",
+    "find_object_focus_planes_3d",
+    "find_object_focus_planes_hybrid",
     "segment_depth_clusters",
     "mask_low_confidence",
     "write_depth_map_npz",
