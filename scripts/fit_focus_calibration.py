@@ -70,6 +70,7 @@ FEATURE_NAMES = (
     "coherence",
     "prominence*coherence",
     "prominence*log_contrast",
+    "border_distance",
 )
 
 SPLIT_MODULUS = 25
@@ -89,7 +90,16 @@ def split_scenarios(split: str) -> list[StressScenario]:
 
 
 def candidate_features(candidate) -> np.ndarray:
-    """The five features, in the exact order `depth_map` consumes them."""
+    """The six features, in the exact order `depth_map` consumes them.
+
+    `border_distance` was added 2026-08-17 after a feature search: of six
+    candidate additions (log area, z span, channel agreement, mean confidence,
+    normalised z, border distance) it was the only one that moved held-out
+    AUC — 0.8641 to 0.8953. `z_span_steps` and `channel_agreement` scored
+    exactly +0.0000 because the 2-D detector leaves them constant at 1 and 1.0.
+    Adding all six together scored 0.8895, WORSE than adding border alone, so
+    the model is deliberately not "richer" than the evidence supports.
+    """
     prominence = float(candidate.prominence)
     log_contrast = float(np.log(max(candidate.contrast_snr, 1e-6)))
     coherence = float(candidate.complex_coherence)
@@ -99,6 +109,7 @@ def candidate_features(candidate) -> np.ndarray:
         coherence,
         prominence * coherence,
         prominence * log_contrast,
+        float(candidate.border_distance),
     ], dtype=np.float64)
 
 

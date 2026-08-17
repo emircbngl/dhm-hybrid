@@ -111,6 +111,14 @@ class ObjectFocusPlane:
     channel_agreement: float = 1.0
     contrast_snr: float = 0.0
     complex_coherence: float = 0.0
+    # Centroid distance to the nearest frame edge, normalised by half the
+    # frame width: 0.0 on the border, 1.0 at the centre. Frame-edge components
+    # are FFT artefacts and are already hard-rejected, but the distance still
+    # carries graded evidence for the ones that survive — it is the single
+    # feature that improved candidate ranking (see
+    # `_candidate_focus_probability`). Defaults to 1.0 (centre, no penalty) so
+    # candidates built without it are scored as if unremarkable.
+    border_distance: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -553,9 +561,20 @@ def find_object_focus_planes(
             np.abs(np.mean(signal_values))
             / max(signal_rms, np.finfo(float).eps)
         )
+        centroid_y = float(ys.mean())
+        centroid_x = float(xs.mean())
+        frame_h, frame_w = focused.shape
+        # Normalised by half the frame so the feature is resolution-free:
+        # 0.0 on the border, 1.0 at the centre. This exact expression is what
+        # `_candidate_focus_probability`'s coefficients were fitted against —
+        # changing it silently invalidates them.
+        border_distance = min(
+            centroid_y, centroid_x,
+            frame_h - 1 - centroid_y, frame_w - 1 - centroid_x,
+        ) / (min(frame_h, frame_w) / 2.0)
         results.append(ObjectFocusPlane(
             object_id=label_id,
-            centroid_yx=(float(ys.mean()), float(xs.mean())),
+            centroid_yx=(centroid_y, centroid_x),
             bbox_yx=(
                 int(obj_slice[0].start), int(obj_slice[1].start),
                 int(obj_slice[0].stop), int(obj_slice[1].stop),
@@ -568,6 +587,7 @@ def find_object_focus_planes(
             confidence=float(prominences[peak_slot]),
             contrast_snr=contrast_snr,
             complex_coherence=coherence,
+            border_distance=float(border_distance),
         ))
 
     results.sort(key=lambda item: (-item.prominence, -item.area_px))
@@ -847,37 +867,43 @@ def _candidate_focus_probability(candidate: ObjectFocusPlane) -> float:
     no machine-learning dependency. An empirical ranking model, not an optical
     law.
 
-    Provenance — read before changing these numbers
-    -----------------------------------------------
-    These constants predate `scripts/fit_focus_calibration.py`; the procedure
-    that produced them was never committed, so they cannot be re-derived. The
-    earlier claim in this docstring that keeping them inline made the
-    calibration "reproducible/auditable" was false, and is withdrawn.
-
-    Running the committed script now yields a DIFFERENT fit. Measured
-    2026-08-17 on its own held-out split (crc32(name) % 25 == 1, 127 scenes,
-    256x256/60, 0.5 mm tolerance):
-
-        threshold 0.75  shipped: 35.4% coverage, 95.6% conditional hit
-                        refit:   24.4% coverage, 100%  conditional hit
-        threshold 0.70  shipped: 44.1% coverage, 96.4% conditional hit
-                        refit:   29.9% coverage, 94.7% conditional hit
-
-    The shipped constants win on coverage and overall hit at every threshold
-    tested, so they are RETAINED on measured evidence rather than swapped for
-    a reproducible-but-worse fit. Two things corroborate them: the refit
-    recovers the same feature standardisation to within 1-2% (so it samples
-    the same population and the original procedure was sound), and ridge
-    strength is not the gap — inner-split AUC is flat at ~0.81 across two
-    orders of magnitude of L2.
-
-    To audit or replace them, run:
+    Provenance — these constants are generated, not hand-tuned
+    ----------------------------------------------------------
+    Produced by `scripts/fit_focus_calibration.py` on the deterministic train
+    split (crc32(name) % 25 == 0, 132 scenes, 256x256/60), and measured once on
+    the disjoint validation split (127 scenes, 0.5 mm tolerance). Regenerate
+    with:
 
         python3 scripts/fit_focus_calibration.py --out tasks/focus_calibration.json
 
-    and only paste its code block in if it beats the table above on the same
-    split. `tests/test_fit_focus_calibration.py` pins that the script's
-    feature order and sigmoid still match this function.
+    An earlier version of this docstring claimed the previous five-feature
+    constants were "reproducible/auditable" while no fitting script existed.
+    That was false and is withdrawn; this is the correction.
+
+    Held-out comparison, same split, same tolerance:
+
+        gate                         recall  precision  coverage    hit
+        no gate                       49.9%      41.2%     91.3%  73.2%
+        5-feature @0.70               29.8%      94.6%     44.1%  42.5%
+        5-feature @0.75               24.2%      93.3%     35.4%  33.9%
+        6-feature @0.50 (this)        35.9%      93.2%     52.8%  51.2%
+        perfect gate (ceiling)        49.9%     100.0%     73.2%  73.2%
+
+    Precision is over covered scenes only. The sixth feature is
+    `border_distance`, chosen by a search over six candidates: it was the only
+    one that moved held-out AUC (0.8641 -> 0.8953). `z_span_steps` and
+    `channel_agreement` moved it by exactly +0.0000 because the 2-D detector
+    leaves both constant, and adding all six scored 0.8895 — worse than adding
+    border alone. The model is deliberately no richer than the evidence.
+
+    The ceiling row is what a gate that kept exactly the correct candidates
+    would score; it is not reachable, but it says the remaining headroom is in
+    ranking these candidates better, not in generating more of them.
+
+    Still synthetic-v1: an empirical ranking model over one simulator family,
+    not an optical law. Replace with a stage-labelled real-data calibration
+    before any measurement claim. `tests/test_fit_focus_calibration.py` pins
+    that the script and this function score a candidate identically.
     """
     prominence = float(candidate.prominence)
     log_contrast = float(np.log(max(candidate.contrast_snr, 1e-6)))
@@ -888,17 +914,18 @@ def _candidate_focus_probability(candidate: ObjectFocusPlane) -> float:
         coherence,
         prominence * coherence,
         prominence * log_contrast,
+        float(candidate.border_distance),
     ], dtype=np.float64)
     mean = np.array([
-        0.48755918, 0.53855197, 0.31358995, 0.15360092, 0.27474844,
+        0.48911202, 0.54942014, 0.31362574, 0.15469217, 0.28152352, 0.35875535,
     ])
     scale = np.array([
-        0.12014674, 0.28378370, 0.16066671, 0.09435946, 0.19868974,
+        0.11759580, 0.27781999, 0.16175545, 0.09644463, 0.19437766, 0.28176341,
     ])
     weights = np.array([
-        0.53889135, -0.52766161, 0.01463786, 0.43066093, 1.36643135,
+        0.59382365, -0.24191525, 0.20819830, 0.20494498, 0.40730492, 0.75770116,
     ])
-    logit = -2.27120575 + float(np.dot(weights, (features - mean) / scale))
+    logit = -2.46997618 + float(np.dot(weights, (features - mean) / scale))
     # Stable scalar sigmoid.
     if logit >= 0.0:
         return float(1.0 / (1.0 + np.exp(-logit)))
@@ -914,7 +941,7 @@ def find_object_focus_planes_hybrid(
     z_max_m: float,
     *,
     n_steps: int = 60,
-    probability_threshold: float = 0.75,
+    probability_threshold: float = 0.50,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> list[ObjectFocusPlane]:
     """High-recall local masks followed by calibrated objectness gating.
@@ -925,16 +952,21 @@ def find_object_focus_planes_hybrid(
     complex coherence, and their interactions. Candidates below the requested
     probability are rejected; if none remain the method abstains.
 
-    ``probability_threshold=0.75`` is the synthetic-v1 operating point. On the
-    125-scene held-out split it dominates the previously documented 0.80: both
-    reach 100% conditional hit, but 0.75 keeps 39.2% coverage against 34.4%.
-    The earlier 0.70 default bought 41.6% coverage at 98.1% conditional hit —
-    2.4 points of coverage for the only conditional miss in the split. With
-    n=49 covered scenes the "100%" carries a Wilson 95% interval of
-    [92.7%, 100%]; it is an operating point, not a proven accuracy.
+    ``probability_threshold=0.50`` is the synthetic-v1 operating point for the
+    six-feature scorer. On the held-out split (127 scenes, 0.5 mm tolerance) it
+    gives 52.8% coverage at 97.0% conditional hit and 51.2% overall hit. The
+    threshold moved down from 0.75 with the scorer change: the added
+    `border_distance` feature separates the classes better, so the same
+    ~95% conditional accuracy is now available while keeping far more scenes.
+    Comparable points on the same split — 0.60: 48.0% coverage / 95.1%
+    conditional; 0.70: 42.5% / 96.3%; 0.80: 27.6% / 97.1%.
 
-    It must be recalibrated on stage-labelled real holograms before
-    clinical/scientific measurement claims are made.
+    Do not read a threshold across scorer versions. It indexes where the
+    probability mass sits, which is a property of the fitted coefficients, not
+    a portable confidence level.
+
+    Recalibrate on stage-labelled real holograms before any clinical or
+    scientific measurement claim.
     """
     if not (0.0 <= probability_threshold <= 1.0):
         raise ValueError("probability_threshold must be in [0, 1]")

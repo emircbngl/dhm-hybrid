@@ -38,15 +38,15 @@ from fit_focus_calibration import (  # noqa: E402
 # purpose: the point of this module is to detect the script and the runtime
 # function drifting apart, which a shared import would hide.
 SHIPPED_MEAN = np.array([
-    0.48755918, 0.53855197, 0.31358995, 0.15360092, 0.27474844])
+    0.48911202, 0.54942014, 0.31362574, 0.15469217, 0.28152352, 0.35875535])
 SHIPPED_SCALE = np.array([
-    0.12014674, 0.28378370, 0.16066671, 0.09435946, 0.19868974])
+    0.11759580, 0.27781999, 0.16175545, 0.09644463, 0.19437766, 0.28176341])
 SHIPPED_WEIGHTS = np.array([
-    0.53889135, -0.52766161, 0.01463786, 0.43066093, 1.36643135])
-SHIPPED_INTERCEPT = -2.27120575
+    0.59382365, -0.24191525, 0.20819830, 0.20494498, 0.40730492, 0.75770116])
+SHIPPED_INTERCEPT = -2.46997618
 
 
-def _plane(prominence, contrast_snr, coherence, z_m=12e-3):
+def _plane(prominence, contrast_snr, coherence, z_m=12e-3, border=0.5):
     return ObjectFocusPlane(
         object_id=0,
         centroid_yx=(0.0, 0.0),
@@ -58,6 +58,7 @@ def _plane(prominence, contrast_snr, coherence, z_m=12e-3):
         metric=FocusMetric.PHASE_VARIANCE,
         contrast_snr=contrast_snr,
         complex_coherence=coherence,
+        border_distance=border,
     )
 
 
@@ -107,16 +108,53 @@ def test_script_probability_matches_the_shipped_function():
 
 
 def test_feature_names_document_the_actual_feature_order():
-    assert len(FEATURE_NAMES) == 5
-    candidate = _plane(0.5, float(np.e), 0.3)
+    assert len(FEATURE_NAMES) == 6
+    candidate = _plane(0.5, float(np.e), 0.3, border=0.42)
     features = candidate_features(candidate)
-    assert features.shape == (5,)
+    assert features.shape == (6,)
     # log(e) == 1 makes the interaction terms checkable by hand.
     assert features[0] == pytest.approx(0.5)
     assert features[1] == pytest.approx(1.0)
     assert features[2] == pytest.approx(0.3)
     assert features[3] == pytest.approx(0.15)
     assert features[4] == pytest.approx(0.5)
+    assert features[5] == pytest.approx(0.42)
+
+
+def test_border_distance_is_populated_by_the_detector():
+    """The feature must come from the detector, not stay at its default.
+
+    `border_distance` defaults to 1.0 so old constructions keep working. If
+    `find_object_focus_planes` ever stops populating it, every candidate would
+    silently score as a dead-centre object and the sixth feature would become
+    a constant — the model would still run, and still be wrong.
+    """
+    import zlib
+
+    from benchmark_af_synthetic_stress import _build_field
+    from core.autofocus import FocusMetric as _FocusMetric
+    from core.depth_map import find_object_focus_planes
+    from core.reconstruction import ReconstructionMethod
+
+    # Not every scene yields candidates — abstention is a designed outcome —
+    # so take the first that does rather than pinning one scene by index.
+    candidates: list = []
+    for scenario in split_scenarios("val")[:10]:
+        field, base = _build_field(
+            scenario, (256, 256),
+            seed=10_000 + int(zlib.crc32(scenario.name.encode("utf-8"))))
+        candidates = find_object_focus_planes(
+            field, base, ReconstructionMethod.ASM, -5e-3, 45e-3,
+            n_steps=60, metric=_FocusMetric.PHASE_VARIANCE)
+        if candidates:
+            break
+    assert candidates, "no candidates in the first 10 val scenes"
+    values = [c.border_distance for c in candidates]
+    assert all(0.0 <= v <= 1.0 for v in values), values
+    assert any(v != 1.0 for v in values), (
+        "every candidate sat at the default 1.0 — the detector is not "
+        "populating border_distance"
+    )
 
 
 def test_labelling_is_one_to_one_not_within_tolerance_of_any():
