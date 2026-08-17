@@ -201,13 +201,15 @@ Full grid, 2026-08-17 — 27 single-sphere scenes (radius 4/10/18 µm, noise
 
 Two facts follow, and they reorder the work:
 
-1. **The whole-frame focus landscape does not peak at the object.** Over the
-   real search bounds every metric's global extremum collapses toward z≈0,
-   the camera plane — median error 12–28 mm, 0–11% hit. The optimizer is not
-   choosing a wrong extremum; it is finding the correct extremum of a
-   landscape whose maximum is in the wrong place. This is what the
-   range-edge rejection in `gradient_descent_search` is patching around, and
-   it is why object-local masking works at all.
+1. **On this fixture the whole-frame focus landscape does not peak at the
+   object.** Over the real search bounds every metric's global extremum
+   collapses toward z≈0, the camera plane — median error 12–28 mm, 0–11% hit.
+   The optimizer is not choosing a wrong extremum; it is finding the correct
+   extremum of a landscape whose maximum is in the wrong place. This is what
+   the range-edge rejection in `gradient_descent_search` is patching around.
+   **Scope correction (2026-08-17):** this is substantially an artefact of the
+   ASM fixture, not a general property of off-axis DHM — see the independent
+   generator below, where the same measurement gives 1.25–4.6 mm.
 2. **The oracle mask is the ceiling, and it is low.** Handed the true object
    footprint, the same metrics reach 0.5–0.875 mm median error but only
    22–37% hit at 0.5 mm. `object_local_hybrid`'s 40.8% overall hit is already
@@ -223,8 +225,63 @@ unchanged at 40.8%. The hybrid's failures are gross, not marginal, so the
 remaining gap is upstream — in the fixture and the metric, not in the
 tolerance.
 
-Consequence for sequencing: build the independent generator (different
-propagator, aberrations, shot noise, speckle, sensor MTF) before investing
-further in 3-D persistence or a richer probability model. While the generator
-calls the same `core.reconstruction.propagate` used to reconstruct, every
-calibrated number describes ASM inverting ASM.
+## The independent generator — inverse crime removed
+
+`tests/fixtures/independent_hologram.py` is a second forward model that shares
+no propagation code with the reconstruction. Contract pins:
+`tests/test_independent_hologram.py`, including an AST check that the module
+imports nothing from `core` and uses no FFT — a property no output number would
+reveal.
+
+* **Direct Rayleigh-Sommerfeld summation, no FFT.** Every object-plane sample
+  is a Huygens source and the field at each sensor pixel is the explicit sum.
+  The reconstruction multiplies an angular spectrum by a transfer function;
+  there is no shared operator to cancel.
+* **Object-plane pitch 1.0 µm against a 2.5 µm sensor pitch**, so grid-aligned
+  artefacts cannot round-trip.
+* **A detector chain the ASM fixture lacks**: Poisson shot noise (the dominant
+  real term — the ASM fixture models only Gaussian read noise), sensor MTF,
+  Gaussian illumination falloff, curved reference, low-order phase error,
+  optional speckle, full-well saturation, quantisation.
+
+Matched comparison — the same 9 (radius, z) scenes, oracle-masked focus curve,
+256×256, 401 steps, ASM fixture at noise=0 versus the independent generator
+carrying its full detector chain:
+
+| metric | ASM masked \|err\| / hit | independent masked \|err\| / hit | ASM global \|err\| | independent global \|err\| |
+|---|---:|---:|---:|---:|
+| laplacian_variance | 0.625 mm / 33% | 0.375 mm / 56% | 3.25 mm | 1.25 mm |
+| tenengrad | 0.375 mm / 56% | 0.375 mm / 67% | 11.38 mm | 3.50 mm |
+| phase_variance | 0.250 mm / 56% | 0.375 mm / 56% | 11.88 mm | 4.63 mm |
+| normalized_variance | 0.250 mm / 56% | 0.375 mm / 56% | 11.88 mm | 4.63 mm |
+| spectral_energy | 0.500 mm / 44% | 0.375 mm / 67% | 12.00 mm | 4.63 mm |
+
+Two things follow, and one of them corrects the section above.
+
+**The oracle ceiling survives.** Masked median error is ~0.4 mm and hit@0.5 mm
+is 56–67% on the independent generator, against 0.25–0.625 mm and 33–56% on the
+ASM fixture — the same order, slightly better, despite the independent scenes
+carrying shot noise, MTF, aberration and saturation that the ASM scenes do not.
+So the ceiling is a real property of this measurement problem, not a symptom of
+ASM inverting ASM. `object_local_hybrid` sitting at 40.8% overall hit remains
+near its ceiling, and that conclusion now rests on two independent forward
+models rather than one.
+
+**The z≈0 collapse was largely the fixture.** Global error drops from 11–12 mm
+to 3.5–4.6 mm (and 3.25 → 1.25 mm for laplacian) once the shared FFT
+propagator is gone. The plausible mechanism is wrap-around: the ASM fixture
+propagates 12–43 mm across a 640 µm periodic FFT window, so the object's field
+re-enters the frame instead of leaving it, and the resulting high-frequency
+structure is strongest near z≈0. Direct summation has no periodic window. This
+is a hypothesis consistent with the measurement, not a verified derivation.
+Whole-frame autofocus is still unreliable on the independent generator —
+multi-millimetre error against a ~0.4 mm oracle — so object-local masking is
+still the right architecture; it is just not rescuing a landscape that peaks at
+the camera.
+
+Remaining shared approximation, stated plainly: both models use a thin
+projected phase screen (no refraction inside the sphere, no multiple
+scattering, scalar fields). The independent generator is a second, independent
+*approximation* whose errors are uncorrelated with the reconstruction's — not a
+metrology reference. Real stage-labelled holograms remain the only way to make
+an accuracy claim.

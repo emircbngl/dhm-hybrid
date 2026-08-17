@@ -55,11 +55,18 @@ def clean_scene_rows() -> list[dict]:
 
 
 def test_global_focus_curve_does_not_peak_at_the_object_plane(clean_scene_rows):
-    """The whole-frame metric maximum sits near the camera, not the object.
+    """On the ASM fixture, the metric maximum sits near the camera.
 
-    This is why `gradient_descent_search` needs range-edge rejection and why
-    whole-frame autofocus scores so poorly on synthetic scenes: the optimiser
-    is finding a real extremum that is in the wrong place.
+    This is why `gradient_descent_search` needs range-edge rejection: the
+    optimiser finds a real extremum that is in the wrong place.
+
+    Scope, measured 2026-08-17 — this is largely a property of THIS fixture,
+    not of off-axis DHM. On `tests/fixtures/independent_hologram.py`, which
+    propagates by direct Rayleigh-Sommerfeld summation instead of a shared
+    FFT, the same measurement gives 1.25-4.6 mm rather than 12-28 mm. Do not
+    cite this test as evidence that whole-frame autofocus is hopeless in
+    general; cite it for why the ASM-fixture benchmark scores look the way
+    they do.
     """
     for row in clean_scene_rows:
         assert abs(row["global_error_mm"]) > 5.0, (
