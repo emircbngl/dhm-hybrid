@@ -842,11 +842,42 @@ def find_object_focus_planes_3d(
 def _candidate_focus_probability(candidate: ObjectFocusPlane) -> float:
     """Synthetic-v1 probability calibration for object-local candidates.
 
-    The fixed coefficients were fitted on 125 deterministic factorial scenes
-    at 256×256/60 planes and evaluated on a disjoint 125-scene split. They are
-    an empirical ranking model, not an optical law. Keeping the five-feature
-    logistic transform here avoids a runtime machine-learning dependency and
-    makes the exact calibration reproducible/auditable.
+    Five-feature logistic model over focus prominence, log ROI/ring complex
+    contrast, complex coherence and two interactions. Inline so runtime needs
+    no machine-learning dependency. An empirical ranking model, not an optical
+    law.
+
+    Provenance — read before changing these numbers
+    -----------------------------------------------
+    These constants predate `scripts/fit_focus_calibration.py`; the procedure
+    that produced them was never committed, so they cannot be re-derived. The
+    earlier claim in this docstring that keeping them inline made the
+    calibration "reproducible/auditable" was false, and is withdrawn.
+
+    Running the committed script now yields a DIFFERENT fit. Measured
+    2026-08-17 on its own held-out split (crc32(name) % 25 == 1, 127 scenes,
+    256x256/60, 0.5 mm tolerance):
+
+        threshold 0.75  shipped: 35.4% coverage, 95.6% conditional hit
+                        refit:   24.4% coverage, 100%  conditional hit
+        threshold 0.70  shipped: 44.1% coverage, 96.4% conditional hit
+                        refit:   29.9% coverage, 94.7% conditional hit
+
+    The shipped constants win on coverage and overall hit at every threshold
+    tested, so they are RETAINED on measured evidence rather than swapped for
+    a reproducible-but-worse fit. Two things corroborate them: the refit
+    recovers the same feature standardisation to within 1-2% (so it samples
+    the same population and the original procedure was sound), and ridge
+    strength is not the gap — inner-split AUC is flat at ~0.81 across two
+    orders of magnitude of L2.
+
+    To audit or replace them, run:
+
+        python3 scripts/fit_focus_calibration.py --out tasks/focus_calibration.json
+
+    and only paste its code block in if it beats the table above on the same
+    split. `tests/test_fit_focus_calibration.py` pins that the script's
+    feature order and sigmoid still match this function.
     """
     prominence = float(candidate.prominence)
     log_contrast = float(np.log(max(candidate.contrast_snr, 1e-6)))

@@ -1,0 +1,897 @@
+{
+  "generated": "2026-08-17",
+  "split_rule": "crc32(scene_name) % 25 -> 0=train, 1=val",
+  "train_scenes": 132,
+  "val_scenes": 127,
+  "shape": [
+    256,
+    256
+  ],
+  "n_steps": 60,
+  "tolerance_mm": 0.5,
+  "l2": 1.0,
+  "feature_names": [
+    "prominence",
+    "log_contrast",
+    "coherence",
+    "prominence*coherence",
+    "prominence*log_contrast"
+  ],
+  "train_candidates": 1354,
+  "train_positive_rate": 0.13737075332348597,
+  "mean": [
+    0.4891120231254947,
+    0.5494201427738163,
+    0.3136257447489431,
+    0.15469217128721074,
+    0.2815235203319426
+  ],
+  "scale": [
+    0.11759580105490613,
+    0.2778199854061372,
+    0.1617554538535699,
+    0.09644463021386203,
+    0.19437765750708125
+  ],
+  "weights": [
+    0.7249323730325332,
+    -0.42013637478595744,
+    0.0806069185963443,
+    0.32008829011426715,
+    0.8375802849789942
+  ],
+  "intercept": -2.3441771829403684,
+  "threshold_sweep": [
+    {
+      "threshold": 0.5,
+      "coverage": 0.48031496062992124,
+      "conditional_hit": 0.9508196721311475,
+      "overall_hit": 0.4566929133858268,
+      "planes_per_scene": 0.8188976377952756,
+      "covered_scenes": 61
+    },
+    {
+      "threshold": 0.6,
+      "coverage": 0.3937007874015748,
+      "conditional_hit": 0.96,
+      "overall_hit": 0.3779527559055118,
+      "planes_per_scene": 0.6614173228346457,
+      "covered_scenes": 50
+    },
+    {
+      "threshold": 0.7,
+      "coverage": 0.2992125984251969,
+      "conditional_hit": 0.9473684210526315,
+      "overall_hit": 0.28346456692913385,
+      "planes_per_scene": 0.5118110236220472,
+      "covered_scenes": 38
+    },
+    {
+      "threshold": 0.75,
+      "coverage": 0.2440944881889764,
+      "conditional_hit": 1.0,
+      "overall_hit": 0.2440944881889764,
+      "planes_per_scene": 0.4330708661417323,
+      "covered_scenes": 31
+    },
+    {
+      "threshold": 0.8,
+      "coverage": 0.2283464566929134,
+      "conditional_hit": 1.0,
+      "overall_hit": 0.2283464566929134,
+      "planes_per_scene": 0.3779527559055118,
+      "covered_scenes": 29
+    },
+    {
+      "threshold": 0.85,
+      "coverage": 0.15748031496062992,
+      "conditional_hit": 1.0,
+      "overall_hit": 0.15748031496062992,
+      "planes_per_scene": 0.2204724409448819,
+      "covered_scenes": 20
+    },
+    {
+      "threshold": 0.9,
+      "coverage": 0.11811023622047244,
+      "conditional_hit": 1.0,
+      "overall_hit": 0.11811023622047244,
+      "planes_per_scene": 0.13385826771653545,
+      "covered_scenes": 15
+    }
+  ],
+  "per_scene": [
+    {
+      "scenario": "factorial_1_1_1_3_4",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_1_2_1_3",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_1_1_2_3_3",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_1_1_2_4_2",
+      "candidates": 2,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_1_1_5_4_1",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_1_5_5_4",
+      "candidates": 7,
+      "positives": 6,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_1_2_1_4_5",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_2_2_3_1",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_2_3_1_2",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_1_2_3_1_3",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_1_2_4_3_5",
+      "candidates": 2,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_1_2_4_4_1",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_2_5_1_1",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_2_5_3_5",
+      "candidates": 2,
+      "positives": 2,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_1_3_1_2_3",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_3_1_2_4",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_3_2_4_3",
+      "candidates": 2,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_1_3_3_5_3",
+      "candidates": 4,
+      "positives": 3,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_1_3_4_3_5",
+      "candidates": 2,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_1_3_5_2_1",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_4_3_2_3",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_1_4_5_2_3",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_1_5_1_1_5",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_5_1_4_1",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_5_1_5_1",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_1_5_2_1_4",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_1_5_4_1_3",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_1_5_4_5_5",
+      "candidates": 5,
+      "positives": 5,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_1_5_5_3_4",
+      "candidates": 2,
+      "positives": 2,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_2_1_3_1_1",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_2_1_3_1_5",
+      "candidates": 1,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_2_1_4_1_4",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_2_2_1_1_4",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_2_2_2_2_2",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_2_2_4_5_5",
+      "candidates": 5,
+      "positives": 5,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_2_3_1_3_1",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_2_3_2_4_5",
+      "candidates": 3,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_2_3_3_3_5",
+      "candidates": 4,
+      "positives": 3,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_2_3_4_4_3",
+      "candidates": 5,
+      "positives": 4,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_2_3_5_5_3",
+      "candidates": 6,
+      "positives": 6,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_2_4_3_1_2",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_2_4_4_1_5",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_2_4_4_4_3",
+      "candidates": 4,
+      "positives": 3,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_2_4_4_5_2",
+      "candidates": 5,
+      "positives": 5,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_2_4_5_3_5",
+      "candidates": 2,
+      "positives": 2,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_2_4_5_5_2",
+      "candidates": 6,
+      "positives": 6,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_2_5_2_1_3",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_2_5_2_5_3",
+      "candidates": 3,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_2_5_3_2_3",
+      "candidates": 1,
+      "positives": 1,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_2_5_3_4_3",
+      "candidates": 3,
+      "positives": 3,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_2_5_4_1_1",
+      "candidates": 0,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_2_5_4_3_1",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_1_1_2_1",
+      "candidates": 6,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_1_1_2_5",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_1_2_2_4",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_3_1_2_5_5",
+      "candidates": 5,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_3_1_3_2_3",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_3_1_3_5_4",
+      "candidates": 9,
+      "positives": 3,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_3_1_3_5_5",
+      "candidates": 5,
+      "positives": 3,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_3_1_4_1_2",
+      "candidates": 1,
+      "positives": 0,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_3_1_5_4_5",
+      "candidates": 7,
+      "positives": 4,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_3_2_2_3_5",
+      "candidates": 7,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_3_2_4_1_2",
+      "candidates": 3,
+      "positives": 0,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_3_2_4_3_5",
+      "candidates": 5,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_3_3_1_1_1",
+      "candidates": 3,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_3_2_1_5",
+      "candidates": 1,
+      "positives": 0,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_3_3_2_3_3",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_3_3_3_2_1",
+      "candidates": 4,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_3_4_4_1",
+      "candidates": 7,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_3_5_3_1",
+      "candidates": 6,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_4_3_4_2",
+      "candidates": 5,
+      "positives": 2,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_3_4_4_2_5",
+      "candidates": 6,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_3_4_5_3_5",
+      "candidates": 6,
+      "positives": 3,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_3_5_1_1_3",
+      "candidates": 6,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_3_5_2_1_5",
+      "candidates": 4,
+      "positives": 0,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_3_5_3_3_5",
+      "candidates": 2,
+      "positives": 1,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_3_5_5_5_1",
+      "candidates": 8,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_1_1_4_4",
+      "candidates": 18,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_1_2_1_2",
+      "candidates": 16,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_4_1_2_1_3",
+      "candidates": 20,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_4_1_2_2_3",
+      "candidates": 17,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_4_1_3_1_4",
+      "candidates": 20,
+      "positives": 2,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_1_3_2_4",
+      "candidates": 25,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_1_5_2_2",
+      "candidates": 20,
+      "positives": 6,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_4_2_1_3_2",
+      "candidates": 23,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_2_1_3_3",
+      "candidates": 18,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_2_2_2_2",
+      "candidates": 21,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_4_2_3_2_4",
+      "candidates": 17,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_2_4_3_3",
+      "candidates": 27,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_4_3_1_5_2",
+      "candidates": 21,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_3_3_1_1",
+      "candidates": 14,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_3_3_2_2",
+      "candidates": 21,
+      "positives": 2,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_3_3_3_3",
+      "candidates": 25,
+      "positives": 2,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_3_4_3_5",
+      "candidates": 22,
+      "positives": 4,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_4_3_5_3_1",
+      "candidates": 16,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_4_1_1_2",
+      "candidates": 19,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_4_2_1_1",
+      "candidates": 19,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_4_2_1_3",
+      "candidates": 22,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_4_4_2_3_2",
+      "candidates": 20,
+      "positives": 0,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_4_4_3_1_3",
+      "candidates": 20,
+      "positives": 1,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_4_3_2_3",
+      "candidates": 20,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_4_3_3_4",
+      "candidates": 21,
+      "positives": 1,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_4_3_4_1",
+      "candidates": 21,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_4_3_4_2",
+      "candidates": 22,
+      "positives": 2,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_4_4_4_1_3",
+      "candidates": 17,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_4_4_4_2_1",
+      "candidates": 18,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_4_5_4_4",
+      "candidates": 23,
+      "positives": 5,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_4_5_2_1_1",
+      "candidates": 14,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_4_5_2_4_2",
+      "candidates": 19,
+      "positives": 1,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_4_5_3_5_1",
+      "candidates": 18,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_1_1_1_2",
+      "candidates": 18,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_1_1_2_1",
+      "candidates": 22,
+      "positives": 1,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_1_1_3_1",
+      "candidates": 25,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_1_3_1_1",
+      "candidates": 26,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_1_5_1_3",
+      "candidates": 26,
+      "positives": 4,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_5_1_5_3_2",
+      "candidates": 20,
+      "positives": 0,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_5_2_2_5_4",
+      "candidates": 26,
+      "positives": 0,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_5_2_4_1_2",
+      "candidates": 32,
+      "positives": 0,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_5_2_4_1_4",
+      "candidates": 19,
+      "positives": 3,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_5_2_4_4_4",
+      "candidates": 22,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_5_2_4_5_2",
+      "candidates": 22,
+      "positives": 3,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_5_2_5_2_3",
+      "candidates": 16,
+      "positives": 1,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_5_3_1_1_5",
+      "candidates": 15,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_3_3_3_1",
+      "candidates": 26,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_4_4_5_3",
+      "candidates": 22,
+      "positives": 3,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_5_4_5_1_2",
+      "candidates": 18,
+      "positives": 1,
+      "truth_planes": 7
+    },
+    {
+      "scenario": "factorial_5_5_1_4_1",
+      "candidates": 19,
+      "positives": 0,
+      "truth_planes": 1
+    },
+    {
+      "scenario": "factorial_5_5_2_3_2",
+      "candidates": 23,
+      "positives": 2,
+      "truth_planes": 2
+    },
+    {
+      "scenario": "factorial_5_5_3_1_5",
+      "candidates": 18,
+      "positives": 0,
+      "truth_planes": 3
+    },
+    {
+      "scenario": "factorial_5_5_4_2_2",
+      "candidates": 19,
+      "positives": 1,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_5_5_4_5_2",
+      "candidates": 19,
+      "positives": 2,
+      "truth_planes": 5
+    },
+    {
+      "scenario": "factorial_5_5_5_2_5",
+      "candidates": 25,
+      "positives": 3,
+      "truth_planes": 7
+    }
+  ],
+  "code_block": "    mean = np.array([\n        0.48911202, 0.54942014, 0.31362574, 0.15469217, 0.28152352,\n    ])\n    scale = np.array([\n        0.11759580, 0.27781999, 0.16175545, 0.09644463, 0.19437766,\n    ])\n    weights = np.array([\n        0.72493237, -0.42013637, 0.08060692, 0.32008829, 0.83758028,\n    ])\n    logit = -2.34417718 + float(np.dot(weights, (features - mean) / scale))"
+}

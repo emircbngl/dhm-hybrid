@@ -1,0 +1,154 @@
+"""Pins for the calibration fitting script.
+
+`scripts/fit_focus_calibration.py` exists so the constants in
+`core.depth_map._candidate_focus_probability` can be audited and re-derived.
+That only holds if two things stay true: the split is a reproducible rule, and
+the script computes the same probability the shipped function does. Both are
+asserted here, because both fail silently.
+"""
+from __future__ import annotations
+
+import sys
+import zlib
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from core.autofocus import FocusMetric  # noqa: E402
+from core.depth_map import (  # noqa: E402
+    ObjectFocusPlane,
+    _candidate_focus_probability,
+)
+from fit_focus_calibration import (  # noqa: E402
+    FEATURE_NAMES,
+    SPLIT_MODULUS,
+    _greedy_positive_indices,
+    candidate_features,
+    fit_logistic,
+    probability,
+    split_scenarios,
+)
+
+# The constants currently shipped in core.depth_map. Duplicated here on
+# purpose: the point of this module is to detect the script and the runtime
+# function drifting apart, which a shared import would hide.
+SHIPPED_MEAN = np.array([
+    0.48755918, 0.53855197, 0.31358995, 0.15360092, 0.27474844])
+SHIPPED_SCALE = np.array([
+    0.12014674, 0.28378370, 0.16066671, 0.09435946, 0.19868974])
+SHIPPED_WEIGHTS = np.array([
+    0.53889135, -0.52766161, 0.01463786, 0.43066093, 1.36643135])
+SHIPPED_INTERCEPT = -2.27120575
+
+
+def _plane(prominence, contrast_snr, coherence, z_m=12e-3):
+    return ObjectFocusPlane(
+        object_id=0,
+        centroid_yx=(0.0, 0.0),
+        bbox_yx=(0, 0, 1, 1),
+        area_px=16,
+        z_m=z_m,
+        prominence=prominence,
+        mean_confidence=0.5,
+        metric=FocusMetric.PHASE_VARIANCE,
+        contrast_snr=contrast_snr,
+        complex_coherence=coherence,
+    )
+
+
+def test_split_is_disjoint_and_name_derived():
+    """Membership must follow from the NAME, not from list order.
+
+    Index-based splitting would silently reshuffle train and validation the
+    moment a scenario is added to the catalogue, leaking the old validation
+    set into training.
+    """
+    train = split_scenarios("train")
+    val = split_scenarios("val")
+    assert train and val
+    train_names = {s.name for s in train}
+    val_names = {s.name for s in val}
+    assert not (train_names & val_names), "split is not disjoint"
+
+    for scenario in train:
+        assert zlib.crc32(scenario.name.encode("utf-8")) % SPLIT_MODULUS == 0
+    for scenario in val:
+        assert zlib.crc32(scenario.name.encode("utf-8")) % SPLIT_MODULUS == 1
+
+    assert {s.name for s in split_scenarios("train")} == train_names
+
+
+def test_script_probability_matches_the_shipped_function():
+    """The script must score a candidate exactly as `depth_map` does.
+
+    If the feature order or the sigmoid drift apart, the script would fit and
+    report numbers for a model that is not the one gating candidates at
+    runtime — the failure this pin exists to prevent.
+    """
+    for prominence, snr, coherence in [
+        (0.75, 3.0, 0.55), (0.40, 1.2, 0.20), (0.95, 8.0, 0.80),
+        (0.05, 1e-6, 0.01),
+    ]:
+        candidate = _plane(prominence, snr, coherence)
+        from_script = float(probability(
+            candidate_features(candidate), SHIPPED_MEAN, SHIPPED_SCALE,
+            SHIPPED_WEIGHTS, SHIPPED_INTERCEPT))
+        from_runtime = _candidate_focus_probability(candidate)
+        assert from_script == pytest.approx(from_runtime, rel=1e-9, abs=1e-12), (
+            f"script and depth_map disagree for "
+            f"({prominence}, {snr}, {coherence}): "
+            f"{from_script} vs {from_runtime}"
+        )
+
+
+def test_feature_names_document_the_actual_feature_order():
+    assert len(FEATURE_NAMES) == 5
+    candidate = _plane(0.5, float(np.e), 0.3)
+    features = candidate_features(candidate)
+    assert features.shape == (5,)
+    # log(e) == 1 makes the interaction terms checkable by hand.
+    assert features[0] == pytest.approx(0.5)
+    assert features[1] == pytest.approx(1.0)
+    assert features[2] == pytest.approx(0.3)
+    assert features[3] == pytest.approx(0.15)
+    assert features[4] == pytest.approx(0.5)
+
+
+def test_labelling_is_one_to_one_not_within_tolerance_of_any():
+    """Duplicates near one true plane must not all count as positives.
+
+    Labelling "within tolerance of any truth" would teach the model that
+    duplicate-heavy output is good — the behaviour the gate exists to suppress.
+    """
+    detected = [12.0e-3, 12.05e-3, 12.1e-3]  # three detections, one plane
+    winners = _greedy_positive_indices(detected, (12.0e-3,), 0.5e-3)
+    assert len(winners) == 1, "only one detection may claim a single plane"
+    assert winners == {0}, "the closest detection should win the match"
+
+
+def test_fit_is_deterministic_and_converges():
+    rng = np.random.default_rng(0)
+    features = rng.normal(size=(400, 5))
+    # macOS Accelerate raises divide/overflow/invalid FPU flags even for this
+    # matmul — standard normals against a 5-vector, where no value is anywhere
+    # near a limit. That is the clearest available proof the flags come from
+    # the BLAS backend and not from the arithmetic here or in fit_logistic.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        logits = features @ np.array([1.0, -0.5, 0.25, 0.0, 0.75]) - 0.3
+    assert np.all(np.isfinite(logits))
+    labels = (rng.uniform(size=400)
+              < 1.0 / (1.0 + np.exp(-logits))).astype(float)
+
+    first = fit_logistic(features, labels, l2=1.0)
+    second = fit_logistic(features, labels, l2=1.0)
+    for a, b in zip(first[:3], second[:3]):
+        assert np.array_equal(a, b), "fit is not deterministic"
+    assert first[3] == second[3]
+    assert np.all(np.isfinite(first[2]))
+    # Signs of the strong, well-separated coefficients should be recovered.
+    assert first[2][0] > 0 and first[2][1] < 0
