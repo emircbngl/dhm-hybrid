@@ -883,7 +883,7 @@ def find_object_focus_planes_hybrid(
     z_max_m: float,
     *,
     n_steps: int = 60,
-    probability_threshold: float = 0.70,
+    probability_threshold: float = 0.75,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> list[ObjectFocusPlane]:
     """High-recall local masks followed by calibrated objectness gating.
@@ -894,9 +894,16 @@ def find_object_focus_planes_hybrid(
     complex coherence, and their interactions. Candidates below the requested
     probability are rejected; if none remain the method abstains.
 
-    ``probability_threshold=0.70`` is the synthetic-v1 operating point. It must
-    be recalibrated on stage-labelled real holograms before clinical/scientific
-    measurement claims are made.
+    ``probability_threshold=0.75`` is the synthetic-v1 operating point. On the
+    125-scene held-out split it dominates the previously documented 0.80: both
+    reach 100% conditional hit, but 0.75 keeps 39.2% coverage against 34.4%.
+    The earlier 0.70 default bought 41.6% coverage at 98.1% conditional hit —
+    2.4 points of coverage for the only conditional miss in the split. With
+    n=49 covered scenes the "100%" carries a Wilson 95% interval of
+    [92.7%, 100%]; it is an operating point, not a proven accuracy.
+
+    It must be recalibrated on stage-labelled real holograms before
+    clinical/scientific measurement claims are made.
     """
     if not (0.0 <= probability_threshold <= 1.0):
         raise ValueError("probability_threshold must be in [0, 1]")

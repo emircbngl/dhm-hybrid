@@ -18,6 +18,7 @@ from scripts.benchmark_af_synthetic_stress import (
 )
 from core.autofocus import FocusMetric
 from core.depth_map import (
+    _candidate_focus_probability,
     find_object_focus_planes,
     find_object_focus_planes_3d,
     find_object_focus_planes_hybrid,
@@ -214,7 +215,22 @@ def test_calibrated_hybrid_can_abstain_instead_of_forcing_a_plane():
         expected_z_m=(12e-3,), primary_z_m=12e-3,
     )
     field, base = _build_field(scenario, (128, 128), seed=321)
+    # A 4 um sphere at 128x128 is below what this fixture resolves, so the
+    # calibrated scorer must reject every candidate at the SHIPPED default.
+    # Asserting against the default is the point: an artificially high
+    # threshold (0.999) abstains on any input and proves nothing.
     assert find_object_focus_planes_hybrid(
-        field, base, ReconstructionMethod.ASM, -5e-3, 45e-3,
-        n_steps=32, probability_threshold=0.999,
+        field, base, ReconstructionMethod.ASM, -5e-3, 45e-3, n_steps=32,
     ) == []
+
+    # The 2-D generator does find masks here, so abstention is the scorer
+    # rejecting them rather than the detector failing to look.
+    # Measured 2026-08-17: 10 candidates, highest probability 0.044.
+    candidates = find_object_focus_planes(
+        field, base, ReconstructionMethod.ASM, -5e-3, 45e-3,
+        n_steps=32, metric=FocusMetric.PHASE_VARIANCE,
+    )
+    assert candidates, "detector found nothing — this no longer tests the gate"
+    assert max(
+        _candidate_focus_probability(item) for item in candidates
+    ) < 0.5

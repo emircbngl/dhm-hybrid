@@ -146,11 +146,85 @@ embedded next to the scorer, so runtime does not depend on scikit-learn. They
 were fitted on 125 deterministic 256×256/60-plane factorial scenes and checked
 on a disjoint 125-scene split.
 
-On that held-out synthetic split, probability threshold 0.70 gave 41.6%
-coverage, 98.1% conditional hit rate and 95.8% conditional plane precision at
-0.5 mm tolerance. Threshold 0.80 reached 100% conditional hit but only 34.4%
-coverage. These figures demonstrate abstention; they do not establish
-real-world accuracy because both splits come from the same simulator family.
-The calibration is named synthetic-v1 in code and must be replaced by a
+On that held-out synthetic split, at 0.5 mm tolerance:
+
+| threshold | coverage | conditional hit | overall hit |
+|---:|---:|---:|---:|
+| 0.70 | 41.6% | 98.1% (51/52) | 40.8% |
+| **0.75** | **39.2%** | **100% (49/49)** | **39.2%** |
+| 0.80 | 34.4% | 100% (43/43) | 34.4% |
+| 0.90 | 24.0% | 100% | 24.0% |
+
+**0.75 is the shipped default** because it dominates 0.80 outright — same
+conditional accuracy, 4.8 more points of coverage. With n=49 the "100%"
+carries a Wilson 95% interval of [92.7%, 100%]; treat it as an operating
+point, not a proven accuracy.
+
+These figures demonstrate abstention; they do not establish real-world
+accuracy because both splits come from the same simulator family. The
+calibration is named synthetic-v1 in code and must be replaced by a
 separately versioned, stage-labelled real-data calibration before scientific
 deployment.
+
+### What the gate costs
+
+Measured on the same 125 scenes, the calibrated gate is a trade, not a net
+gain. It buys precision by discarding scenes:
+
+| method | coverage | conditional hit | overall hit | overall F1 | planes/scene |
+|---|---:|---:|---:|---:|---:|
+| `object_local` (ungated) | 89.6% | 57.1% | **51.2%** | **36.5%** | 7.83 |
+| `object_local_3d` | 64.8% | 40.7% | 26.4% | 16.9% | 1.50 |
+| `object_local_hybrid` | 41.6% | 98.1% | 40.8% | 31.4% | 0.61 |
+
+Report overall hit and F1 alongside the conditional numbers. Quoting 98%
+conditional hit without the 41.6% coverage overstates the method.
+
+## Fixture characterization — read this before tuning search
+
+`scripts/characterize_focus_fixture.py` measures what the synthetic fixture
+itself can resolve, so search scores can be read against a real ceiling rather
+than an assumed 0.5 mm tolerance. Raw rows:
+`tasks/focus_fixture_characterization.json`; pins:
+`tests/test_focus_fixture_characterization.py`.
+
+Full grid, 2026-08-17 — 27 single-sphere scenes (radius 4/10/18 µm, noise
+0/0.01/0.06, z 3/12/29 mm) × 5 metrics, 256×256, 401 steps over −5…45 mm:
+
+| metric | global \|err\| | global hit | masked \|err\| | masked hit | masked FWHM |
+|---|---:|---:|---:|---:|---:|
+| laplacian_variance | 12.13 mm | 11% | 0.875 mm | 22% | 0.375 mm |
+| normalized_variance | 13.50 mm | 0% | 0.500 mm | 37% | 3.250 mm |
+| phase_variance | 13.50 mm | 0% | 0.500 mm | 37% | 3.250 mm |
+| spectral_energy | 26.13 mm | 0% | 0.625 mm | 33% | 3.125 mm |
+| tenengrad | 28.38 mm | 7% | 0.625 mm | 37% | 2.125 mm |
+
+Two facts follow, and they reorder the work:
+
+1. **The whole-frame focus landscape does not peak at the object.** Over the
+   real search bounds every metric's global extremum collapses toward z≈0,
+   the camera plane — median error 12–28 mm, 0–11% hit. The optimizer is not
+   choosing a wrong extremum; it is finding the correct extremum of a
+   landscape whose maximum is in the wrong place. This is what the
+   range-edge rejection in `gradient_descent_search` is patching around, and
+   it is why object-local masking works at all.
+2. **The oracle mask is the ceiling, and it is low.** Handed the true object
+   footprint, the same metrics reach 0.5–0.875 mm median error but only
+   22–37% hit at 0.5 mm. `object_local_hybrid`'s 40.8% overall hit is already
+   at that ceiling. No detector, calibration or optimizer improvement moves a
+   benchmark past its oracle.
+
+The derived tolerance is **1.625 mm** (half the measured axial response,
+floored by the median masked error) against the 0.5 mm currently scored — the
+benchmark is roughly 3× tighter than the fixture supports. Loosening it is
+not the fix, though: recomputed on the held-out split, moving 0.5 → 1.625 mm
+lifts `object_local` from 51.2% to 60.0% but leaves `object_local_hybrid`
+unchanged at 40.8%. The hybrid's failures are gross, not marginal, so the
+remaining gap is upstream — in the fixture and the metric, not in the
+tolerance.
+
+Consequence for sequencing: build the independent generator (different
+propagator, aberrations, shot noise, speckle, sensor MTF) before investing
+further in 3-D persistence or a richer probability model. While the generator
+calls the same `core.reconstruction.propagate` used to reconstruct, every
+calibrated number describes ASM inverting ASM.
