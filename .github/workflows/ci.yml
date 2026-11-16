@@ -30,8 +30,14 @@ jobs:
         # macos-14 was retired on 2026-11-02 and now fails in 1 s with
         # "configuration ... is not supported". macos-15 is one of the two
         # macOS generations GitHub keeps; bump again when it is retired.
-        os: [ubuntu-22.04, macos-15]
-        python: ["3.11", "3.13"]
+        # TEMPORARY DIAGNOSTIC MATRIX — do not merge.
+        include:
+          - {os: ubuntu-22.04, python: "3.13", variant: asis-a}
+          - {os: ubuntu-22.04, python: "3.13", variant: asis-b}
+          - {os: ubuntu-22.04, python: "3.13", variant: pyside610}
+          - {os: ubuntu-22.04, python: "3.13", variant: notorch}
+          - {os: ubuntu-22.04, python: "3.13", variant: fileonly}
+          - {os: macos-15, python: "3.13", variant: asis-mac}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -55,8 +61,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
       - name: Install torch (Linux only)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.variant != 'notorch'
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: DIAG pin PySide6 to the last locally-green version
+        if: matrix.variant == 'pyside610'
+        run: pip install "PySide6==6.10.2"
+      - name: DIAG drop torch pulled in by requirements.txt
+        if: matrix.variant == 'notorch'
+        run: pip uninstall -y torch || true
+      - name: DIAG versions
+        run: pip freeze | grep -iE "pyside|shiboken|torch|numpy|scipy|pyfftw|pyqtgraph|vispy|opencv|mlx" || true
       # Torch tests are a Linux-only concern here, as the header says. The
       # hosted macOS runners are VMs whose Metal stack advertises MPS via
       # torch.backends.mps.is_available() but fails every allocation
@@ -69,7 +83,9 @@ jobs:
       - name: Headless test suite
         run: |
           export DHM_USER=ci
-          PYTHONPATH=src:tests python -m pytest tests/ -q --tb=short \
+          TARGET=tests/
+          if [ "${{ matrix.variant }}" = "fileonly" ]; then TARGET=tests/test_ui3_viewer_dialogs.py; fi
+          PYTHONPATH=src:tests python -X faulthandler -m pytest $TARGET -v --tb=short \
               -m "not needs_gui"
       - name: Bug regression
         run: |
