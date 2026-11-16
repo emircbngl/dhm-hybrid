@@ -21,6 +21,8 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -84,18 +86,45 @@ def _call(name: str, **args) -> ToolCall:
     return ToolCall(id="x", name=name, arguments_json=json.dumps(args))
 
 
+def _hide_mcp_sdk(monkeypatch) -> None:
+    """Make the optional ``mcp`` SDK look uninstalled for one test.
+
+    Masking ``sys.modules["mcp"]`` alone is not enough. Once any earlier
+    test has imported ``mcp.server.fastmcp`` (``test_mcp_bridge.py`` does,
+    whenever the SDK is installed), ``from mcp.server.fastmcp import X`` is
+    served from ``sys.modules`` under its full dotted name and never
+    consults the parent package — so the "missing SDK" tests would
+    silently run against the real one. Every cached ``mcp.*`` entry must
+    be masked too. CI does not install ``mcp``, which is why this only
+    ever showed up on a developer machine.
+    """
+    cached = [n for n in sys.modules if n == "mcp" or n.startswith("mcp.")]
+    for name in cached:
+        monkeypatch.setitem(sys.modules, name, None)
+    monkeypatch.setitem(sys.modules, "mcp", None)
+
+
 # ---------------------------------------------------------------------------
 # (a) import dhm_mcp.headless works with no mcp installed
 # ---------------------------------------------------------------------------
 
-def test_import_headless_without_mcp_installed(monkeypatch):
+def test_import_headless_without_mcp_installed():
     # The normal development environment may deliberately have the optional
-    # ``mcp`` extra installed.  Simulate its absence at the import boundary
-    # rather than making this test suite's outcome depend on global packages.
-    monkeypatch.setitem(sys.modules, "mcp", None)
-    with pytest.raises(ModuleNotFoundError):
-        import mcp  # noqa: F401
-    import dhm_mcp.headless  # noqa: F401 - the point is this import succeeds
+    # ``mcp`` extra installed, so its absence is simulated at the import
+    # boundary. This has to happen in a fresh interpreter: this file already
+    # imports ``dhm_mcp.headless`` at the top, so an in-process ``import``
+    # would return the cached module and could never fail.
+    code = (
+        "import sys\n"
+        "sys.modules['mcp'] = None\n"
+        "import dhm_mcp.headless\n"
+        "leaked = sorted(n for n in sys.modules if n.startswith('mcp.'))\n"
+        "assert not leaked, leaked\n"
+    )
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    proc = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +246,7 @@ def test_irreversible_tool_allowed_via_env_override(tmp_path, monkeypatch):
 def test_server_main_exits_without_mcp(monkeypatch):
     from dhm_mcp import server
 
-    monkeypatch.setitem(sys.modules, "mcp", None)
+    _hide_mcp_sdk(monkeypatch)
     with pytest.raises(SystemExit) as excinfo:
         server.main()
     assert "mcp" in str(excinfo.value).lower()
@@ -226,6 +255,6 @@ def test_server_main_exits_without_mcp(monkeypatch):
 def test_build_mcp_server_raises_import_error_without_mcp(monkeypatch):
     from dhm_mcp import server
 
-    monkeypatch.setitem(sys.modules, "mcp", None)
+    _hide_mcp_sdk(monkeypatch)
     with pytest.raises(ImportError):
         server.build_mcp_server()

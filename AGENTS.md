@@ -51,7 +51,9 @@ python3 tools/job.py run tests -- python3 -m pytest -q
 python3 tools/job.py wait tests
 ```
 
-Measured on an M4: the full suite is **~160-200 s** (1271 passed, 11 skipped).
+Measured on an M4: the full suite is **~170-230 s** (1303 passed, 12 skipped
+on 2026-11-16, with the optional `mcp` SDK installed; CI does not install it,
+so CI skips the MCP bridge tests).
 That is the number to expect — do not poll it every 30 s, and do not assume it
 died because two minutes passed.
 
