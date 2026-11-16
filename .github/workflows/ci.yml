@@ -32,10 +32,12 @@ jobs:
         # macOS generations GitHub keeps; bump again when it is retired.
         # TEMPORARY DIAGNOSTIC MATRIX — do not merge.
         include:
-          - {os: ubuntu-22.04, python: "3.13", variant: gdb-1}
-          - {os: ubuntu-22.04, python: "3.13", variant: gdb-2}
-          - {os: ubuntu-22.04, python: "3.13", variant: gdb-3}
-          - {os: ubuntu-22.04, python: "3.13", variant: gdb-4}
+          - {os: ubuntu-22.04, python: "3.13", variant: control}
+          - {os: ubuntu-22.04, python: "3.13", variant: pyside610}
+          - {os: ubuntu-22.04, python: "3.13", variant: pyside610-b}
+          - {os: ubuntu-22.04, python: "3.13", variant: notorch}
+          - {os: ubuntu-22.04, python: "3.13", variant: notorch-b}
+          - {os: ubuntu-22.04, python: "3.13", variant: fileonly}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -59,13 +61,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-dev.txt
       - name: Install torch (Linux only)
-        if: runner.os == 'Linux' && matrix.variant != 'notorch'
+        if: runner.os == 'Linux' && !startsWith(matrix.variant, 'notorch')
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: DIAG pin PySide6 to the last locally-green version
-        if: matrix.variant == 'pyside610'
+        if: startsWith(matrix.variant, 'pyside610')
         run: pip install "PySide6==6.10.2"
       - name: DIAG drop torch pulled in by requirements.txt
-        if: matrix.variant == 'notorch'
+        if: startsWith(matrix.variant, 'notorch')
         run: pip uninstall -y torch || true
       - name: DIAG versions
         run: pip freeze | grep -iE "pyside|shiboken|torch|numpy|scipy|pyfftw|pyqtgraph|vispy|opencv|mlx" || true
@@ -83,6 +85,8 @@ jobs:
           export DHM_USER=ci
           sudo apt-get install -y --no-install-recommends gdb
           export PYTHONPATH=src:tests
+          TARGET=tests/
+          if [ "${{ matrix.variant }}" = "fileonly" ]; then TARGET=tests/test_ui3_viewer_dialogs.py; fi
           gdb -q -batch \
               -ex "handle SIGPIPE nostop noprint pass" \
               -ex "handle SIGUSR1 nostop noprint pass" \
@@ -91,7 +95,7 @@ jobs:
               -ex "bt 40" \
               -ex "echo \n===== GDB: all threads =====\n" \
               -ex "thread apply all bt 15" \
-              --args python -m pytest tests/ -q --tb=short -p no:cacheprovider \
+              --args python -m pytest $TARGET -q --tb=short -p no:cacheprovider \
               -m "not needs_gui" 2>&1 | tee gdb_run.log
           if grep -q "GDB: crashing thread" gdb_run.log && grep -q "received signal" gdb_run.log; then
             echo "CRASH CAPTURED"; exit 1
