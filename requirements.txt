@@ -1,4 +1,9 @@
-PySide6
+# Pinned 2026-11-17. PySide6 6.12.0 together with torch 2.15 segfaults in
+# QTimerInfoList::activateTimers on Linux (a timer firing for a freed QObject),
+# measured on CI: 5/5 crashes under gdb, 0/2 with torch removed, 0/2 on
+# 6.10.2 with torch kept. 6.10.2 is the version those runs and the dev box
+# pass on. Before lifting this, re-run CI with the newer PySide6 and torch.
+PySide6==6.10.2
 mlx
 numpy
 scikit-image
