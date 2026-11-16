@@ -32,12 +32,10 @@ jobs:
         # macOS generations GitHub keeps; bump again when it is retired.
         # TEMPORARY DIAGNOSTIC MATRIX — do not merge.
         include:
-          - {os: ubuntu-22.04, python: "3.13", variant: asis-a}
-          - {os: ubuntu-22.04, python: "3.13", variant: asis-b}
-          - {os: ubuntu-22.04, python: "3.13", variant: pyside610}
-          - {os: ubuntu-22.04, python: "3.13", variant: notorch}
-          - {os: ubuntu-22.04, python: "3.13", variant: fileonly}
-          - {os: macos-15, python: "3.13", variant: asis-mac}
+          - {os: ubuntu-22.04, python: "3.13", variant: gdb-1}
+          - {os: ubuntu-22.04, python: "3.13", variant: gdb-2}
+          - {os: ubuntu-22.04, python: "3.13", variant: gdb-3}
+          - {os: ubuntu-22.04, python: "3.13", variant: gdb-4}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -83,10 +81,21 @@ jobs:
       - name: Headless test suite
         run: |
           export DHM_USER=ci
-          TARGET=tests/
-          if [ "${{ matrix.variant }}" = "fileonly" ]; then TARGET=tests/test_ui3_viewer_dialogs.py; fi
-          PYTHONPATH=src:tests python -X faulthandler -m pytest $TARGET -v --tb=short \
-              -m "not needs_gui"
+          sudo apt-get install -y --no-install-recommends gdb
+          export PYTHONPATH=src:tests
+          gdb -q -batch \
+              -ex "handle SIGPIPE nostop noprint pass" \
+              -ex "handle SIGUSR1 nostop noprint pass" \
+              -ex "run" \
+              -ex "echo \n===== GDB: crashing thread =====\n" \
+              -ex "bt 40" \
+              -ex "echo \n===== GDB: all threads =====\n" \
+              -ex "thread apply all bt 15" \
+              --args python -m pytest tests/ -q --tb=short -p no:cacheprovider \
+              -m "not needs_gui" 2>&1 | tee gdb_run.log
+          if grep -q "GDB: crashing thread" gdb_run.log && grep -q "received signal" gdb_run.log; then
+            echo "CRASH CAPTURED"; exit 1
+          fi
       - name: Bug regression
         run: |
           python scripts/check_bugs.py --no-color
